@@ -129,6 +129,8 @@ members = [
     "crates/string_train_case",
     "crates/string_upper",
     "crates/string_upper_first",
+    "crates/nest_by",
+    "crates/nest_hierarchy",
     "crates/webassembly_wat",
 ]
 resolver = "2"
