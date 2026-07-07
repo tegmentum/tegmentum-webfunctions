@@ -1,0 +1,22 @@
+# Cargo workspace for the tegmentum WebAssembly component standard library.
+# Each crate is a single-function wasm component (built via cargo component).
+# All crates share the WIT world at shared/wit/webfunction.wit.
+
+[workspace]
+members = [
+    "crates/math_sqrt",
+    "crates/string_upper",
+    "crates/string_levenshtein",
+    "crates/hash_sha256",
+    "crates/parse_json",
+    "crates/parse_csv",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+wit-bindgen = "0.36"
