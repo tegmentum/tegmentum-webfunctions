@@ -1,0 +1,20 @@
+[package]
+name = "hash_md4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+md4 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+[package.metadata.component]
+package = "tegmentum:hash-md4"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

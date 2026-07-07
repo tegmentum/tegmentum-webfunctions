@@ -1,0 +1,20 @@
+[package]
+name = "json_path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+serde_json = "1.0"
+serde_json_path = "0.7"
+
+[package.metadata.component]
+package = "tegmentum:json-path"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

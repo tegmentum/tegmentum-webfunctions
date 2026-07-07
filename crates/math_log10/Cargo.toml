@@ -1,0 +1,18 @@
+[package]
+name = "math_log10"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[package.metadata.component]
+package = "tegmentum:math-log10"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

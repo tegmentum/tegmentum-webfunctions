@@ -1,0 +1,19 @@
+[package]
+name = "string_count"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+voca_rs = "1.15"
+
+[package.metadata.component]
+package = "tegmentum:string-count"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

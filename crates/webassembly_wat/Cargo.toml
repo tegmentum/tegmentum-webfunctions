@@ -1,0 +1,20 @@
+[package]
+name = "webassembly_wat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+wasmprinter = "0.220"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+[package.metadata.component]
+package = "tegmentum:webassembly-wat"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

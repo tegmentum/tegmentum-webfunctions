@@ -1,0 +1,18 @@
+[package]
+name = "agg_sum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[package.metadata.component]
+package = "tegmentum:agg-sum"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

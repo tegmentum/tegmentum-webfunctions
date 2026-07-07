@@ -1,0 +1,20 @@
+[package]
+name = "jmespath_search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+jmespath = "0.3"
+serde_json = "1.0"
+
+[package.metadata.component]
+package = "tegmentum:jmespath-search"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

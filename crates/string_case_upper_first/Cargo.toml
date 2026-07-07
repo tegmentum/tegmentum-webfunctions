@@ -1,0 +1,19 @@
+[package]
+name = "string_case_upper_first"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+voca_rs = "1.15"
+
+[package.metadata.component]
+package = "tegmentum:string-case-upper-first"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

@@ -1,0 +1,21 @@
+[package]
+name = "hash_gost94"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+gost94 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+digest = { version = "0.10", default-features = false }
+
+[package.metadata.component]
+package = "tegmentum:hash-gost94"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

@@ -1,0 +1,20 @@
+[package]
+name = "hash_md2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+md2 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+[package.metadata.component]
+package = "tegmentum:hash-md2"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

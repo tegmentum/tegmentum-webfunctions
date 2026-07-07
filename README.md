@@ -13,20 +13,55 @@ Two flavours of crate live here:
    principally the XSPARQL-shape data-interop primitives (`parse_json`,
    `parse_csv`, and friends yet to come).
 
-## Current inventory
+## Current inventory (126 crates)
 
 Each crate is buildable via `cargo component build --release` and yields
 a wasm component at
-`target/wasm32-wasip1/release/<crate_name>.wasm`.
+`target/wasm32-wasip1/release/<crate_name>.wasm`. Average size ≈ 106 KB.
 
-| Crate | Origin | Function |
-|---|---|---|
-| `math_sqrt` | port of `function_math/sqrt` | `sqrt(x)` |
-| `string_upper` | port of `function_string_case/to_upper` | Unicode uppercase |
-| `string_levenshtein` | port of `function_string_similarity/levenshtein` | edit distance via strsim |
-| `hash_sha256` | port of `function_crypto_hash/sha2` | hex-encoded SHA-256 |
-| `parse_json` | new (XSPARQL interop) | JSON → binding-sets |
-| `parse_csv` | new (XSPARQL interop) | CSV → binding-sets |
+Ports (module-mode → Component Model):
+
+| Prefix | Count | Origin | Notes |
+|---|---|---|---|
+| `math_*` | 30 | function_math/ | trig, exp/log, arithmetic, stats (mean, median, stddev, covariance, pearson_r), variadic (min/max/sum_arrays). The upstream sources were all identical broken templates — the algorithms in these ports were written from scratch. |
+| `math_const_*` | 19 | function_math_constants/ | π, e, τ, √2, ln 2, log₂ 10, φ (from f64::consts), etc. |
+| `string_*` | 12 | function_string/ | count / count_graphemes / count_substrings / count_words / count_unique_words / count_where / split_chars / swap_case / title_case / train_case / upper / upper_first |
+| `string_case_*` | 13 | function_string_case/ | camel, snake, kebab, pascal, shouty_snake / shouty_kebab, capitalize / decapitalize, lower / lower_first, swap / title / train / upper_first |
+| `hash_*` | 21 | function_crypto_hash/ | blake2b / blake2b_256 / blake2b_512 / fsb / gost94 / groestl / k12 / md2 / md4 / md5 / ripemd160 / sha1 / sha256 / sha3_256 / sha384 / sha512 / shabal / sm3 / streebog / tiger / whirlpool |
+| `similarity_*` | 8 | function_string_similarity/ | levenshtein / damerau_levenshtein / normalized_levenshtein / normalized_damerau / hamming / jaro / jaro_winkler / osa_distance / sorensen_dice |
+| `array_*` | 11 | function_array/ | append / contains / dedupe / equals / fill / get / index / of / reverse / size / unique |
+| `base64_*` | 1 | function_base64/ | decode |
+| `jmespath_*` | 1 | function_json_jmespath/ | search — JMESPath over JSON |
+| `webassembly_*` | 1 | function_webassembly/ | wat — inspect the plugin's Wasm engine version |
+| `agg_*` | 1 | aggregate/ | sum — canonical example of aggregate-step / aggregate-finish |
+
+New (XSPARQL-shape data interop, not ports):
+
+| Crate | Purpose |
+|---|---|
+| `parse_json` | Take a JSON string, return binding-sets. Objects → single row keyed by field; arrays-of-objects → one row per element; scalars typed. Nested values stringified for recursive parse_json. |
+| `parse_csv` | Take a CSV string (optional delimiter), return binding-sets. First row is the header, subsequent rows are one Binding per column. |
+| `parse_xml` | Take an XML string, return binding-sets. Attributes become columns; direct text goes to `text`; child elements grouped by tag, XML-serialized for recursive parse_xml. |
+| `json_path` | Given a JSON string plus a JSONPath expression, return the matched values as rows. |
+| `emit_json` | Aggregate-shaped: consume rows via aggregate-step (name-value pairs), emit a JSON string via aggregate-finish. |
+| `emit_csv` | Aggregate-shaped mirror of emit_json for CSV. |
+
+Skipped and why:
+
+- **function_python** — a Python interpreter can't run in a wasm
+  component. Consider a `pyodide.wasm`-shaped bridge later if needed.
+- **function_image**, **function_object_detection**, **function_ocr**,
+  **function_nlp** — depend on native / large-model deps that either
+  don't compile to wasm32-wasip1 or would bloat the .wasm by 10-100 MB.
+  Defer per-component until needed.
+- **function_bio**, **function_bio_alphabet** — the upstream 60 crates
+  were all empty templates copied from function_math, not real bio
+  implementations. Bio work is happening separately in
+  [scry-webfunctions-demo](https://github.com/tegmentum/scry-webfunctions-demo)
+  (blastp, protparam) — those will move here eventually as `bio_*`.
+- **aggregate_stats**, **aggregate_stats_distribution** — empty upstream.
+  agg_sum is the canonical aggregate example; stats aggregators will
+  follow the same pattern once needed.
 
 ## Deferred / to-port
 

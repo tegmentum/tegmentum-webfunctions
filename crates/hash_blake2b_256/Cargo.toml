@@ -1,0 +1,21 @@
+[package]
+name = "hash_blake2b_256"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+blake2 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+digest = { version = "0.10", default-features = false }
+
+[package.metadata.component]
+package = "tegmentum:hash-blake2b-256"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

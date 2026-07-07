@@ -1,0 +1,19 @@
+[package]
+name = "parse_xml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+roxmltree = { version = "0.20", default-features = false, features = ["std"] }
+
+[package.metadata.component]
+package = "tegmentum:parse-xml"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

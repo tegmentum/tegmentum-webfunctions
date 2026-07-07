@@ -1,0 +1,18 @@
+[package]
+name = "math_const_log2_e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[package.metadata.component]
+package = "tegmentum:math-const-log2-e"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"
