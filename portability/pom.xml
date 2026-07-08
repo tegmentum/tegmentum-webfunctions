@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>ai.tegmentum</groupId>
+    <artifactId>webfunction-portability</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+
+    <name>tegmentum-webfunctions portability harness</name>
+    <description>
+        Executable proof of Paper 2's headline claim: one wf_tree.wasm
+        binary drives recursive execute-query callbacks under multiple
+        SPARQL engines with identical guest code. Each test loads the
+        same bytes and asserts identical output structure.
+    </description>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <plugin.version>0.1.0-SNAPSHOT</plugin.version>
+        <junit.version>4.13.2</junit.version>
+        <assertj.version>3.24.2</assertj.version>
+        <rdf4j.version>6.0.0</rdf4j.version>
+        <jena.version>6.1.0</jena.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>ai.tegmentum.rdf4j</groupId>
+            <artifactId>webfunction</artifactId>
+            <version>${plugin.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>ai.tegmentum.jena</groupId>
+            <artifactId>webfunction</artifactId>
+            <version>${plugin.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.eclipse.rdf4j</groupId>
+            <artifactId>rdf4j-sail-memory</artifactId>
+            <version>${rdf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.rdf4j</groupId>
+            <artifactId>rdf4j-repository-sail</artifactId>
+            <version>${rdf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.jena</groupId>
+            <artifactId>jena-arq</artifactId>
+            <version>${jena.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                    <!-- Fresh JVM per test class. The portability tests wire
+                         RDF4J + Jena into the same JVM, and each plugin's
+                         CallbackContext ThreadLocal + the shared wasmtime4j
+                         engine cache accumulate per-JVM state that
+                         cross-pollutes runs. Isolating per class keeps each
+                         test measuring only its own configuration. -->
+                    <forkCount>1</forkCount>
+                    <reuseForks>false</reuseForks>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
