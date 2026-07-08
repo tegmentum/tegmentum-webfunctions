@@ -131,6 +131,7 @@ members = [
     "crates/string_upper_first",
     "crates/nest_by",
     "crates/nest_hierarchy",
+    "crates/wf_tree",
     "crates/webassembly_wat",
 ]
 resolver = "2"

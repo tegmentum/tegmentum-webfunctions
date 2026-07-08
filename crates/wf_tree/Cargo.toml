@@ -1,0 +1,19 @@
+[package]
+name = "wf_tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+serde_json = "1.0"
+
+[package.metadata.component]
+package = "tegmentum:wf-tree"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"
