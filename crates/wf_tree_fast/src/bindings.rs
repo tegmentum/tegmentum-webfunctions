@@ -1562,6 +1562,7 @@ pub mod stardog {
             use super::super::super::_rt;
             pub type Binding = super::super::super::stardog::webfunction::types::Binding;
             pub type BindingSets = super::super::super::stardog::webfunction::types::BindingSets;
+            pub type Value = super::super::super::stardog::webfunction::types::Value;
             #[allow(unused_unsafe, clippy::all)]
             /// Execute a read-only SPARQL query in the caller's current
             /// transaction. `bindings` are pre-applied as if the query text opened
@@ -1717,7 +1718,7 @@ pub mod stardog {
                     };
                     let ptr12 = ret_area.0.as_mut_ptr().cast::<u8>();
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.2")]
+                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.3")]
                     unsafe extern "C" {
                         #[link_name = "execute-query"]
                         fn wit_import13(
@@ -1990,7 +1991,7 @@ pub mod stardog {
             pub fn callback_depth() -> u32 {
                 unsafe {
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.2")]
+                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.3")]
                     unsafe extern "C" {
                         #[link_name = "callback-depth"]
                         fn wit_import0() -> i32;
@@ -2032,7 +2033,7 @@ pub mod stardog {
                     let len0 = vec0.len();
                     let ptr1 = ret_area.0.as_mut_ptr().cast::<u8>();
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.2")]
+                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.3")]
                     unsafe extern "C" {
                         #[link_name = "prepare-query"]
                         fn wit_import2(_: *mut u8, _: usize, _: *mut u8);
@@ -2215,7 +2216,7 @@ pub mod stardog {
                     };
                     let ptr11 = ret_area.0.as_mut_ptr().cast::<u8>();
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.2")]
+                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.3")]
                     unsafe extern "C" {
                         #[link_name = "run-prepared"]
                         fn wit_import12(
@@ -2477,6 +2478,402 @@ pub mod stardog {
                     result50
                 }
             }
+            #[allow(unused_unsafe, clippy::all)]
+            /// Native triple-pattern lookup: returns the set of `?o` matching
+            /// `(subject, predicate, ?o)` in the outer query's current transaction.
+            /// No SPARQL parse, no algebra, no binding-set marshalling — the host
+            /// hands back a plain list of value variants.
+            ///
+            /// This is the fast path for tree/graph traversal patterns whose
+            /// child-lookup is a single triple pattern. Guests can layer more
+            /// structure on top (attributes, joined siblings, etc.) via
+            /// `execute-query`; `follow-predicate` is for the tight inner loop.
+            pub fn follow_predicate(
+                subject: &Value,
+                predicate: &Value,
+            ) -> Result<_rt::Vec<Value>, _rt::String> {
+                unsafe {
+                    #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+                    #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
+                    struct RetArea(
+                        [::core::mem::MaybeUninit<
+                            u8,
+                        >; 3 * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let mut ret_area = RetArea(
+                        [::core::mem::MaybeUninit::uninit(); 3
+                            * ::core::mem::size_of::<*const u8>()],
+                    );
+                    use super::super::super::stardog::webfunction::types::Value as V7;
+                    let (
+                        result8_0,
+                        result8_1,
+                        result8_2,
+                        result8_3,
+                        result8_4,
+                        result8_5,
+                        result8_6,
+                        result8_7,
+                    ) = match subject {
+                        V7::Iri(e) => {
+                            let vec0 = e;
+                            let ptr0 = vec0.as_ptr().cast::<u8>();
+                            let len0 = vec0.len();
+                            (
+                                0i32,
+                                ptr0.cast_mut(),
+                                len0,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                                0i32,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                            )
+                        }
+                        V7::Literal(e) => {
+                            let super::super::super::stardog::webfunction::types::Literal {
+                                label: label1,
+                                datatype: datatype1,
+                                lang: lang1,
+                            } = e;
+                            let vec2 = label1;
+                            let ptr2 = vec2.as_ptr().cast::<u8>();
+                            let len2 = vec2.len();
+                            let vec3 = datatype1;
+                            let ptr3 = vec3.as_ptr().cast::<u8>();
+                            let len3 = vec3.len();
+                            let (result5_0, result5_1, result5_2) = match lang1 {
+                                Some(e) => {
+                                    let vec4 = e;
+                                    let ptr4 = vec4.as_ptr().cast::<u8>();
+                                    let len4 = vec4.len();
+                                    (1i32, ptr4.cast_mut(), len4)
+                                }
+                                None => (0i32, ::core::ptr::null_mut(), 0usize),
+                            };
+                            (
+                                1i32,
+                                ptr2.cast_mut(),
+                                len2,
+                                ptr3.cast_mut(),
+                                len3,
+                                result5_0,
+                                result5_1,
+                                result5_2,
+                            )
+                        }
+                        V7::Bnode(e) => {
+                            let vec6 = e;
+                            let ptr6 = vec6.as_ptr().cast::<u8>();
+                            let len6 = vec6.len();
+                            (
+                                2i32,
+                                ptr6.cast_mut(),
+                                len6,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                                0i32,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                            )
+                        }
+                    };
+                    use super::super::super::stardog::webfunction::types::Value as V16;
+                    let (
+                        result17_0,
+                        result17_1,
+                        result17_2,
+                        result17_3,
+                        result17_4,
+                        result17_5,
+                        result17_6,
+                        result17_7,
+                    ) = match predicate {
+                        V16::Iri(e) => {
+                            let vec9 = e;
+                            let ptr9 = vec9.as_ptr().cast::<u8>();
+                            let len9 = vec9.len();
+                            (
+                                0i32,
+                                ptr9.cast_mut(),
+                                len9,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                                0i32,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                            )
+                        }
+                        V16::Literal(e) => {
+                            let super::super::super::stardog::webfunction::types::Literal {
+                                label: label10,
+                                datatype: datatype10,
+                                lang: lang10,
+                            } = e;
+                            let vec11 = label10;
+                            let ptr11 = vec11.as_ptr().cast::<u8>();
+                            let len11 = vec11.len();
+                            let vec12 = datatype10;
+                            let ptr12 = vec12.as_ptr().cast::<u8>();
+                            let len12 = vec12.len();
+                            let (result14_0, result14_1, result14_2) = match lang10 {
+                                Some(e) => {
+                                    let vec13 = e;
+                                    let ptr13 = vec13.as_ptr().cast::<u8>();
+                                    let len13 = vec13.len();
+                                    (1i32, ptr13.cast_mut(), len13)
+                                }
+                                None => (0i32, ::core::ptr::null_mut(), 0usize),
+                            };
+                            (
+                                1i32,
+                                ptr11.cast_mut(),
+                                len11,
+                                ptr12.cast_mut(),
+                                len12,
+                                result14_0,
+                                result14_1,
+                                result14_2,
+                            )
+                        }
+                        V16::Bnode(e) => {
+                            let vec15 = e;
+                            let ptr15 = vec15.as_ptr().cast::<u8>();
+                            let len15 = vec15.len();
+                            (
+                                2i32,
+                                ptr15.cast_mut(),
+                                len15,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                                0i32,
+                                ::core::ptr::null_mut(),
+                                0usize,
+                            )
+                        }
+                    };
+                    let ptr18 = ret_area.0.as_mut_ptr().cast::<u8>();
+                    #[cfg(target_arch = "wasm32")]
+                    #[link(wasm_import_module = "stardog:webfunction/host@0.3.3")]
+                    unsafe extern "C" {
+                        #[link_name = "follow-predicate"]
+                        fn wit_import19(
+                            _: i32,
+                            _: *mut u8,
+                            _: usize,
+                            _: *mut u8,
+                            _: usize,
+                            _: i32,
+                            _: *mut u8,
+                            _: usize,
+                            _: i32,
+                            _: *mut u8,
+                            _: usize,
+                            _: *mut u8,
+                            _: usize,
+                            _: i32,
+                            _: *mut u8,
+                            _: usize,
+                            _: *mut u8,
+                        );
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    unsafe extern "C" fn wit_import19(
+                        _: i32,
+                        _: *mut u8,
+                        _: usize,
+                        _: *mut u8,
+                        _: usize,
+                        _: i32,
+                        _: *mut u8,
+                        _: usize,
+                        _: i32,
+                        _: *mut u8,
+                        _: usize,
+                        _: *mut u8,
+                        _: usize,
+                        _: i32,
+                        _: *mut u8,
+                        _: usize,
+                        _: *mut u8,
+                    ) {
+                        unreachable!()
+                    }
+                    unsafe {
+                        wit_import19(
+                            result8_0,
+                            result8_1,
+                            result8_2,
+                            result8_3,
+                            result8_4,
+                            result8_5,
+                            result8_6,
+                            result8_7,
+                            result17_0,
+                            result17_1,
+                            result17_2,
+                            result17_3,
+                            result17_4,
+                            result17_5,
+                            result17_6,
+                            result17_7,
+                            ptr18,
+                        )
+                    };
+                    let l20 = i32::from(*ptr18.add(0).cast::<u8>());
+                    let result45 = match l20 {
+                        0 => {
+                            let e = {
+                                let l21 = *ptr18
+                                    .add(::core::mem::size_of::<*const u8>())
+                                    .cast::<*mut u8>();
+                                let l22 = *ptr18
+                                    .add(2 * ::core::mem::size_of::<*const u8>())
+                                    .cast::<usize>();
+                                let base41 = l21;
+                                let len41 = l22;
+                                let mut result41 = _rt::Vec::with_capacity(len41);
+                                for i in 0..len41 {
+                                    let base = base41
+                                        .add(i * (8 * ::core::mem::size_of::<*const u8>()));
+                                    let e41 = {
+                                        let l23 = i32::from(*base.add(0).cast::<u8>());
+                                        use super::super::super::stardog::webfunction::types::Value as V40;
+                                        let v40 = match l23 {
+                                            0 => {
+                                                let e40 = {
+                                                    let l24 = *base
+                                                        .add(::core::mem::size_of::<*const u8>())
+                                                        .cast::<*mut u8>();
+                                                    let l25 = *base
+                                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                                        .cast::<usize>();
+                                                    let len26 = l25;
+                                                    let bytes26 = _rt::Vec::from_raw_parts(
+                                                        l24.cast(),
+                                                        len26,
+                                                        len26,
+                                                    );
+                                                    _rt::string_lift(bytes26)
+                                                };
+                                                V40::Iri(e40)
+                                            }
+                                            1 => {
+                                                let e40 = {
+                                                    let l27 = *base
+                                                        .add(::core::mem::size_of::<*const u8>())
+                                                        .cast::<*mut u8>();
+                                                    let l28 = *base
+                                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                                        .cast::<usize>();
+                                                    let len29 = l28;
+                                                    let bytes29 = _rt::Vec::from_raw_parts(
+                                                        l27.cast(),
+                                                        len29,
+                                                        len29,
+                                                    );
+                                                    let l30 = *base
+                                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                                        .cast::<*mut u8>();
+                                                    let l31 = *base
+                                                        .add(4 * ::core::mem::size_of::<*const u8>())
+                                                        .cast::<usize>();
+                                                    let len32 = l31;
+                                                    let bytes32 = _rt::Vec::from_raw_parts(
+                                                        l30.cast(),
+                                                        len32,
+                                                        len32,
+                                                    );
+                                                    let l33 = i32::from(
+                                                        *base
+                                                            .add(5 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<u8>(),
+                                                    );
+                                                    super::super::super::stardog::webfunction::types::Literal {
+                                                        label: _rt::string_lift(bytes29),
+                                                        datatype: _rt::string_lift(bytes32),
+                                                        lang: match l33 {
+                                                            0 => None,
+                                                            1 => {
+                                                                let e = {
+                                                                    let l34 = *base
+                                                                        .add(6 * ::core::mem::size_of::<*const u8>())
+                                                                        .cast::<*mut u8>();
+                                                                    let l35 = *base
+                                                                        .add(7 * ::core::mem::size_of::<*const u8>())
+                                                                        .cast::<usize>();
+                                                                    let len36 = l35;
+                                                                    let bytes36 = _rt::Vec::from_raw_parts(
+                                                                        l34.cast(),
+                                                                        len36,
+                                                                        len36,
+                                                                    );
+                                                                    _rt::string_lift(bytes36)
+                                                                };
+                                                                Some(e)
+                                                            }
+                                                            _ => _rt::invalid_enum_discriminant(),
+                                                        },
+                                                    }
+                                                };
+                                                V40::Literal(e40)
+                                            }
+                                            n => {
+                                                debug_assert_eq!(n, 2, "invalid enum discriminant");
+                                                let e40 = {
+                                                    let l37 = *base
+                                                        .add(::core::mem::size_of::<*const u8>())
+                                                        .cast::<*mut u8>();
+                                                    let l38 = *base
+                                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                                        .cast::<usize>();
+                                                    let len39 = l38;
+                                                    let bytes39 = _rt::Vec::from_raw_parts(
+                                                        l37.cast(),
+                                                        len39,
+                                                        len39,
+                                                    );
+                                                    _rt::string_lift(bytes39)
+                                                };
+                                                V40::Bnode(e40)
+                                            }
+                                        };
+                                        v40
+                                    };
+                                    result41.push(e41);
+                                }
+                                _rt::cabi_dealloc(
+                                    base41,
+                                    len41 * (8 * ::core::mem::size_of::<*const u8>()),
+                                    ::core::mem::size_of::<*const u8>(),
+                                );
+                                result41
+                            };
+                            Ok(e)
+                        }
+                        1 => {
+                            let e = {
+                                let l42 = *ptr18
+                                    .add(::core::mem::size_of::<*const u8>())
+                                    .cast::<*mut u8>();
+                                let l43 = *ptr18
+                                    .add(2 * ::core::mem::size_of::<*const u8>())
+                                    .cast::<usize>();
+                                let len44 = l43;
+                                let bytes44 = _rt::Vec::from_raw_parts(
+                                    l42.cast(),
+                                    len44,
+                                    len44,
+                                );
+                                _rt::string_lift(bytes44)
+                            };
+                            Err(e)
+                        }
+                        _ => _rt::invalid_enum_discriminant(),
+                    };
+                    result45
+                }
+            }
         }
     }
 }
@@ -2620,12 +3017,12 @@ macro_rules! __export_webfunction_impl {
 pub(crate) use __export_webfunction_impl as export;
 #[cfg(target_arch = "wasm32")]
 #[unsafe(
-    link_section = "component-type:wit-bindgen:0.41.0:stardog:webfunction@0.3.2:webfunction:encoded world"
+    link_section = "component-type:wit-bindgen:0.41.0:stardog:webfunction@0.3.3:webfunction:encoded world"
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1052] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x9a\x07\x01A\x02\x01\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1123] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xe1\x07\x01A\x02\x01\
 A\x19\x01B\x11\x01ks\x01r\x03\x05labels\x08datatypes\x04lang\0\x04\0\x07literal\x03\
 \0\x01\x01q\x03\x03iri\x01s\0\x07literal\x01\x02\0\x05bnode\x01s\0\x04\0\x05valu\
 e\x03\0\x03\x01r\x02\x04names\x05value\x04\x04\0\x07binding\x03\0\x05\x01p\x06\x04\
@@ -2633,22 +3030,24 @@ e\x03\0\x03\x01r\x02\x04names\x05value\x04\x04\0\x07binding\x03\0\x05\x01p\x06\x
 \x0cbinding-sets\x03\0\x0b\x01m\x08\x08verified\x08injected\x08accurate\x0fmostl\
 y-accurate\x11probably-accurate\x0cpossibly-off\x0cprobably-off\x06random\x04\0\x08\
 accuracy\x03\0\x0d\x01r\x02\x05valueu\x08accuracy\x0e\x04\0\x0bcardinality\x03\0\
-\x0f\x03\0\x1fstardog:webfunction/types@0.3.2\x05\0\x02\x03\0\0\x05value\x03\0\x05\
+\x0f\x03\0\x1fstardog:webfunction/types@0.3.3\x05\0\x02\x03\0\0\x05value\x03\0\x05\
 value\x03\0\x01\x02\x03\0\0\x0cbinding-sets\x03\0\x0cbinding-sets\x03\0\x03\x02\x03\
-\0\0\x0bcardinality\x03\0\x0bcardinality\x03\0\x05\x02\x03\0\0\x07binding\x01B\x10\
+\0\0\x0bcardinality\x03\0\x0bcardinality\x03\0\x05\x02\x03\0\0\x07binding\x01B\x16\
 \x02\x03\x02\x01\x07\x04\0\x07binding\x03\0\0\x02\x03\x02\x01\x03\x04\0\x0cbindi\
-ng-sets\x03\0\x02\x01p\x01\x01ky\x01j\x01\x03\x01s\x01@\x03\x06sparqls\x08bindin\
-gs\x04\x08max-rows\x05\0\x06\x04\0\x0dexecute-query\x01\x07\x01@\0\0y\x04\0\x0ec\
-allback-depth\x01\x08\x01j\x01y\x01s\x01@\x01\x06sparqls\0\x09\x04\0\x0dprepare-\
-query\x01\x0a\x01@\x03\x06handley\x08bindings\x04\x08max-rows\x05\0\x06\x04\0\x0c\
-run-prepared\x01\x0b\x03\0\x1estardog:webfunction/host@0.3.2\x05\x08\x01p\x02\x01\
-j\x01\x04\x01s\x01@\x01\x04args\x09\0\x0a\x04\0\x08evaluate\x01\x0b\x01j\0\x01s\x01\
-@\x02\x04args\x09\x04multw\0\x0c\x04\0\x0eaggregate-step\x01\x0d\x01@\0\0\x0a\x04\
-\0\x10aggregate-finish\x01\x0e\x01j\x01\x06\x01s\x01@\x02\x05input\x06\x04args\x09\
-\0\x0f\x04\0\x14cardinality-estimate\x01\x10\x01@\0\0\x04\x04\0\x03doc\x01\x11\x04\
-\0%stardog:webfunction/webfunction@0.3.2\x04\0\x0b\x11\x01\0\x0bwebfunction\x03\0\
-\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bi\
-ndgen-rust\x060.41.0";
+ng-sets\x03\0\x02\x02\x03\x02\x01\x01\x04\0\x05value\x03\0\x04\x01p\x01\x01ky\x01\
+j\x01\x03\x01s\x01@\x03\x06sparqls\x08bindings\x06\x08max-rows\x07\0\x08\x04\0\x0d\
+execute-query\x01\x09\x01@\0\0y\x04\0\x0ecallback-depth\x01\x0a\x01j\x01y\x01s\x01\
+@\x01\x06sparqls\0\x0b\x04\0\x0dprepare-query\x01\x0c\x01@\x03\x06handley\x08bin\
+dings\x06\x08max-rows\x07\0\x08\x04\0\x0crun-prepared\x01\x0d\x01p\x05\x01j\x01\x0e\
+\x01s\x01@\x02\x07subject\x05\x09predicate\x05\0\x0f\x04\0\x10follow-predicate\x01\
+\x10\x03\0\x1estardog:webfunction/host@0.3.3\x05\x08\x01p\x02\x01j\x01\x04\x01s\x01\
+@\x01\x04args\x09\0\x0a\x04\0\x08evaluate\x01\x0b\x01j\0\x01s\x01@\x02\x04args\x09\
+\x04multw\0\x0c\x04\0\x0eaggregate-step\x01\x0d\x01@\0\0\x0a\x04\0\x10aggregate-\
+finish\x01\x0e\x01j\x01\x06\x01s\x01@\x02\x05input\x06\x04args\x09\0\x0f\x04\0\x14\
+cardinality-estimate\x01\x10\x01@\0\0\x04\x04\0\x03doc\x01\x11\x04\0%stardog:web\
+function/webfunction@0.3.3\x04\0\x0b\x11\x01\0\x0bwebfunction\x03\0\0\0G\x09prod\
+ucers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x06\
+0.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

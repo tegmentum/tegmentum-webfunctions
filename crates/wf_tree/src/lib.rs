@@ -89,9 +89,11 @@ fn value_to_json(v: &Value) -> JsonValue {
     }
 }
 
-/// Recursively walk from `node`, running `query` at each level with `?this`
-/// bound to the current node.
-fn walk(node: &Value, query: &str, child_var: &str, seen: &mut HashSet<String>) -> JsonValue {
+/// Recursively walk from `node`, running the prepared `query_handle` at each
+/// level with `?this` bound to the current node. The parse + precompile cost
+/// is paid once by the caller via `host::prepare_query`; each recursion step
+/// only pays initial-binding substitution and iteration.
+fn walk(node: &Value, query_handle: u32, child_var: &str, seen: &mut HashSet<String>) -> JsonValue {
     let node_key = value_as_string(node);
 
     let mut obj = serde_json::Map::new();
@@ -115,7 +117,7 @@ fn walk(node: &Value, query: &str, child_var: &str, seen: &mut HashSet<String>) 
         value: node.clone(),
     }];
 
-    let rows = match host::execute_query(query, &bindings, Some(CHILD_ROW_LIMIT)) {
+    let rows = match host::run_prepared(query_handle, &bindings, Some(CHILD_ROW_LIMIT)) {
         Ok(bs) => bs,
         Err(e) => {
             obj.insert("error".into(), json!(e));
@@ -135,7 +137,7 @@ fn walk(node: &Value, query: &str, child_var: &str, seen: &mut HashSet<String>) 
             .map(|b| (b.name.clone(), value_to_json(&b.value)))
             .collect();
 
-        let child_tree = walk(&child_binding.value, query, child_var, seen);
+        let child_tree = walk(&child_binding.value, query_handle, child_var, seen);
         let mut child_obj = child_tree.as_object().cloned().unwrap_or_default();
         for (k, v) in attrs {
             // Don't clobber existing keys (mainly "uri", "children", "cycle").
@@ -176,8 +178,13 @@ impl Guest for Component {
             DEFAULT_CHILD_VAR.into()
         };
 
+        // Parse + precompile the child-lookup query once. Every recursion
+        // step reuses the handle, so we don't re-pay ~400µs of parse +
+        // strategy.precompile on each of N nodes.
+        let query_handle = host::prepare_query(&query)?;
+
         let mut seen: HashSet<String> = HashSet::new();
-        let tree = walk(&root, &query, &child_var, &mut seen);
+        let tree = walk(&root, query_handle, &child_var, &mut seen);
 
         Ok(BindingSets {
             vars: vec!["tree".into()],

@@ -1,13 +1,15 @@
-// Webfunction WIT world, v0.3.2.
+// Webfunction WIT world, v0.3.1.
 //
-// v0.3.2 adds `prepare-query` + `run-prepared` — the guest can amortise
-// SPARQL parsing and per-engine plan compilation over many callbacks.
-// wf_tree's 1000-node walk drops from ~800 ms to ~150 ms once the guest
-// stops re-parsing the child-lookup query on every recursion step.
+// Additive change over v0.3.0: adds `execute-update` to the host interface,
+// so a component can also perform SPARQL 1.1 Update (INSERT/DELETE) against
+// the calling triplestore's transaction. `execute-query` and `callback-depth`
+// are unchanged; guest components using only those keep working.
 //
-// Additive; a v0.3.0 guest that only imports execute-query still links.
+// This file is deliberately per-crate (not a shared wit) so components can
+// move to v0.3.1 independently — plugins keep the v0.3.0 imports registered
+// and add the v0.3.1 ones alongside.
 
-package stardog:webfunction@0.3.2;
+package stardog:webfunction@0.3.1;
 
 interface types {
     variant value {
@@ -83,31 +85,28 @@ interface host {
     ) -> result<binding-sets, string>;
 
     /// Current callback-recursion depth. Zero on the outermost wasm call;
-    /// incremented every time `execute-query` re-enters a wasm component.
-    /// The host also caps hard (`webfunctions.callback.max.depth`, default
-    /// 100); this accessor lets the component unwind cleanly before the cap.
+    /// incremented every time `execute-query` or `execute-update` re-enters
+    /// a wasm component. The host also caps hard
+    /// (`webfunctions.callback.max.depth`, default 100); this accessor lets
+    /// the component unwind cleanly before the cap.
     callback-depth: func() -> u32;
 
-    /// Parse a SPARQL SELECT/ASK/CONSTRUCT/DESCRIBE once and return an
-    /// opaque handle the guest can pass to `run-prepared`. The host caches
-    /// whatever it can — parsed algebra, precompiled evaluation step, plan
-    /// — under the handle, so per-call cost drops to just the initial-
-    /// binding substitution and the actual scan/iteration.
+    /// Execute a SPARQL 1.1 UPDATE (INSERT/DELETE/LOAD/CLEAR) in the caller's
+    /// current transaction. `bindings` are pre-applied the same way
+    /// `execute-query` uses them — variables in the update text bind to the
+    /// supplied Values before the update runs. Returns `ok(_)` on success or
+    /// `err(msg)` on failure; the host does not report a change count.
     ///
-    /// Handles are valid only for the lifetime of the outer wf:call that
-    /// created them. When that call returns, all handles it minted are
-    /// invalidated together — the guest doesn't need to release them
-    /// explicitly. Attempts to use a stale handle return err.
-    prepare-query: func(sparql: string) -> result<u32, string>;
-
-    /// Run a previously-prepared query with fresh initial bindings. Same
-    /// return contract as `execute-query`. `handle` must be one this
-    /// wf:call frame minted via `prepare-query`.
-    run-prepared: func(
-        handle: u32,
+    /// Semantics depend on the calling engine's transaction model. RDF4J and
+    /// Stardog run the update inside the outer query's transaction, so
+    /// subsequent `execute-query` calls in the same wasm invocation see the
+    /// new data. Jena's ARQ path commits the update to the underlying
+    /// DatasetGraph immediately — same-invocation reads still see it, but
+    /// there is no outer transaction to roll back.
+    execute-update: func(
+        sparql: string,
         bindings: list<binding>,
-        max-rows: option<u32>,
-    ) -> result<binding-sets, string>;
+    ) -> result<_, string>;
 }
 
 world webfunction {

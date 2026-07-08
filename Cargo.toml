@@ -132,7 +132,9 @@ members = [
     "crates/nest_by",
     "crates/nest_hierarchy",
     "crates/wf_tree",
+    "crates/wf_tree_fast",
     "crates/debug_callback_depth",
+    "crates/debug_execute_update",
     "crates/webassembly_wat",
 ]
 resolver = "2"

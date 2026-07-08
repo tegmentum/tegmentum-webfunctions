@@ -1,13 +1,15 @@
-// Webfunction WIT world, v0.3.2.
+// Webfunction WIT world, v0.3.3.
 //
-// v0.3.2 adds `prepare-query` + `run-prepared` — the guest can amortise
-// SPARQL parsing and per-engine plan compilation over many callbacks.
-// wf_tree's 1000-node walk drops from ~800 ms to ~150 ms once the guest
-// stops re-parsing the child-lookup query on every recursion step.
+// v0.3.3 adds `follow-predicate` — a direct triple-pattern lookup that
+// bypasses SPARQL entirely for the common walk-one-predicate case. On the
+// wf_tree_fast benchmark this brings the marginal per-callback cost down
+// from ~25 µs (prepared query) to ~5 µs by cutting the initial-binding
+// substitution, the parsed-algebra iteration setup, and the WIT marshalling
+// of binding-set records.
 //
-// Additive; a v0.3.0 guest that only imports execute-query still links.
+// Additive; older guests keep linking.
 
-package stardog:webfunction@0.3.2;
+package stardog:webfunction@0.3.3;
 
 interface types {
     variant value {
@@ -58,7 +60,7 @@ interface types {
 /// and can recurse to build tree-shaped output. See `crates/wf_tree/` for
 /// the reference implementation.
 interface host {
-    use types.{binding, binding-sets};
+    use types.{binding, binding-sets, value};
 
     /// Execute a read-only SPARQL query in the caller's current
     /// transaction. `bindings` are pre-applied as if the query text opened
@@ -108,6 +110,20 @@ interface host {
         bindings: list<binding>,
         max-rows: option<u32>,
     ) -> result<binding-sets, string>;
+
+    /// Native triple-pattern lookup: returns the set of `?o` matching
+    /// `(subject, predicate, ?o)` in the outer query's current transaction.
+    /// No SPARQL parse, no algebra, no binding-set marshalling — the host
+    /// hands back a plain list of value variants.
+    ///
+    /// This is the fast path for tree/graph traversal patterns whose
+    /// child-lookup is a single triple pattern. Guests can layer more
+    /// structure on top (attributes, joined siblings, etc.) via
+    /// `execute-query`; `follow-predicate` is for the tight inner loop.
+    follow-predicate: func(
+        subject: value,
+        predicate: value,
+    ) -> result<list<value>, string>;
 }
 
 world webfunction {
