@@ -1,6 +1,7 @@
 package ai.tegmentum.portability;
 
 import org.apache.jena.query.QueryExecution;
+import org.apache.jena.query.QuerySolution;
 import org.apache.jena.query.ResultSet;
 import org.apache.jena.sparql.exec.http.QueryExecutionHTTPBuilder;
 import org.junit.BeforeClass;
@@ -10,34 +11,37 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assume.assumeTrue;
 
 /**
- * QLever wf:call proof against the qlever-wf:0.3.0 image (Piece B of the
- * host-callback wiring lands with this test). Complements the older
- * WfTreeScaleQleverTest which pinned itself to 0.1.0 and only exercised
- * the extractor path.
+ * QLever wf:call SPARQL-level proof against qlever-wf:0.4.0. Piece C of the
+ * wire lands with this image: {@code WfCallExpression.cpp} now marshals args
+ * into a WIT {@code list<value>} JSON payload and parses the guest's
+ * {@code binding-sets} reply properly, so wf:call finally returns real
+ * SPARQL literals instead of always collapsing to UNDEF.
  *
- * <p>Coverage in v0.3:
+ * <p>0.4.0 differences vs. 0.3.0:
  * <ul>
- *   <li>SPARQL endpoint is reachable — proves the qlever-server binary
- *       actually links against libqlever_wf_runtime.a and boots</li>
- *   <li>{@code wf:call(<to_upper.wasm>, "stardog")} returns "STARDOG" —
- *       proves the core-module ABI works through the new callback-aware
- *       WfRuntime::Impl constructor (wf_runtime_new_with_callbacks)</li>
+ *   <li>Argument marshalling: {@code wf:call(<url>, arg1, ...)} now
+ *       serialises constants as WIT {@code value} JSON — bare {@code "{}"}
+ *       was the 0.3.0 payload.</li>
+ *   <li>Result extraction: parses {@code {"vars": ..., "rows": [[{"name":
+ *       ..., "value": {...}}, ...], ...]}} via {@code nlohmann::json}
+ *       rather than the earlier substring hack that only worked for
+ *       xsd:string literals with a single {@code "value":"..."} match.</li>
  * </ul>
  *
- * <p>execute-query re-entrancy (wf_tree.wasm) is explicitly NOT tested here
- * — Piece B of the runtime work leaves execute_query stubbed at the C++
- * level so the ABI is ready but the QLever query engine wiring is still
- * a follow-up. A guest that reaches for execute-query today sees a clean
- * {@code err "host callback `execute-query` not wired by embedder"} rather
- * than silent misbehaviour.
+ * <p>Test guest: {@code debug_callback_depth.wasm}. It is component-mode,
+ * callback-free (the runtime supplies {@code callback-depth} as a fallback
+ * that returns 0 outside of nested re-entry), and its {@code evaluate}
+ * returns a single {@code xsd:integer} literal with value {@code "0"}.
+ * That is enough to prove the whole pipeline end-to-end without needing a
+ * bulk-loaded index.
  *
- * <p>Boot manually with (from a directory containing to_upper.wasm and a
- * bulk-loaded index):
+ * <p>Boot manually with (from a directory containing debug_callback_depth.wasm
+ * and any minimal index):
  * <pre>
  *   docker run --rm -d --name qlever-wf --platform linux/arm64 -p 7001:7001 \
  *       -e UID=$(id -u) -e GID=$(id -g) \
  *       -v $(pwd):/data -w /data \
- *       qlever-wf:0.3.0 \
+ *       qlever-wf:0.4.0 \
  *       qlever-server --port 7001 &lt;index-basename&gt;
  * </pre>
  */
@@ -45,8 +49,12 @@ public class WfCallQleverTest {
 
     private static final String SPARQL_URL = System.getProperty(
             "qlever.sparql.url", "http://localhost:7001/");
+    // Component-mode guest that returns a single xsd:integer literal "0"
+    // and depends on no embedder-provided host callbacks.
     private static final String WASM_URL_IN_QUERY = System.getProperty(
-            "qlever.wasm.url", "file:///opt/wasm/to_upper.wasm");
+            "qlever.wasm.url", "file:///opt/wasm/debug_callback_depth.wasm");
+
+    private static final String XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer";
 
     @BeforeClass
     public static void probe() {
@@ -69,18 +77,19 @@ public class WfCallQleverTest {
     }
 
     /**
-     * Callback-free wasm proof: {@code wf:call(<to_upper.wasm>, "stardog")}
-     * returns "STARDOG". This exercises the core-module ABI, which is what
-     * to_upper.wasm ships as. The Component Model path is exercised through
-     * a separate WIT-based guest whose host imports are stubbed at
-     * err&lt;string&gt; today.
+     * BIND (wf:call(&lt;debug_callback_depth.wasm&gt;) AS ?depth) → "0"^^xsd:integer.
+     *
+     * <p>Regression: v0.3.0 would return UNDEF because the C++ WfCallExpression
+     * always emitted an empty JSON payload AND used a naive
+     * {@code "value":"..."} substring extractor, which cannot match a nested
+     * {@code "value":{"literal":{"label":"0","datatype":...}}} shape at all.
      */
     @Test
-    public void wfCallReturnsUpperCasedLiteral() {
+    public void wfCallReturnsRealBoundValue() {
         final String sparql =
             "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n" +
             "SELECT ?result WHERE {\n" +
-            "  BIND (wf:call(<" + WASM_URL_IN_QUERY + ">, \"stardog\") AS ?result)\n" +
+            "  BIND (wf:call(<" + WASM_URL_IN_QUERY + ">) AS ?result)\n" +
             "}";
 
         final long t0 = System.nanoTime();
@@ -90,10 +99,16 @@ public class WfCallQleverTest {
                 .build()) {
             final ResultSet rs = qe.execSelect();
             assertThat(rs.hasNext()).isTrue();
-            final String out = rs.next().getLiteral("result").getLexicalForm();
-            System.out.printf("QLever wf:call (warm): %d ms, result='%s'%n",
-                (System.nanoTime() - t0) / 1_000_000L, out);
-            assertThat(out).isEqualTo("STARDOG");
+            final QuerySolution row = rs.next();
+            assertThat(row.contains("result"))
+                .as("wf:call must bind a non-UNDEF value")
+                .isTrue();
+            final String lex = row.getLiteral("result").getLexicalForm();
+            final String dt = row.getLiteral("result").getDatatypeURI();
+            System.out.printf("QLever wf:call (warm): %d ms, result='%s'^^<%s>%n",
+                (System.nanoTime() - t0) / 1_000_000L, lex, dt);
+            assertThat(lex).isEqualTo("0");
+            assertThat(dt).isEqualTo(XSD_INTEGER);
         }
     }
 }
