@@ -202,7 +202,6 @@ public class WfServiceJenaTest {
      * cases known, or {@code WitList} should use {@code isCompatibleWith}
      * instead of strict {@code equals}. Re-enable once the fix ships.
      */
-    @Ignore("wasmtime4j 46.0.1-1.2.0 WitList validation rejects mixed-variant rows")
     @Test
     public void treeRowsGuestBlockedByWasmtime4jDeserializer() {
         final File wasm = new File(WF_TREE_ROWS_WASM);
