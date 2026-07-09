@@ -134,6 +134,7 @@ members = [
     "crates/wf_tree",
     "crates/wf_tree_fast",
     "crates/wf_tree_rows",
+    "crates/adjacency_tree",
     "crates/debug_callback_depth",
     "crates/debug_execute_update",
     "crates/webassembly_wat",
