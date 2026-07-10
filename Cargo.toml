@@ -98,6 +98,7 @@ members = [
     "crates/similarity_hamming",
     "crates/similarity_jaro",
     "crates/similarity_jaro_winkler",
+    "crates/similarity_levenshtein",
     "crates/similarity_normalized_damerau_levenshtein",
     "crates/similarity_normalized_levenshtein",
     "crates/similarity_osa_distance",
