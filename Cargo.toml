@@ -149,6 +149,8 @@ members = [
     "crates/string_lang_lingua_tag",
     "crates/nest_by",
     "crates/nest_hierarchy",
+    "crates/wf_apply",
+    "crates/wf_map",
     "crates/wf_tree",
     "crates/wf_tree_fast",
     "crates/vega_bar_chart",
