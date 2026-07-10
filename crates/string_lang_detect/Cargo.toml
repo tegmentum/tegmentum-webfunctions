@@ -1,0 +1,19 @@
+[package]
+name = "string_lang_detect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+whatlang = "0.16"
+
+[package.metadata.component]
+package = "tegmentum:string-lang-detect"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

@@ -1,0 +1,19 @@
+[package]
+name = "string_lang_lingua_all_languages_with_devanagari_script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+lingua = { version = "1.8", default-features = false, features = ["english", "spanish", "french", "german", "italian", "portuguese", "russian", "japanese"] }
+
+[package.metadata.component]
+package = "tegmentum:string-lang-lingua-all-languages-with-devanagari-script"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"

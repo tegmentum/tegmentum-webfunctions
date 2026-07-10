@@ -1,0 +1,19 @@
+[package]
+name = "string_lang_all_languages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+whatlang = "0.16"
+
+[package.metadata.component]
+package = "tegmentum:string-lang-all-languages"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"
