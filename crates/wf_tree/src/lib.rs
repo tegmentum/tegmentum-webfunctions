@@ -45,6 +45,11 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+// RDF 1.2 canonical JSON datatype. Stardog exposes it natively; Oxigraph
+// and Jena/RDF4J parse it as an opaque literal with an application-JSON
+// content marker so consumers can dispatch on the datatype instead of
+// re-parsing an untyped string.
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 
 // Conservative guard below the host's default max-depth of 100. If the host
 // admin has lowered the cap, we still exit cleanly before reaching it.
@@ -56,6 +61,10 @@ const CHILD_ROW_LIMIT: u32 = 1_000;
 
 fn string_literal(s: &str) -> Value {
     Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+}
+
+fn json_literal(s: &str) -> Value {
+    Value::Literal(Literal { label: s.into(), datatype: RDF_JSON.into(), lang: None })
 }
 
 fn value_as_string(v: &Value) -> String {
@@ -190,7 +199,7 @@ impl Guest for Component {
             vars: vec!["tree".into()],
             rows: vec![vec![Binding {
                 name: "tree".into(),
-                value: string_literal(&tree.to_string()),
+                value: json_literal(&tree.to_string()),
             }]],
         })
     }
