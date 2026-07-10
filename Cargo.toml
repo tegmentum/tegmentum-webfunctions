@@ -134,6 +134,7 @@ members = [
     "crates/nest_hierarchy",
     "crates/wf_tree",
     "crates/wf_tree_fast",
+    "crates/vega_bar_chart",
     "crates/wf_tree_rows",
     "crates/adjacency_tree",
     "crates/debug_callback_depth",

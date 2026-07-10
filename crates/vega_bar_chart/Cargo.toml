@@ -1,0 +1,19 @@
+[package]
+name = "vega_bar_chart"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[package.metadata.component]
+package = "tegmentum:vega-bar-chart"
+
+[package.metadata.component.target]
+path = "wit"
+world = "webfunction"
