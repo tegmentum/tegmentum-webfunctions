@@ -31,6 +31,12 @@
       "description": "Only for shape=list. SQL-side type of the list's value column, derived from the dominant xsd datatype of chain leaves (or `iri` when leaves are IRIs)."
     },
 
+    "graph": {
+      "type": "string",
+      "format": "iri",
+      "description": "Named graph the shape lives in. Absent = default graph (assertions carrying no explicit graph identifier). When set, wf_materialize scopes its source SELECT to this graph, wf_demote scopes its DELETE to this graph, and wf_fetch returns the graph identifier alongside each row. Descriptors from different named graphs can co-exist under the same shape name if the sink schema supports it (the sink's primary key becomes (subject_iri, graph))."
+    },
+
     "anchor": {
       "type": "object",
       "description": "How to identify subjects belonging to this shape.",

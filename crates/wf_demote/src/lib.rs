@@ -45,6 +45,11 @@ struct Descriptor {
     anchor: Anchor,
     columns: Vec<Column>,
     sink: Option<String>,
+    /// Named graph the shape lives in. Absent = default graph. When
+    /// present, the DELETE scopes to this graph so triples in other
+    /// graphs about the same subjects are preserved.
+    #[serde(default)]
+    graph: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +146,18 @@ impl Guest for Component {
         // VALUES + FILTER but SPARQL parsers tolerate ~10k VALUES rows
         // cleanly; CHUNK=1000 leaves headroom for very fat predicate
         // sets without needing dialect-specific tuning.
+        // Scope the DELETE to a named graph when the descriptor names
+        // one. Without this, demoting a shape that lives in graph A
+        // would happily delete matching triples that were actually
+        // asserted in graph B — a Stardog-style "your delete affected
+        // things you didn't ask about" failure we intentionally avoid.
+        let graph_wrap = |body: &str| -> String {
+            match &d.graph {
+                Some(g) => format!("GRAPH <{g}> {{ {body} }}"),
+                None => body.to_string(),
+            }
+        };
+
         let mut deleted = 0u64;
         for predicate in &predicates {
             for chunk in subjects.chunks(CHUNK) {
@@ -149,10 +166,13 @@ impl Guest for Component {
                     .map(|iri| format!("<{iri}>"))
                     .collect::<Vec<_>>()
                     .join(" ");
+                let delete_pattern = format!("?s <{predicate}> ?o");
+                let where_pattern = format!("?s <{predicate}> ?o");
                 let update = format!(
-                    "DELETE {{ ?s <{predicate}> ?o }} WHERE {{ \
-                     ?s <{predicate}> ?o . VALUES ?s {{ {values_clause} }} \
-                     }}"
+                    "DELETE {{ {del} }} WHERE {{ {whr} . VALUES ?s {{ {vals} }} }}",
+                    del = graph_wrap(&delete_pattern),
+                    whr = graph_wrap(&where_pattern),
+                    vals = values_clause,
                 );
                 host::execute_update(&update).map_err(|e| {
                     format!(

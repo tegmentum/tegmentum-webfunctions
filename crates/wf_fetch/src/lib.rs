@@ -88,12 +88,13 @@ impl Guest for Component {
             .ok_or_else(|| "wf_fetch: descriptor has no `sink`".to_string())?;
 
         let table = table_name_from(sink_url);
-        let column_list = d
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
+        // _graph goes ahead of user columns in the projection so
+        // downstream binding lookup finds it under a stable name. Sink
+        // consumers that don't project ?_graph in their outer SELECT
+        // just ignore it.
+        let mut projection: Vec<String> = vec!["_graph".to_string()];
+        projection.extend(d.columns.iter().map(|c| c.name.clone()));
+        let column_list = projection.join(", ");
         let sql = if sql_tail.is_empty() {
             format!("SELECT {column_list} FROM {table}")
         } else {
@@ -109,10 +110,35 @@ impl Guest for Component {
         // remap them into WIT value shapes matched to the descriptor's
         // declared column types (the sink's own type inference is looser
         // — TEXT → xsd:string always — so we tighten it here).
-        let vars: Vec<String> = d.columns.iter().map(|c| c.name.clone()).collect();
+        let mut vars: Vec<String> = vec!["_graph".into()];
+        vars.extend(d.columns.iter().map(|c| c.name.clone()));
+
         let mut rows: Vec<Vec<Binding>> = Vec::with_capacity(raw.rows.len());
         for row in &raw.rows {
-            let mut out = Vec::with_capacity(d.columns.len());
+            let mut out = Vec::with_capacity(d.columns.len() + 1);
+            // Surface the graph column as an iri when non-empty; skip
+            // the binding entirely for default-graph rows so consumers
+            // see it as UNDEF rather than as an empty-string literal
+            // (matches SPARQL's convention that default-graph facts
+            // have no graph identifier at all).
+            if let Some(gv) = row.iter().find(|b| b.name == "_graph").map(|b| &b.value) {
+                let non_empty = match gv {
+                    Value::Literal(l) if l.label.is_empty() => false,
+                    Value::Literal(_) | Value::Iri(_) => true,
+                    Value::Bnode(_) => false,
+                };
+                if non_empty {
+                    let iri_val = match gv {
+                        Value::Iri(s) => Value::Iri(s.clone()),
+                        Value::Literal(l) => Value::Iri(l.label.clone()),
+                        other => other.clone(),
+                    };
+                    out.push(Binding {
+                        name: "_graph".into(),
+                        value: iri_val,
+                    });
+                }
+            }
             for col in &d.columns {
                 let raw_val = row.iter().find(|b| b.name == col.name).map(|b| &b.value);
                 if let Some(v) = raw_val {

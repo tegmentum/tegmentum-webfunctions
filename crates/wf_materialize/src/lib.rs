@@ -47,6 +47,12 @@ struct Descriptor {
     sink: Option<String>,
     #[serde(default)]
     registry: Option<String>,
+    /// Optional named graph the shape lives in. Absent = default graph.
+    /// Present = anchor pattern and column reads scope to this GRAPH
+    /// clause, sink schema includes a graph column, subsequent
+    /// wf_demote scopes its DELETE to the same graph.
+    #[serde(default)]
+    graph: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,8 +147,17 @@ impl Guest for Component {
 
         let mut row_count = 0u64;
         let insert = build_insert(&table_name, &d.columns);
+        // Graph identifier stored alongside every row so a sink
+        // consumer can distinguish default-graph facts from named-graph
+        // ones without re-consulting the descriptor. Empty string ⇔
+        // default graph.
+        let graph_lit = Value::Literal(Literal {
+            label: d.graph.clone().unwrap_or_default(),
+            datatype: XSD_STRING.into(),
+            lang: None,
+        });
         for row in rows.rows {
-            let params = align_params(&row, &d.columns);
+            let params = align_params(&row, &d.columns, &graph_lit);
             host::sink_execute(handle, &insert, &params)
                 .map_err(|e| format!("wf_materialize: insert row {row_count}: {e}"))?;
             row_count += 1;
@@ -271,15 +286,26 @@ fn build_select(d: &Descriptor) -> Result<String, String> {
         }
     }
 
+    // Wrap the pattern in a GRAPH clause when the descriptor scopes to
+    // a named graph. Absent = default graph, no wrapping needed.
+    let where_body = if let Some(g) = &d.graph {
+        format!("GRAPH <{g}> {{ {} }}", patterns.join(" "))
+    } else {
+        patterns.join(" ")
+    };
     Ok(format!(
         "SELECT {} WHERE {{ {} }}",
         projection.join(" "),
-        patterns.join(" ")
+        where_body
     ))
 }
 
 fn build_ddl(table: &str, cols: &[Column]) -> String {
     let mut parts: Vec<String> = Vec::new();
+    // Universal graph column — NULL when the source triple lived in the
+    // default graph, or the named-graph IRI otherwise. Kept ahead of
+    // user columns so the sink schema always starts with it.
+    parts.push("_graph TEXT".to_string());
     for col in cols {
         let sqlite_type = sqlite_type_for(&col.r#type);
         let nullable = matches!(col.cardinality.as_str(), "1" | "1..n");
@@ -343,7 +369,11 @@ fn sql_literal(v: &serde_json::Value) -> String {
 }
 
 fn build_insert(table: &str, cols: &[Column]) -> String {
-    let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+    // _graph is emitted ahead of user columns to match build_ddl's
+    // column order; align_params below produces the graph slot first
+    // as well.
+    let mut names: Vec<&str> = vec!["_graph"];
+    names.extend(cols.iter().map(|c| c.name.as_str()));
     let placeholders = std::iter::repeat("?")
         .take(names.len())
         .collect::<Vec<_>>()
@@ -380,28 +410,33 @@ fn registry_table_from(url: &str) -> String {
         .unwrap_or_else(|| "shapes".into())
 }
 
-/// Rearrange one row's bindings into the descriptor's column order,
-/// substituting an empty-string literal for missing OPTIONAL cells.
-fn align_params(row: &[Binding], cols: &[Column]) -> Vec<Value> {
-    cols.iter()
-        .map(|col| {
-            let name = if col.role == "subject_iri" {
-                "subject"
-            } else {
-                col.name.as_str()
-            };
-            row.iter()
-                .find(|b| b.name == name)
-                .map(|b| b.value.clone())
-                .unwrap_or_else(|| {
-                    Value::Literal(Literal {
-                        label: String::new(),
-                        datatype: XSD_STRING.into(),
-                        lang: None,
-                    })
+/// Rearrange one row's bindings into (graph, ...descriptor columns...)
+/// order. The graph literal is stamped ahead of every user column so
+/// the parameter list matches build_insert's placeholder count.
+/// Missing OPTIONAL cells become empty-string literals.
+fn align_params(row: &[Binding], cols: &[Column], graph_lit: &Value) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(cols.len() + 1);
+    out.push(graph_lit.clone());
+    for col in cols {
+        let name = if col.role == "subject_iri" {
+            "subject"
+        } else {
+            col.name.as_str()
+        };
+        let v = row
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.value.clone())
+            .unwrap_or_else(|| {
+                Value::Literal(Literal {
+                    label: String::new(),
+                    datatype: XSD_STRING.into(),
+                    lang: None,
                 })
-        })
-        .collect()
+            });
+        out.push(v);
+    }
+    out
 }
 
 fn integer_literal(n: i64) -> Value {
