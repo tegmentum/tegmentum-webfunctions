@@ -1,0 +1,34 @@
+{
+  "name": "interests",
+  "shape": "list",
+  "anchor": {
+    "class": "http://dbpedia.org/ontology/Person"
+  },
+  "list_predicate": "http://dbpedia.org/ontology/interests",
+  "value_type": "string",
+  "columns": [
+    {
+      "name": "subject",
+      "role": "subject_iri",
+      "type": "iri"
+    },
+    {
+      "name": "idx",
+      "role": "list_index",
+      "type": "integer",
+      "cardinality": "1"
+    },
+    {
+      "name": "value",
+      "role": "list_value",
+      "type": "string",
+      "cardinality": "1"
+    }
+  ],
+  "sink": "sqlite:///data/demo.db#interests",
+  "demote": false,
+  "provenance": {
+    "generator": "hand-written",
+    "confidence": 1.0
+  }
+}

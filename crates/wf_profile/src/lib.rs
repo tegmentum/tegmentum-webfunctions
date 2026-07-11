@@ -166,7 +166,17 @@ fn classify(
         "0..1"
     };
 
-    let (shape, target_type, confidence) = if lit_pct >= 0.95 {
+    // Check for RDF Collection / rdf:list shape BEFORE dispatching on
+    // iri_pct vs lit_pct, because a list head may be either a bnode
+    // (pre-skolemize) or an IRI (post-skolemize) but the shape is the
+    // same. Any predicate whose object typically has rdf:first + rdf:rest
+    // out-edges is a list head, regardless of whether the head is a
+    // bnode or a genid IRI. Only reachable for functional predicates —
+    // real lists have one head per subject.
+    let (shape, target_type, confidence) = if max_c <= 1 && is_rdf_list(predicate) {
+        let value_type = list_value_type(predicate);
+        ("list".to_string(), value_type, 0.85)
+    } else if lit_pct >= 0.95 {
         let dt = dominant_datatype(predicate);
         let target = xsd_to_column_type(&dt);
         if max_c <= 1 {
@@ -183,14 +193,56 @@ fn classify(
             ("graph".to_string(), "iri".to_string(), 0.50_f64.min(iri_pct))
         }
     } else if bns > 0 {
-        // Blank-node objects are almost always structural (RDF collections,
-        // OWL restrictions). Not demotion candidates.
+        // Blank-node objects that aren't RDF Collection heads — OWL
+        // Restrictions, reified statements, ad-hoc structures. Not
+        // demotion candidates.
         ("graph".to_string(), "bnode".to_string(), 0.60)
     } else {
         ("graph".to_string(), "mixed".to_string(), 0.30)
     };
 
     (shape, cardinality.to_string(), target_type, confidence)
+}
+
+/// Is the predicate's object typically the head of an RDF Collection?
+/// Detection: probe whether the object carries both `rdf:first` and
+/// `rdf:rest` out-edges. Works pre-skolemize (head is a bnode) and
+/// post-skolemize (head is a genid IRI) — the shape lives in the
+/// out-edges, not the head's identity. One SELECT with LIMIT 1 is
+/// enough; a mid-chain surgery that hides the head shape is a corner
+/// case we accept as a false-negative rather than a false-positive.
+fn is_rdf_list(predicate: &str) -> bool {
+    let sparql = format!(
+        "SELECT ?head WHERE {{ \
+         ?s <{predicate}> ?head . \
+         ?head <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ?_f ; \
+               <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>  ?_r . \
+         }}"
+    );
+    host::execute_query(&sparql, &[], Some(1))
+        .map(|bs| !bs.rows.is_empty())
+        .unwrap_or(false)
+}
+
+/// For a predicate whose object is an RDF Collection head, discover the
+/// dominant datatype of the chain's leaf values. Samples up to 100 first
+/// items via `rdf:first` — we only need enough to pick one xsd datatype
+/// or notice that the leaves are IRIs.
+fn list_value_type(predicate: &str) -> String {
+    let sparql = format!(
+        "SELECT ?dt (COUNT(*) AS ?n) (COUNT(IF(isIRI(?item), 1, 1)) AS ?iri_n) WHERE {{ \
+         ?s <{predicate}> ?head . \
+         ?head <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>*/\
+<http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ?item . \
+         FILTER(isLiteral(?item)) BIND(datatype(?item) AS ?dt) \
+         }} GROUP BY ?dt ORDER BY DESC(?n)"
+    );
+    host::execute_query(&sparql, &[], Some(1))
+        .ok()
+        .and_then(|bs| bs.rows.into_iter().next())
+        .and_then(|row| binding_iri(&row, "dt"))
+        .map(|dt| xsd_to_column_type(&dt))
+        .unwrap_or_else(|| "iri".into())
 }
 
 fn dominant_datatype(predicate: &str) -> String {

@@ -16,8 +16,19 @@
     },
 
     "shape": {
-      "enum": ["attribute", "foreign_key", "child_table", "tree", "graph"],
-      "description": "Shape family. Determines which materializer runs (attribute/foreign_key/child_table → wf_materialize_relational.wasm; tree → wf_materialize_tree.wasm; graph → do not demote)."
+      "enum": ["attribute", "foreign_key", "child_table", "list", "tree", "graph"],
+      "description": "Shape family. Determines which materializer runs (attribute/foreign_key/child_table → wf_materialize_relational.wasm; list → wf_materialize_list.wasm; tree → wf_materialize_tree.wasm; graph → do not demote)."
+    },
+
+    "list_predicate": {
+      "type": "string",
+      "format": "iri",
+      "description": "Only for shape=list. The predicate whose object is the head of an RDF Collection (rdf:first/rdf:rest chain) or an RDF Container (rdf:_1, rdf:_2, ...). The materializer walks the chain and emits (subject, idx, value) rows to the sink."
+    },
+
+    "value_type": {
+      "enum": ["string", "integer", "decimal", "boolean", "date", "datetime", "iri"],
+      "description": "Only for shape=list. SQL-side type of the list's value column, derived from the dominant xsd datatype of chain leaves (or `iri` when leaves are IRIs)."
     },
 
     "anchor": {
@@ -124,8 +135,8 @@
           "description": "Snake-case column identifier used verbatim in the sink schema."
         },
         "role": {
-          "enum": ["subject_iri", "attribute", "foreign_key", "child_link", "parent_link"],
-          "description": "How this column relates to the anchor. Exactly one column per descriptor has role=subject_iri (the primary key). foreign_key targets a sibling shape; child_link/parent_link only appear on shape=tree descriptors."
+          "enum": ["subject_iri", "attribute", "foreign_key", "child_link", "parent_link", "list_index", "list_value"],
+          "description": "How this column relates to the anchor. Exactly one column per descriptor has role=subject_iri (the primary key). foreign_key targets a sibling shape; child_link/parent_link only appear on shape=tree descriptors; list_index/list_value only appear on shape=list descriptors (list_index is the 0-based position in the RDF list, list_value is the chain leaf)."
         },
         "predicate": {
           "type": "string",

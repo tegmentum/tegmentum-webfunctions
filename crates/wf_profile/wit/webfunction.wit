@@ -83,6 +83,10 @@ interface host {
         args: list<value>,
     ) -> result<binding-sets, string>;
 
+    /// Execute a SPARQL UPDATE against the caller's store. Returns nothing
+    /// on success; the return payload is an ok/err discriminator only.
+    execute-update: func(update: string) -> result<_, string>;
+
     /// Open a sink connection at `url` and return an opaque handle.
     ///
     /// Supported URL schemes are host-dependent; the reference plugin
