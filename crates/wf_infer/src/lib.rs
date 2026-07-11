@@ -86,6 +86,27 @@ struct Rule {
     graph: String,
     #[serde(default = "default_refresh")]
     refresh_mode: String,
+
+    /// Loop until fixed point. Each iteration reads from
+    /// `default_graph ∪ target_graph` (the user writes their WHERE to
+    /// reference the target graph via UNION or GRAPH clauses) and writes
+    /// to `target_graph`. INSERT DATA is idempotent at the store level,
+    /// so re-inserting already-derived triples is a no-op; we detect
+    /// convergence by comparing target-graph size before and after each
+    /// pass.
+    #[serde(default)]
+    iterate: bool,
+
+    /// Safety cap on iteration count. Non-terminating rules or slow
+    /// convergence would otherwise loop forever. Default 100; the
+    /// transitive closure of anything human-scale converges well
+    /// under that.
+    #[serde(default = "default_max_iterations")]
+    max_iterations: u32,
+}
+
+fn default_max_iterations() -> u32 {
+    100
 }
 
 impl Rule {
@@ -157,31 +178,61 @@ impl Guest for Component {
             ));
         }
 
-        // Run the CONSTRUCT via execute-query. CONSTRUCT returns
-        // binding-sets with vars=[s, p, o] and one row per emitted
-        // triple (see the host contract in host.wit).
         let construct_sparql = rule.construct_sparql()?;
-        let bs = host::execute_query(&construct_sparql, &[], None)?;
 
-        // INSERT triples into the target graph. Batch: build one big
-        // INSERT DATA per K rows to keep the parser happy. Materialize
-        // as VALUES-free ground triples since CONSTRUCT already
-        // instantiated the template.
-        let inserted = bulk_insert(&rule.graph, &bs)?;
-
-        Ok(BindingSets {
-            vars: vec!["rule".into(), "inserted".into()],
-            rows: vec![vec![
-                Binding {
-                    name: "rule".into(),
-                    value: string_lit(&rule.name),
-                },
-                Binding {
-                    name: "inserted".into(),
-                    value: int_lit(inserted as i64),
-                },
-            ]],
-        })
+        if rule.iterate {
+            let (iterations, emitted_total, final_size) =
+                iterate_to_fixpoint(&rule, &construct_sparql)?;
+            // Naming discipline: `emitted_total` counts CONSTRUCT rows
+            // across every pass — including the ones INSERT DATA set-
+            // semantics silently absorbed as duplicates. It's a
+            // diagnostic (how much SPARQL work happened) not a fact
+            // count. `graph_size` is the honest "how many derived
+            // triples exist" number.
+            Ok(BindingSets {
+                vars: vec![
+                    "rule".into(),
+                    "iterations".into(),
+                    "emitted_total".into(),
+                    "graph_size".into(),
+                ],
+                rows: vec![vec![
+                    Binding {
+                        name: "rule".into(),
+                        value: string_lit(&rule.name),
+                    },
+                    Binding {
+                        name: "iterations".into(),
+                        value: int_lit(iterations as i64),
+                    },
+                    Binding {
+                        name: "emitted_total".into(),
+                        value: int_lit(emitted_total as i64),
+                    },
+                    Binding {
+                        name: "graph_size".into(),
+                        value: int_lit(final_size as i64),
+                    },
+                ]],
+            })
+        } else {
+            // Single-pass: run the CONSTRUCT once, insert the results.
+            let bs = host::execute_query(&construct_sparql, &[], None)?;
+            let inserted = bulk_insert(&rule.graph, &bs)?;
+            Ok(BindingSets {
+                vars: vec!["rule".into(), "inserted".into()],
+                rows: vec![vec![
+                    Binding {
+                        name: "rule".into(),
+                        value: string_lit(&rule.name),
+                    },
+                    Binding {
+                        name: "inserted".into(),
+                        value: int_lit(inserted as i64),
+                    },
+                ]],
+            })
+        }
     }
 
     fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
@@ -216,6 +267,60 @@ impl Guest for Component {
             }]],
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-point iteration
+// ---------------------------------------------------------------------------
+
+/// Loop the CONSTRUCT until the target graph stops growing. Returns
+/// (iterations_run, total_triples_inserted, final_graph_size).
+fn iterate_to_fixpoint(rule: &Rule, construct_sparql: &str) -> Result<(u32, u64, u64), String> {
+    let mut prev_size = graph_size(&rule.graph)?;
+    let mut total_inserted = 0u64;
+    let mut iterations = 0u32;
+
+    while iterations < rule.max_iterations {
+        let bs = host::execute_query(construct_sparql, &[], None)?;
+        let inserted = bulk_insert(&rule.graph, &bs)?;
+        total_inserted += inserted;
+        iterations += 1;
+
+        let new_size = graph_size(&rule.graph)?;
+        if new_size == prev_size {
+            // Fixed point: nothing new was added this pass.
+            return Ok((iterations, total_inserted, new_size));
+        }
+        prev_size = new_size;
+    }
+    // Hit the cap without converging. Return what we have; the caller
+    // sees iterations == max_iterations as the signal that the loop was
+    // truncated. In practice this means the rule diverges or is very
+    // slow to converge — inspect and consider raising max_iterations
+    // or restructuring the rule.
+    Ok((iterations, total_inserted, prev_size))
+}
+
+/// Count triples currently in the target graph. Returns 0 if the graph
+/// doesn't exist yet.
+fn graph_size(graph: &str) -> Result<u64, String> {
+    let sparql = format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}"
+    );
+    let bs = host::execute_query(&sparql, &[], Some(1))?;
+    let row = bs
+        .rows
+        .first()
+        .ok_or_else(|| "wf_infer: graph_size returned no row".to_string())?;
+    let n = row
+        .iter()
+        .find(|b| b.name == "n")
+        .and_then(|b| match &b.value {
+            Value::Literal(l) => l.label.parse::<u64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------
