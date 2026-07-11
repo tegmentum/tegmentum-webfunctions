@@ -153,6 +153,7 @@ members = [
     "crates/wf_canonicalize",
     "crates/wf_demote",
     "crates/wf_fetch",
+    "crates/wf_infer",
     "crates/wf_map",
     "crates/wf_materialize",
     "crates/wf_materialize_list",
