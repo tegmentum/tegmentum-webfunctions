@@ -5,11 +5,11 @@
 //!                     rewritten: xsd:integer }
 //!
 //! Config JSON shape (only `sink` is required; `rule` defaults to
-//! `shortest_uri`):
+//! `mint_genid`):
 //!
 //! ```json
 //! { "sink": "sqlite:///data/mv.db#aliases",
-//!   "rule": "shortest_uri" }
+//!   "rule": "mint_genid" }
 //! ```
 //!
 //! Pipeline (four phases):
@@ -18,10 +18,14 @@
 //!    IRI identities. sameAs is transitive per OWL, so A↔B, B↔C forms
 //!    one class {A, B, C}. Equivalence classes drop out of the DSU.
 //!
-//! 2. For each class, pick a canonical member by the configured rule.
-//!    v1 rules: `shortest_uri` (shortest lexicographic form wins,
-//!    lex-first tiebreak). Extensible later with `prefix_priority` +
-//!    an ordered list of prefixes.
+//! 2. For each class, pick a canonical by the configured rule. v1 rules:
+//!    * `mint_genid` (default) — mint a deterministic well-known-genid
+//!      IRI derived from the sorted class membership. Every source URI
+//!      is treated equally as an alias; no arbitrary preference. Matches
+//!      wf_skolemize's identity resolution.
+//!    * `shortest_uri` — promote the shortest source URI (lex-first
+//!      tiebreak). Retained for callers who want to keep a source URI
+//!      as canonical (e.g. when one identifier scheme is authoritative).
 //!
 //! 3. Rewrite the store: for every triple involving any alias (non-
 //!    canonical member) in subject or object position, INSERT the
@@ -62,7 +66,12 @@ struct Config {
 }
 
 fn default_rule() -> String {
-    "shortest_uri".into()
+    // Mint a well-known-genid IRI per equivalence class rather than
+    // promoting one of the sources — treats every input identifier the
+    // same instead of arbitrarily preferring one. Matches wf_skolemize's
+    // treatment of blank nodes: identity ambiguity always resolves to a
+    // minted IRI + alias map.
+    "mint_genid".into()
 }
 
 impl Guest for Component {
@@ -287,21 +296,50 @@ impl Guest for Component {
 
 fn pick_canonical(class: &[String], rule: &str) -> Result<String, String> {
     match rule {
+        // Mint a fresh well-known-genid IRI derived from the equivalence
+        // class's sorted membership. No original identifier is promoted;
+        // every source is treated as an alias. Deterministic — the same
+        // input class always produces the same canonical.
+        "mint_genid" => {
+            if class.is_empty() {
+                return Err("wf_canonicalize: empty equivalence class".into());
+            }
+            let mut sorted: Vec<&str> = class.iter().map(String::as_str).collect();
+            sorted.sort();
+            let joined = sorted.join("\0");
+            Ok(mint_genid_iri(&joined))
+        }
         // Shortest URI wins; lex-first tiebreak. Deterministic and rule-
-        // free — no external prefix table to maintain.
+        // free — no external prefix table to maintain. Retained as an
+        // opt-in for callers who prefer promoting a real source URI
+        // (useful when one identifier scheme is definitively primary).
         "shortest_uri" => class
             .iter()
-            .min_by(|a, b| {
-                a.len()
-                    .cmp(&b.len())
-                    .then_with(|| a.cmp(b))
-            })
+            .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
             .cloned()
             .ok_or_else(|| "wf_canonicalize: empty equivalence class".into()),
         other => Err(format!(
-            "wf_canonicalize: unknown rule `{other}` (v1 supports: shortest_uri)"
+            "wf_canonicalize: unknown rule `{other}` (v1 supports: mint_genid, shortest_uri)"
         )),
     }
+}
+
+/// Mint a deterministic well-known-genid IRI from an input string. Same
+/// 128-bit hash pattern used by wf_skolemize — two 64-bit accumulators
+/// seeded so collisions across skolemize/canonicalize outputs are
+/// astronomically unlikely.
+fn mint_genid_iri(input: &str) -> String {
+    const GENID_PREFIX: &str = "https://tegmentum.ai/.well-known/genid/";
+    const SALT: u64 = 0x9E3779B97F4A7C15;
+    let mut h1: u64 = SALT;
+    for b in input.bytes() {
+        h1 = h1.wrapping_mul(0x100000001B3).wrapping_add(b as u64);
+    }
+    let mut h2: u64 = h1.rotate_left(23) ^ 0x428A2F98D728AE22;
+    for b in input.bytes() {
+        h2 = h2.wrapping_mul(0x100000001B3).wrapping_add(b as u64);
+    }
+    format!("{GENID_PREFIX}{h1:016x}{h2:016x}")
 }
 
 // ---------------------------------------------------------------------------
