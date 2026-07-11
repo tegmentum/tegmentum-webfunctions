@@ -1,0 +1,41 @@
+{
+  "name": "category_tree",
+  "shape": "tree",
+  "anchor": {
+    "class": "http://www.w3.org/2004/02/skos/core#Concept"
+  },
+  "columns": [
+    {
+      "name": "id",
+      "role": "subject_iri",
+      "type": "iri"
+    },
+    {
+      "name": "label",
+      "role": "attribute",
+      "predicate": "http://www.w3.org/2004/02/skos/core#prefLabel",
+      "type": "string",
+      "cardinality": "1"
+    },
+    {
+      "name": "parent",
+      "role": "parent_link",
+      "predicate": "http://www.w3.org/2004/02/skos/core#broader",
+      "type": "iri",
+      "cardinality": "0..1"
+    },
+    {
+      "name": "children",
+      "role": "child_link",
+      "predicate": "http://www.w3.org/2004/02/skos/core#narrower",
+      "type": "iri",
+      "cardinality": "0..n"
+    }
+  ],
+  "sink": "sirix:///data/skos.sirix#category_tree",
+  "demote": false,
+  "provenance": {
+    "generator": "hand-written",
+    "confidence": 1.0
+  }
+}

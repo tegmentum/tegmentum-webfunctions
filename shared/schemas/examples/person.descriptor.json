@@ -1,0 +1,44 @@
+{
+  "name": "person",
+  "shape": "attribute",
+  "anchor": {
+    "class": "http://dbpedia.org/ontology/Person"
+  },
+  "columns": [
+    {
+      "name": "id",
+      "role": "subject_iri",
+      "type": "iri"
+    },
+    {
+      "name": "name",
+      "role": "attribute",
+      "predicate": "http://xmlns.com/foaf/0.1/name",
+      "type": "string",
+      "cardinality": "1",
+      "constraint": { "max_length": 512 }
+    },
+    {
+      "name": "birth_date",
+      "role": "attribute",
+      "predicate": "http://dbpedia.org/ontology/birthDate",
+      "type": "date",
+      "cardinality": "0..1"
+    },
+    {
+      "name": "birth_place",
+      "role": "foreign_key",
+      "predicate": "http://dbpedia.org/ontology/birthPlace",
+      "type": "iri",
+      "cardinality": "0..1",
+      "target_shape": "place"
+    }
+  ],
+  "sink": "sqlite:///data/demo.db#person",
+  "demote": false,
+  "refresh": { "threshold_rows": 1000000, "interval_seconds": 3600 },
+  "provenance": {
+    "generator": "hand-written",
+    "confidence": 1.0
+  }
+}

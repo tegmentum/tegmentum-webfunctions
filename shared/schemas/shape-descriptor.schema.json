@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tegmentum.ai/schemas/shape-descriptor/v1",
+  "title": "wf shape descriptor",
+  "description": "Describes a set of RDF triples that behave as a relational or tree-shaped table. One document, three coordinated uses: validate on write, define the sink schema, guide demotion. Serves as input to wf_profile (proposal), wf_validate, wf_materialize, wf_demote, wf_fetch.",
+
+  "type": "object",
+  "required": ["name", "anchor", "shape", "columns"],
+  "additionalProperties": false,
+  "properties": {
+
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Snake-case identifier used as the sink table/document name and as the descriptor's reference IRI-suffix in composition graphs."
+    },
+
+    "shape": {
+      "enum": ["attribute", "foreign_key", "child_table", "tree", "graph"],
+      "description": "Shape family. Determines which materializer runs (attribute/foreign_key/child_table → wf_materialize_relational.wasm; tree → wf_materialize_tree.wasm; graph → do not demote)."
+    },
+
+    "anchor": {
+      "type": "object",
+      "description": "How to identify subjects belonging to this shape.",
+      "oneOf": [
+        {
+          "required": ["class"],
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "type": "string",
+              "format": "iri",
+              "description": "rdf:type IRI; subject is anchored when { ?s a <class> } holds."
+            }
+          }
+        },
+        {
+          "required": ["predicate_signature"],
+          "additionalProperties": false,
+          "properties": {
+            "predicate_signature": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "format": "iri" },
+              "description": "Subject is anchored when it has non-empty values for every listed predicate. Used when no class assertion is available (open-world data, ad-hoc profiling output)."
+            }
+          }
+        }
+      ]
+    },
+
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/column" }
+    },
+
+    "sink": {
+      "type": "string",
+      "format": "uri",
+      "description": "Where to materialize. Examples: sqlite:///data/mv.db#person, duckdb:///data/mv.duckdb#person, postgres://host/db#schema.person, sirix://host/tree#category_tree. Absent = descriptor is metadata only (validation, profiling), not materialized.",
+      "pattern": "^(sqlite|duckdb|postgres|sirix)://.+#[a-z][a-z0-9_]*$"
+    },
+
+    "demote": {
+      "type": "boolean",
+      "default": false,
+      "description": "After successful materialization, DELETE the source triples for subjects confirmed in the sink. Only honored when sink is set. Off by default — demotion is a one-way door, opt-in."
+    },
+
+    "refresh": {
+      "type": "object",
+      "description": "When to re-run the materializer. Absent = manual only.",
+      "additionalProperties": false,
+      "properties": {
+        "threshold_rows": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Trigger materialization when the shape's row count reaches this many since the last run."
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Trigger materialization at least this often, regardless of row count."
+        }
+      }
+    },
+
+    "provenance": {
+      "type": "object",
+      "description": "Origin metadata. Set by wf_profile on generated descriptors; users may edit.",
+      "additionalProperties": false,
+      "properties": {
+        "generator": {
+          "type": "string",
+          "description": "Tool that produced this descriptor (e.g. \"wf_profile@0.1.0\"). Free-form; not enforced."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Profiler's confidence in the shape classification (0..1). Low = user should review before adopting."
+        },
+        "sample_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of subjects the profiler examined."
+        }
+      }
+    }
+  },
+
+  "$defs": {
+
+    "column": {
+      "type": "object",
+      "required": ["name", "role"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Snake-case column identifier used verbatim in the sink schema."
+        },
+        "role": {
+          "enum": ["subject_iri", "attribute", "foreign_key", "child_link", "parent_link"],
+          "description": "How this column relates to the anchor. Exactly one column per descriptor has role=subject_iri (the primary key). foreign_key targets a sibling shape; child_link/parent_link only appear on shape=tree descriptors."
+        },
+        "predicate": {
+          "type": "string",
+          "format": "iri",
+          "description": "RDF predicate that projects this column's values from the anchor subject. Absent only when role=subject_iri (the subject IRI itself is the value)."
+        },
+        "type": {
+          "enum": ["string", "integer", "decimal", "boolean", "date", "datetime", "iri"],
+          "description": "SQL-side type. Derived from the RDF datatype: xsd:string/*Literal → string; xsd:integer/int/long → integer; xsd:decimal/double/float → decimal; xsd:boolean → boolean; xsd:date → date; xsd:dateTime → datetime; IRI object → iri (rendered as CHAR/VARCHAR of the IRI text in most backends)."
+        },
+        "cardinality": {
+          "enum": ["0..1", "1", "0..n", "1..n"],
+          "default": "0..1",
+          "description": "Values per subject. 0..1/1 → scalar column (nullable / NOT NULL); 0..n/1..n → separate child table keyed by subject_iri."
+        },
+        "target_shape": {
+          "type": "string",
+          "description": "For role=foreign_key: name of the sibling shape descriptor whose subject_iri is referenced. Enables cross-shape planner rewriting."
+        },
+        "constraint": {
+          "type": "object",
+          "description": "Optional per-column constraint. All applied at validation time; the compatible subset (regex → CHECK, length → CHECK) is emitted as DDL by the materializer.",
+          "additionalProperties": false,
+          "properties": {
+            "regex": {
+              "type": "string",
+              "description": "ECMAScript regex; applied to string columns only."
+            },
+            "min": { "type": "number", "description": "Numeric lower bound, inclusive." },
+            "max": { "type": "number", "description": "Numeric upper bound, inclusive." },
+            "enum": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": ["string", "number", "boolean"] },
+              "description": "Allowed value set."
+            },
+            "min_length": { "type": "integer", "minimum": 0, "description": "Minimum string length." },
+            "max_length": { "type": "integer", "minimum": 1, "description": "Maximum string length. Emitted as VARCHAR(n) where the backend supports it." }
+          }
+        }
+      }
+    }
+  }
+}

@@ -151,6 +151,8 @@ members = [
     "crates/nest_hierarchy",
     "crates/wf_apply",
     "crates/wf_map",
+    "crates/wf_materialize",
+    "crates/wf_profile",
     "crates/wf_tree",
     "crates/wf_tree_fast",
     "crates/vega_bar_chart",
