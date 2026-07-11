@@ -12,13 +12,25 @@
 //!   "rule": "mint_genid" }
 //! ```
 //!
-//! Pipeline (four phases):
+//! Pipeline (five phases):
 //!
-//! 1. Enumerate every `?a owl:sameAs ?b` triple, build a union-find over
-//!    IRI identities. sameAs is transitive per OWL, so A↔B, B↔C forms
-//!    one class {A, B, C}. Equivalence classes drop out of the DSU.
+//! 0. Load any existing alias map from the sink. Seed the union-find
+//!    with the (alias → canonical) pairs so previously-assigned
+//!    canonicals stay sticky across ingest batches. First run finds no
+//!    table and skips seeding; subsequent runs pick up the accumulated
+//!    identity decisions and never remint a canonical for a class that
+//!    already has one.
 //!
-//! 2. For each class, pick a canonical by the configured rule. v1 rules:
+//! 1. Enumerate every `?a owl:sameAs ?b` triple in the store, union
+//!    them into the DSU. sameAs is transitive per OWL, so A↔B, B↔C
+//!    forms one class {A, B, C}. Combined with the seed pairs from
+//!    phase 0, this produces the current post-batch equivalence
+//!    classes.
+//!
+//! 2. For each class, pick a canonical. If the class already contains
+//!    a canonical from phase 0's seed (sticky path), reuse it — no
+//!    remint even if the class grew. Otherwise apply the configured
+//!    rule. v1 rules:
 //!    * `mint_genid` (default) — mint a deterministic well-known-genid
 //!      IRI derived from the sorted class membership. Every source URI
 //!      is treated equally as an alias; no arbitrary preference. Matches
@@ -88,7 +100,40 @@ impl Guest for Component {
         let cfg: Config = serde_json::from_str(&config_json)
             .map_err(|e| format!("wf_canonicalize: config parse: {e}"))?;
 
-        // Phase 1: union-find over sameAs.
+        // Phase 0: prepare the sink and seed the DSU from any existing
+        // (alias → canonical) map. Table is created idempotently so a
+        // first run finds it empty and the seed loop is a no-op.
+        let sink_handle = host::sink_open(&cfg.sink)?;
+        let table = table_name_from(&cfg.sink);
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {table} (\
+             alias TEXT PRIMARY KEY, \
+             canonical TEXT NOT NULL)"
+        );
+        host::sink_execute(sink_handle, &ddl, &[])
+            .map_err(|e| format!("wf_canonicalize: create alias table: {e}"))?;
+
+        let mut dsu = DisjointSetUnion::new();
+        let mut existing_canonicals: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        let existing = host::sink_execute(
+            sink_handle,
+            &format!("SELECT alias, canonical FROM {table}"),
+            &[],
+        )
+        .map_err(|e| format!("wf_canonicalize: load existing alias map: {e}"))?;
+        for row in &existing.rows {
+            let alias = binding_literal_str(row, "alias");
+            let canonical = binding_literal_str(row, "canonical");
+            if let (Some(a), Some(c)) = (alias, canonical) {
+                dsu.union(&a, &c);
+                existing_canonicals.insert(c);
+            }
+        }
+        let seed_size = existing_canonicals.len();
+
+        // Phase 1: union-find over sameAs in the store on top of the seed.
         let pairs = host::execute_query(
             &format!(
                 "SELECT ?a ?b WHERE {{ ?a <{OWL_SAME_AS}> ?b }}"
@@ -97,7 +142,6 @@ impl Guest for Component {
             None,
         )?;
 
-        let mut dsu = DisjointSetUnion::new();
         for row in &pairs.rows {
             let a = match binding_iri(row, "a") {
                 Some(v) => v,
@@ -111,10 +155,29 @@ impl Guest for Component {
         }
         let classes = dsu.classes();
 
-        // Phase 2: pick canonicals. Alias map: non-canonical → canonical.
+        // Phase 2: pick canonicals. Sticky rule — if the class already
+        // contains a previously-assigned canonical (from the phase-0
+        // seed), reuse it verbatim. This makes re-runs safe: canonicals
+        // never change once assigned, so triples that reference them
+        // don't need to be rewritten again. Only newly-added members
+        // become fresh aliases in the map.
+        //
+        // If multiple existing canonicals ended up in the same class
+        // (two previously-separate classes merged via a newly-observed
+        // sameAs bridge), pick the lex-smallest to keep the choice
+        // deterministic; the other becomes an alias, and any triples
+        // referencing it get rewritten in phase 3.
         let mut alias_to_canonical: HashMap<String, String> = HashMap::new();
         for class in &classes {
-            let canonical = pick_canonical(class, &cfg.rule)?;
+            let mut existing_in_class: Vec<&String> = class
+                .iter()
+                .filter(|m| existing_canonicals.contains(*m))
+                .collect();
+            existing_in_class.sort();
+            let canonical = match existing_in_class.first() {
+                Some(sticky) => (*sticky).clone(),
+                None => pick_canonical(class, &cfg.rule)?,
+            };
             for member in class {
                 if member != &canonical {
                     alias_to_canonical.insert(member.clone(), canonical.clone());
@@ -203,23 +266,17 @@ impl Guest for Component {
             })?;
         }
 
-        // Phase 4: write the alias map to the sink.
+        // Phase 4: append the alias map. INSERT OR REPLACE so re-runs
+        // that redirect a previously-seen alias to a merged class's
+        // canonical overwrite the old row instead of erroring on the
+        // primary key.
         if !alias_to_canonical.is_empty() {
-            let handle = host::sink_open(&cfg.sink)?;
-            let table = table_name_from(&cfg.sink);
-            let ddl = format!(
-                "CREATE TABLE IF NOT EXISTS {table} (\
-                 alias TEXT PRIMARY KEY, \
-                 canonical TEXT NOT NULL)"
-            );
-            host::sink_execute(handle, &ddl, &[])
-                .map_err(|e| format!("wf_canonicalize: create alias table: {e}"))?;
             let insert = format!(
                 "INSERT OR REPLACE INTO {table} (alias, canonical) VALUES (?, ?)"
             );
             for (alias, canonical) in &alias_to_canonical {
                 host::sink_execute(
-                    handle,
+                    sink_handle,
                     &insert,
                     &[string_lit(alias), string_lit(canonical)],
                 )
@@ -227,8 +284,8 @@ impl Guest for Component {
                     format!("wf_canonicalize: alias table insert `{alias}`: {e}")
                 })?;
             }
-            host::sink_close(handle).ok();
         }
+        host::sink_close(sink_handle).ok();
 
         // Phase 5: delete the sameAs assertions.
         let delete_sameas = format!(
@@ -238,7 +295,12 @@ impl Guest for Component {
             .map_err(|e| format!("wf_canonicalize: delete sameAs assertions: {e}"))?;
 
         Ok(BindingSets {
-            vars: vec!["classes".into(), "aliased".into(), "rewritten".into()],
+            vars: vec![
+                "classes".into(),
+                "aliased".into(),
+                "rewritten".into(),
+                "seeded".into(),
+            ],
             rows: vec![vec![
                 Binding {
                     name: "classes".into(),
@@ -251,6 +313,10 @@ impl Guest for Component {
                 Binding {
                     name: "rewritten".into(),
                     value: int_literal(rewritten as i64),
+                },
+                Binding {
+                    name: "seeded".into(),
+                    value: int_literal(seed_size as i64),
                 },
             ]],
         })
@@ -435,6 +501,18 @@ fn binding_iri(row: &[Binding], name: &str) -> Option<String> {
 
 fn binding_value(row: &[Binding], name: &str) -> Option<Value> {
     row.iter().find(|b| b.name == name).map(|b| b.value.clone())
+}
+
+/// Extract the string form of a binding's value regardless of variant.
+/// Used for the sink's alias table — its columns come back as WIT
+/// literals per the sink-execute contract, and we only need their
+/// lexical form.
+fn binding_literal_str(row: &[Binding], name: &str) -> Option<String> {
+    row.iter().find(|b| b.name == name).and_then(|b| match &b.value {
+        Value::Literal(l) => Some(l.label.clone()),
+        Value::Iri(s) => Some(s.clone()),
+        _ => None,
+    })
 }
 
 fn table_name_from(url: &str) -> String {
