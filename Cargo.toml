@@ -159,6 +159,7 @@ members = [
     "crates/wf_materialize_tree",
     "crates/wf_profile",
     "crates/wf_skolemize",
+    "crates/wf_sql",
     "crates/wf_validate",
     "crates/wf_tree",
     "crates/wf_tree_fast",
