@@ -150,6 +150,7 @@ members = [
     "crates/nest_by",
     "crates/nest_hierarchy",
     "crates/wf_apply",
+    "crates/wf_canonicalize",
     "crates/wf_map",
     "crates/wf_materialize",
     "crates/wf_materialize_list",
