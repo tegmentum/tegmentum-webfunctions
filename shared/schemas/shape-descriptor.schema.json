@@ -74,6 +74,13 @@
       "pattern": "^(sqlite|duckdb|postgres|sirix)://.+#[a-z][a-z0-9_]*$"
     },
 
+    "registry": {
+      "type": "string",
+      "format": "uri",
+      "description": "Shape registry sink where wf_materialize records this descriptor's metadata on commit — the planner-side query rewrite reads it at server startup to route BGPs to wf_fetch. Fragment names the registry table (default: shapes). Example: sqlite:///data/mv.db#shapes. Absent = no registry write; materialization stays local.",
+      "pattern": "^(sqlite|duckdb|postgres)://.+#[a-z][a-z0-9_]*$"
+    },
+
     "demote": {
       "type": "boolean",
       "default": false,

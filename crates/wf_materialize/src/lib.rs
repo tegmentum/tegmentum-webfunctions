@@ -39,13 +39,14 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 #[derive(Deserialize)]
 struct Descriptor {
-    #[allow(dead_code)]
     name: String,
     #[allow(dead_code)]
     shape: String,
     anchor: Anchor,
     columns: Vec<Column>,
     sink: Option<String>,
+    #[serde(default)]
+    registry: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +131,44 @@ impl Guest for Component {
         }
 
         host::sink_close(handle).ok(); // best-effort; frame closes on exit anyway
+
+        // Register this shape in the planner's shape registry if the
+        // descriptor named one. Stores the descriptor JSON verbatim so
+        // the planner can parse it back for column names + sink URL.
+        if let Some(registry_url) = &d.registry {
+            let reg_handle = host::sink_open(registry_url)?;
+            let reg_table = registry_table_from(registry_url);
+            host::sink_execute(
+                reg_handle,
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {reg_table} (\
+                     name TEXT PRIMARY KEY, \
+                     descriptor TEXT NOT NULL)"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("wf_materialize: create registry table: {e}"))?;
+            host::sink_execute(
+                reg_handle,
+                &format!(
+                    "INSERT OR REPLACE INTO {reg_table} (name, descriptor) VALUES (?, ?)"
+                ),
+                &[
+                    Value::Literal(Literal {
+                        label: d.name.clone(),
+                        datatype: XSD_STRING.into(),
+                        lang: None,
+                    }),
+                    Value::Literal(Literal {
+                        label: descriptor_json.clone(),
+                        datatype: XSD_STRING.into(),
+                        lang: None,
+                    }),
+                ],
+            )
+            .map_err(|e| format!("wf_materialize: registry insert: {e}"))?;
+            host::sink_close(reg_handle).ok();
+        }
 
         Ok(BindingSets {
             vars: vec!["rows".into()],
@@ -272,6 +311,12 @@ fn table_name_from(url: &str) -> String {
     url.rsplit_once('#')
         .map(|(_, frag)| frag.to_string())
         .unwrap_or_else(|| "t".into())
+}
+
+fn registry_table_from(url: &str) -> String {
+    url.rsplit_once('#')
+        .map(|(_, frag)| frag.to_string())
+        .unwrap_or_else(|| "shapes".into())
 }
 
 /// Rearrange one row's bindings into the descriptor's column order,
