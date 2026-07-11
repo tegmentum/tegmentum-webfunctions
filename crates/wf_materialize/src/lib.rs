@@ -64,6 +64,24 @@ struct Column {
     r#type: String,
     #[serde(default = "default_cardinality")]
     cardinality: String,
+    #[serde(default)]
+    constraint: Option<Constraint>,
+}
+
+#[derive(Deserialize, Default)]
+struct Constraint {
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+    #[serde(default)]
+    min_length: Option<usize>,
+    #[serde(default)]
+    max_length: Option<usize>,
+    #[serde(default)]
+    r#enum: Option<Vec<serde_json::Value>>,
+    // regex is not emitted as SQLite DDL (no native support); wf_validate
+    // still checks it at query time.
 }
 
 fn default_type() -> String {
@@ -272,6 +290,37 @@ fn build_ddl(table: &str, cols: &[Column]) -> String {
         if col.role == "subject_iri" {
             piece.push_str(" PRIMARY KEY");
         }
+        // Emit descriptor constraint block as SQL CHECK where the
+        // backend supports it. SQLite supports CHECK on all storage
+        // classes; regex is not native and is intentionally skipped
+        // (wf_validate still enforces regex at query time). Each check
+        // is quoted individually so a mismatch reports column + kind.
+        if let Some(c) = &col.constraint {
+            let mut checks: Vec<String> = Vec::new();
+            if let Some(min) = c.min {
+                checks.push(format!("{} >= {}", col.name, min));
+            }
+            if let Some(max) = c.max {
+                checks.push(format!("{} <= {}", col.name, max));
+            }
+            if let Some(min_len) = c.min_length {
+                checks.push(format!("LENGTH({}) >= {}", col.name, min_len));
+            }
+            if let Some(max_len) = c.max_length {
+                checks.push(format!("LENGTH({}) <= {}", col.name, max_len));
+            }
+            if let Some(enum_set) = &c.r#enum {
+                let literal_list = enum_set
+                    .iter()
+                    .map(sql_literal)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                checks.push(format!("{} IN ({})", col.name, literal_list));
+            }
+            for chk in checks {
+                piece.push_str(&format!(" CHECK ({chk})"));
+            }
+        }
         parts.push(piece);
     }
     format!(
@@ -279,6 +328,18 @@ fn build_ddl(table: &str, cols: &[Column]) -> String {
         table,
         parts.join(", ")
     )
+}
+
+/// Render a JSON enum member as a SQL literal. Numbers pass through as
+/// digits; everything else becomes a single-quoted string, doubling any
+/// embedded quote per SQL escape rules.
+fn sql_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.into(),
+        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
 }
 
 fn build_insert(table: &str, cols: &[Column]) -> String {
