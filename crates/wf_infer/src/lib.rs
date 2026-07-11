@@ -9,8 +9,9 @@
 //! whose provenance is obvious, delete semantics are honest (drop the
 //! graph or delete individual quads).
 //!
-//! Rule JSON shape (extends the shape-descriptor pattern for rules
-//! instead of shapes):
+//! Rule JSON shape — two forms accepted, same semantics:
+//!
+//! **Explicit CONSTRUCT** (raw SPARQL text):
 //!
 //! ```json
 //! {
@@ -22,6 +23,24 @@
 //!   "refresh_mode": "replace"
 //! }
 //! ```
+//!
+//! **Stardog-SRS-style if/then sugar** (translates to CONSTRUCT
+//! automatically; the two triple-pattern strings each go into the
+//! WHERE and CONSTRUCT clauses verbatim, with `prefixes` prepended
+//! once):
+//!
+//! ```json
+//! {
+//!   "name": "type_from_subclass",
+//!   "prefixes": "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>",
+//!   "if":   "?s a ?sub . ?sub rdfs:subClassOf+ ?super",
+//!   "then": "?s a ?super",
+//!   "graph": "http://tegmentum.ai/graph/derived/type_from_subclass"
+//! }
+//! ```
+//!
+//! Reads like SRS but stays as a CONSTRUCT operationally — same code
+//! path, same delete semantics, same predictable cost.
 //!
 //! `refresh_mode`:
 //!   * `"replace"` (default) — CLEAR the target graph before insert.
@@ -56,10 +75,52 @@ const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 #[derive(Deserialize)]
 struct Rule {
     name: String,
-    construct: String,
+    #[serde(default)]
+    construct: Option<String>,
+    #[serde(default, rename = "if")]
+    if_clause: Option<String>,
+    #[serde(default, rename = "then")]
+    then_clause: Option<String>,
+    #[serde(default)]
+    prefixes: Option<String>,
     graph: String,
     #[serde(default = "default_refresh")]
     refresh_mode: String,
+}
+
+impl Rule {
+    /// Build the CONSTRUCT SPARQL text. If the rule specifies `construct`
+    /// verbatim, use it as-is. If it uses the `if`/`then` sugar,
+    /// synthesise a CONSTRUCT that wraps the two triple-pattern strings
+    /// into WHERE and CONSTRUCT clauses respectively, prefixing any
+    /// declared namespaces once at the top.
+    fn construct_sparql(&self) -> Result<String, String> {
+        match (&self.construct, &self.if_clause, &self.then_clause) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(format!(
+                "wf_infer: rule `{}` sets both `construct` and `if`/`then`; pick one",
+                self.name
+            )),
+            (Some(q), None, None) => Ok(q.clone()),
+            (None, Some(if_body), Some(then_body)) => {
+                let prefix = self
+                    .prefixes
+                    .as_deref()
+                    .map(|p| format!("{p}\n"))
+                    .unwrap_or_default();
+                Ok(format!(
+                    "{prefix}CONSTRUCT {{ {then_body} }} WHERE {{ {if_body} }}"
+                ))
+            }
+            (None, Some(_), None) | (None, None, Some(_)) => Err(format!(
+                "wf_infer: rule `{}` uses SRS sugar but is missing one of `if` / `then`",
+                self.name
+            )),
+            (None, None, None) => Err(format!(
+                "wf_infer: rule `{}` has neither `construct` nor `if`/`then`",
+                self.name
+            )),
+        }
+    }
 }
 
 fn default_refresh() -> String {
@@ -99,7 +160,8 @@ impl Guest for Component {
         // Run the CONSTRUCT via execute-query. CONSTRUCT returns
         // binding-sets with vars=[s, p, o] and one row per emitted
         // triple (see the host contract in host.wit).
-        let bs = host::execute_query(&rule.construct, &[], None)?;
+        let construct_sparql = rule.construct_sparql()?;
+        let bs = host::execute_query(&construct_sparql, &[], None)?;
 
         // INSERT triples into the target graph. Batch: build one big
         // INSERT DATA per K rows to keep the parser happy. Materialize
