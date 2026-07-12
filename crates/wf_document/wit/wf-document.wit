@@ -27,7 +27,7 @@
 //    admin operations live in this same guest so the substrate can
 //    reach them via one component rather than juggling two.
 
-package wf:document@0.2.0;
+package wf:document@1.0.0;
 
 interface types {
     /// A reference to a document in Sirix. `id` is a full-path IRI of
@@ -42,6 +42,11 @@ interface types {
     /// Search options. `include-body`, when true, triggers the guest to
     /// fetch each hit's document body from Sirix inline. This is the
     /// v0.2 compose surface: search + fetch as one SERVICE dispatch.
+    ///
+    /// v1.0 adds `at-time` and `at-rev` — the time-travel search
+    /// selectors (memo `wf-document-v1.md` §04). Mutually exclusive: the
+    /// guest returns Err when both are set. Both unset = current-only
+    /// results (v0.2 semantics preserved).
     record search-opts {
         limit: option<u32>,
         offset: option<u32>,
@@ -51,6 +56,14 @@ interface types {
         filter: option<string>,
         include-body: bool,
         body-content-type: option<string>,
+        /// ISO-8601 datetime, or Unix epoch seconds as a decimal
+        /// string. Selects revisions live at this moment. Manticore
+        /// filters rows where `_valid_from <= at-time AND
+        /// (_valid_to IS NULL OR _valid_to > at-time)`.
+        at-time: option<string>,
+        /// Alternative to `at-time`: pin every hit to a specific
+        /// Sirix revision. Manticore filters rows where `_rev = at-rev`.
+        at-rev: option<u64>,
     }
 
     /// A search result. `body` and `content-type` are populated only

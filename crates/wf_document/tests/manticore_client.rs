@@ -4,6 +4,12 @@
 //! and adds `body` / `content_type` fields to `Hit`; both are compose-
 //! time signals that don't appear on the wire, so the tests here still
 //! exercise the same JSON shape.
+//!
+//! v1.0 note: every emitted body now carries a `bool.filter` clause —
+//! at minimum the `_valid_to IS NULL` "current-only" guard that
+//! preserves v0.2 semantics on retention=all indexes (memo §04). The
+//! v0.2 test bodies below have been updated to reflect this: the JSON
+//! shape changes, the semantic coverage stays identical.
 
 use serde_json::{json, Value as JsonValue};
 use std::io::{Read, Write};
@@ -11,7 +17,16 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 
-use wf_document::manticore::{build_request_body, parse_response, Hit, PlainOpts};
+use wf_document::manticore::{
+    build_probe_body, build_request_body, parse_response, schema_has_valid_from, AtTime, Hit,
+    PlainOpts,
+};
+
+/// The v1.0 default filter emitted for callers who set neither
+/// `at_time` nor `at_rev` — matches only current revisions.
+fn current_only_guard() -> JsonValue {
+    json!({ "equals": { "_valid_to": null } })
+}
 
 // ---------------------------------------------------------------------------
 // build_request_body — per-opts wire-shape checks
@@ -19,13 +34,22 @@ use wf_document::manticore::{build_request_body, parse_response, Hit, PlainOpts}
 
 #[test]
 fn body_minimal() {
+    // v1.0: even the "minimal" body carries the current-only guard so
+    // retention=all indexes return only current-time hits when the
+    // caller didn't ask for time-travel. Retention=latest sweeps set
+    // `_valid_to = NULL` uniformly, so the guard is a no-op there.
     let body = build_request_body("docs", "fox", &PlainOpts::default()).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
     assert_eq!(
         parsed,
         json!({
             "table": "docs",
-            "query": { "match": { "*": "fox" } },
+            "query": {
+                "bool": {
+                    "must":   [{ "match": { "*": "fox" } }],
+                    "filter": [{ "equals": { "_valid_to": null } }],
+                }
+            },
         })
     );
 }
@@ -98,12 +122,16 @@ fn body_with_lang_wraps_in_bool_filter() {
     };
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    // v1.0: lang filter joins the current-only guard in the same list.
     assert_eq!(
         parsed["query"],
         json!({
             "bool": {
                 "must":   [{ "match": { "*": "fox" } }],
-                "filter": [{ "equals": { "lang": "en" } }],
+                "filter": [
+                    { "equals": { "lang": "en" } },
+                    { "equals": { "_valid_to": null } },
+                ],
             }
         })
     );
@@ -117,9 +145,14 @@ fn body_with_filter_string_forwarded_verbatim() {
     };
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    // v1.0: forwarded user filter still in slot [0]; current-only guard
+    // appended after.
     assert_eq!(
         parsed["query"]["bool"]["filter"],
-        json!([{ "equals": { "category": "book" } }])
+        json!([
+            { "equals": { "category": "book" } },
+            { "equals": { "_valid_to": null } },
+        ])
     );
 }
 
@@ -133,9 +166,11 @@ fn body_with_lang_and_filter_combined() {
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
     let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
-    assert_eq!(filters.len(), 2);
+    // v1.0: lang, user filter, then the current-only guard.
+    assert_eq!(filters.len(), 3);
     assert_eq!(filters[0], json!({ "equals": { "lang": "de" } }));
     assert_eq!(filters[1], json!({ "range": { "price": { "lt": 50 } } }));
+    assert_eq!(filters[2], current_only_guard());
 }
 
 #[test]
@@ -258,6 +293,226 @@ fn parse_response_skips_nested_source_values() {
 }
 
 // ---------------------------------------------------------------------------
+// v1.0 — time-travel search
+// ---------------------------------------------------------------------------
+
+#[test]
+fn neither_restricts_to_current_only() {
+    // Neither at_time nor at_rev = current-only guard.
+    let body = build_request_body("docs", "fox", &PlainOpts::default()).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0], current_only_guard());
+}
+
+#[test]
+fn at_time_iso_emits_interval_filter() {
+    let opts = PlainOpts {
+        at_time: Some(AtTime::Iso("2026-01-01T00:00:00Z".into())),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    // interval = two clauses: _valid_from lte, and (_valid_to null or gt)
+    assert_eq!(filters.len(), 2);
+    assert_eq!(
+        filters[0],
+        json!({ "range": { "_valid_from": { "lte": "2026-01-01T00:00:00Z" } } })
+    );
+    assert_eq!(
+        filters[1],
+        json!({
+            "bool": {
+                "should": [
+                    { "equals": { "_valid_to": null } },
+                    { "range":  { "_valid_to": { "gt": "2026-01-01T00:00:00Z" } } },
+                ]
+            }
+        })
+    );
+    // and the current-only guard is NOT emitted when time-travel is on.
+    for f in filters {
+        assert!(f != &current_only_guard(), "current-only guard leaked in");
+    }
+}
+
+#[test]
+fn at_time_epoch_emits_numeric_interval_filter() {
+    let opts = PlainOpts {
+        at_time: Some(AtTime::Epoch(1735689600)),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    // Numeric on the wire — Manticore compares numerically against the
+    // sweep's epoch-seconds `_valid_from`.
+    assert_eq!(
+        filters[0],
+        json!({ "range": { "_valid_from": { "lte": 1735689600 } } })
+    );
+    assert_eq!(
+        filters[1]["bool"]["should"][1],
+        json!({ "range": { "_valid_to": { "gt": 1735689600 } } })
+    );
+}
+
+#[test]
+fn at_rev_emits_equality_filter() {
+    let opts = PlainOpts {
+        at_rev: Some(17),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    // at_rev = one clause, the exact-revision match. Current-only guard
+    // is omitted (revision pin fully specifies the target row).
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0], json!({ "equals": { "_rev": 17 } }));
+}
+
+#[test]
+fn both_at_time_and_at_rev_errors_at_build_body() {
+    // The guest surface (`search` in lib.rs) rejects the both-set case
+    // before it reaches build_request_body. build_request_body carries a
+    // defence-in-depth guard for callers that skip the surface check.
+    let opts = PlainOpts {
+        at_time: Some(AtTime::Epoch(1735689600)),
+        at_rev: Some(17),
+        ..PlainOpts::default()
+    };
+    let err = build_request_body("docs", "fox", &opts).unwrap_err();
+    assert!(err.contains("mutually exclusive"), "err={err}");
+}
+
+#[test]
+fn at_time_composes_with_user_filter_and_lang() {
+    // Ordering: user's lang → user's filter → time-travel clauses.
+    let opts = PlainOpts {
+        lang: Some("en".into()),
+        filter: Some(r#"{"equals":{"category":"book"}}"#.into()),
+        at_time: Some(AtTime::Iso("2026-01-01".into())),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    // 4 clauses: lang, user-filter, valid_from lte, valid_to null/gt.
+    assert_eq!(filters.len(), 4);
+    assert_eq!(filters[0], json!({ "equals": { "lang": "en" } }));
+    assert_eq!(filters[1], json!({ "equals": { "category": "book" } }));
+    assert_eq!(
+        filters[2],
+        json!({ "range": { "_valid_from": { "lte": "2026-01-01" } } })
+    );
+}
+
+#[test]
+fn revision_populated_from_response() {
+    // Mock response with `_rev` in `_source` — verify hit.revision is
+    // populated.
+    let body = json!({
+        "hits": {
+            "hits": [{
+                "_id":    "sirix://docs/manuals/1",
+                "_score": 0.5,
+                "_source": {
+                    "title":  "waterproof spec",
+                    "_rev":   17,
+                    "_valid_from": 1735689600,
+                    "_valid_to":   null
+                }
+            }]
+        }
+    })
+    .to_string();
+    let hits = parse_response(&body).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].revision, Some(17));
+}
+
+#[test]
+fn revision_absent_leaves_none() {
+    // v0.2-shape hit (no `_rev`) — hit.revision stays None.
+    let body = json!({
+        "hits": { "hits": [{
+            "_id": "sirix://docs/manuals/1",
+            "_score": 0.5,
+            "_source": { "title": "no rev here" }
+        }]}
+    })
+    .to_string();
+    let hits = parse_response(&body).unwrap();
+    assert_eq!(hits[0].revision, None);
+}
+
+#[test]
+fn revision_from_string_int() {
+    // Manticore sometimes stringifies u64s in `_source`. Accept both.
+    let body = json!({
+        "hits": { "hits": [{
+            "_id": "sirix://docs/manuals/1",
+            "_score": 0.5,
+            "_source": { "_rev": "23" }
+        }]}
+    })
+    .to_string();
+    let hits = parse_response(&body).unwrap();
+    assert_eq!(hits[0].revision, Some(23));
+}
+
+// ---------------------------------------------------------------------------
+// v1.0 — storage-gate probe helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn probe_body_shape() {
+    let body = build_probe_body("docs");
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["table"], json!("docs"));
+    assert_eq!(parsed["query"], json!({ "match_all": {} }));
+    assert_eq!(parsed["limit"], json!(1));
+}
+
+#[test]
+fn schema_has_valid_from_when_source_carries_it() {
+    let body = json!({
+        "hits": { "hits": [{
+            "_id": "x", "_score": 1.0,
+            "_source": { "_valid_from": 1735689600, "_valid_to": null }
+        }]}
+    })
+    .to_string();
+    assert!(schema_has_valid_from(&body));
+}
+
+#[test]
+fn schema_has_valid_from_false_on_latest_only_index() {
+    // Retention=latest sweep only mirrors current bodies, no interval
+    // columns. Probe returns false, and the storage gate surfaces the
+    // "index appears to hold latest-only" error.
+    let body = json!({
+        "hits": { "hits": [{
+            "_id": "x", "_score": 1.0,
+            "_source": { "title": "current body" }
+        }]}
+    })
+    .to_string();
+    assert!(!schema_has_valid_from(&body));
+}
+
+#[test]
+fn schema_has_valid_from_false_on_empty_probe() {
+    // Empty index — we can't tell. Conservatively false so the gate errs
+    // on the side of surfacing a schema problem.
+    let body = json!({ "hits": { "hits": [] } }).to_string();
+    assert!(!schema_has_valid_from(&body));
+}
+
+// ---------------------------------------------------------------------------
 // Wire test — the guest's built body reaches Manticore intact
 // ---------------------------------------------------------------------------
 
@@ -338,6 +593,10 @@ fn wire_round_trip_via_local_tcp_listener() {
             ("title".into(), "Quick brown fox".into()),
             ("views".into(), "42".into()),
         ],
+        // v1.0: the canned response's _source has no `_rev`, so revision
+        // stays None. See `revision_populated_from_response` below for
+        // the populated case.
+        revision: None,
     };
     assert_eq!(hits[0], expected_first);
 

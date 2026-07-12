@@ -27,7 +27,10 @@ pub mod manticore;
 pub mod manticore_admin;
 pub mod sirix;
 
-use manticore::{build_request_body, parse_response, Hit as PlainHit, PlainOpts};
+use manticore::{
+    build_probe_body, build_request_body, parse_response, schema_has_valid_from, AtTime,
+    Hit as PlainHit, PlainOpts,
+};
 use manticore_admin::{
     build_bulk_body, build_delete_body, parse_bulk_response, PlainDocWrite,
 };
@@ -47,6 +50,20 @@ impl Guest for Component {
         query: String,
         opts: SearchOpts,
     ) -> Result<Vec<Hit>, String> {
+        // v1.0: `at_time` and `at_rev` are mutually exclusive. The
+        // guest rejects both-set at the surface — the Manticore adapter
+        // then trusts that at most one time-travel selector is set when
+        // it builds the interval filter.
+        if opts.at_time.is_some() && opts.at_rev.is_some() {
+            return Err("at_time and at_rev are mutually exclusive".to_string());
+        }
+
+        let at_time_norm = opts
+            .at_time
+            .as_deref()
+            .map(normalize_at_time)
+            .transpose()?;
+
         let opts_plain = PlainOpts {
             limit: opts.limit,
             offset: opts.offset,
@@ -56,6 +73,8 @@ impl Guest for Component {
             filter: opts.filter,
             include_body: opts.include_body,
             body_content_type: opts.body_content_type.clone(),
+            at_time: at_time_norm,
+            at_rev: opts.at_rev,
         };
 
         let body = build_request_body(&index, &query, &opts_plain)?;
@@ -65,6 +84,25 @@ impl Guest for Component {
             .map_err(|e| format!("wf_document: POST {url}: {e}"))?;
 
         let plain_hits = parse_response(&response_body)?;
+
+        // v1.0 storage gate: when the caller asked for time-travel but
+        // Manticore returned zero hits, probe once — if the index lacks
+        // `_valid_from`, the sweep isn't running retention=all and the
+        // query would silently degrade. Surface a specific error instead.
+        // Best-effort: if the probe fails, fall through to the honest
+        // empty result rather than fabricating a schema verdict.
+        if plain_hits.is_empty() && opts_plain.at_time.is_some() {
+            let probe = build_probe_body(&index);
+            if let Ok(probe_body) = host::http_post_json(&url, &probe) {
+                if !schema_has_valid_from(&probe_body) {
+                    return Err(
+                        "time-travel search requires retention=all sweep; \
+                         index appears to hold latest-only"
+                            .to_string(),
+                    );
+                }
+            }
+        }
 
         // Compose: if the caller asked for bodies, fetch each hit from
         // Sirix and populate `body` + `content_type` before returning.
@@ -186,7 +224,9 @@ fn hit_wit(h: PlainHit) -> Hit {
     Hit {
         doc: DocRef {
             id: h.doc,
-            revision: None,
+            // v1.0: populate revision from Manticore's `_rev`. `None`
+            // when the sweep doesn't index it (retention=latest).
+            revision: h.revision,
         },
         score: h.score,
         snippet: h.snippet,
@@ -195,6 +235,31 @@ fn hit_wit(h: PlainHit) -> Hit {
         content_type: h.content_type,
         fields: h.fields,
     }
+}
+
+/// Normalize the WIT `at_time` string into a shape Manticore can filter
+/// on. Two accepted forms (memo §04):
+///
+///   * Unix epoch seconds — a bare integer literal. Emitted as a JSON
+///     number so Manticore's range filter compares numerically against
+///     `_valid_from`. The sweep indexes revisions as epoch seconds.
+///   * ISO-8601 datetime — forwarded verbatim as a string. Manticore's
+///     datetime parser handles the common forms.
+///
+/// We don't rewrite ISO into epoch here — the guest can't rely on
+/// chrono/time in `wasm32-wasip1`, and Manticore's own parser is the
+/// honest fallback. Empty string is rejected outright.
+fn normalize_at_time(raw: &str) -> Result<AtTime, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("wf_document: at_time must not be empty".to_string());
+    }
+    // `strtoll`-style: pure integer literal (optional leading sign) is
+    // an epoch value.
+    if let Ok(epoch) = trimmed.parse::<i64>() {
+        return Ok(AtTime::Epoch(epoch));
+    }
+    Ok(AtTime::Iso(trimmed.to_string()))
 }
 
 /// `search-url` is a bare host[:port] like `http://localhost:9308`.
@@ -240,5 +305,30 @@ mod tests {
     fn bulk_url_idempotent() {
         assert_eq!(bulk_url("http://x:9308"), "http://x:9308/bulk");
         assert_eq!(bulk_url("http://x:9308/bulk"), "http://x:9308/bulk");
+    }
+
+    #[test]
+    fn normalize_at_time_epoch_seconds() {
+        assert_eq!(normalize_at_time("1735689600").unwrap(), AtTime::Epoch(1735689600));
+        assert_eq!(normalize_at_time("0").unwrap(), AtTime::Epoch(0));
+    }
+
+    #[test]
+    fn normalize_at_time_iso_8601_verbatim() {
+        assert_eq!(
+            normalize_at_time("2026-01-01T00:00:00Z").unwrap(),
+            AtTime::Iso("2026-01-01T00:00:00Z".into())
+        );
+    }
+
+    #[test]
+    fn normalize_at_time_trims_whitespace() {
+        assert_eq!(normalize_at_time("  2026-01-01  ").unwrap(), AtTime::Iso("2026-01-01".into()));
+    }
+
+    #[test]
+    fn normalize_at_time_empty_errors() {
+        assert!(normalize_at_time("").is_err());
+        assert!(normalize_at_time("   ").is_err());
     }
 }
