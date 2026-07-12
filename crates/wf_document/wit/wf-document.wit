@@ -1,12 +1,30 @@
-// wf_document WIT world — v1.1.0.
+// wf_document WIT world — v1.2.0 (additive over v1.1 write-through).
 //
 // One guest, two backends: Manticore for search, SirixDB (via
 // sirix-sql-server) for durable, versioned document storage. Design
 // memo: docs/design/wf-document.md in the wf-conformance repo.
 //
-// v1.1 adds **write-through** (`insert-doc`, `update-doc`,
-// `delete-doc`) Writes go into Sirix (source of truth); Manticore
-// catches up on the periodic sweep.
+// v1.1 (already shipped, commit 3e5d833) adds write-through:
+// `insert-doc`, `update-doc`, `delete-doc`. Writes go into Sirix
+// (source of truth); Manticore catches up on the periodic sweep.
+//
+// v1.2 (this bump) adds four search-side capabilities from the memos'
+// deferred list (`wf-document.md` §12, `wf-document-v1.md` §08).
+// All four are additive on top of v1.1 — every earlier call is
+// byte-for-byte unchanged when the new fields are None.
+//   * Cross-index queries — `search-opts.indexes` unions multiple
+//     registered indexes into a single Manticore request. `index`
+//     positional stays the DEFAULT when this is None or empty.
+//   * Faceting — new `facet` export aggregates hits by metadata
+//     field via Manticore's `aggs` clause.
+//   * MoreLikeThis — new `more-like-this` export. Manticore has no
+//     native MLT; the guest fetches the seed doc from Sirix, extracts
+//     top TF terms, and issues an OR query excluding the seed doc's
+//     own `_id`.
+//   * Vector search — new `vector-search` export. Vector is passed
+//     verbatim to Manticore's k-NN. The target index MUST have a
+//     `vector` field declared (operator's responsibility — this
+//     substrate does not generate embeddings).
 //
 // Notes:
 //
@@ -14,7 +32,9 @@
 //    substrate side folds them through `wf:partial(<wasm>, ...)`.
 //
 // 2. Network I/O is a host import, not client-side ureq. The single
-//    `host::http-post-json` shape matches wf_fulltext's.
+//    `host::http-post-json` shape matches wf_fulltext's. No new host
+//    imports in v1.2 — every new capability dispatches through the
+//    same primitive.
 //
 // 3. Doc-ids are `sirix://<db>/<resource>/<node-key>` URIs (memo §06).
 //
@@ -22,7 +42,7 @@
 //    `delete-batch` (Manticore admin ops) alongside `search`, `fetch`,
 //    and `list-revisions`.
 
-package wf:document@1.1.0;
+package wf:document@1.2.0;
 
 interface types {
     record doc-ref {
@@ -30,6 +50,18 @@ interface types {
         revision: option<u64>,
     }
 
+    /// Search options. `include-body`, when true, triggers the guest to
+    /// fetch each hit's document body from Sirix inline.
+    ///
+    /// v1.0 adds `at-time` and `at-rev` — the time-travel search
+    /// selectors. Mutually exclusive; the guest returns Err when both
+    /// are set. Both unset = current-only results (v0.2 semantics
+    /// preserved).
+    ///
+    /// v1.2 adds `indexes` — cross-index query selector. When Some and
+    /// non-empty, the guest builds one Manticore request over the union
+    /// of the listed indexes. The `index` positional argument is the
+    /// DEFAULT — used when `indexes` is None or an empty list.
     record search-opts {
         limit: option<u32>,
         offset: option<u32>,
@@ -41,6 +73,12 @@ interface types {
         body-content-type: option<string>,
         at-time: option<string>,
         at-rev: option<u64>,
+        /// v1.2 cross-index selector. When Some(non-empty), the guest
+        /// unions the listed indexes into one Manticore request
+        /// (comma-separated `table` field per Manticore's HTTP JSON API).
+        /// The `index` positional argument is the DEFAULT when this is
+        /// None or empty.
+        indexes: option<list<string>>,
     }
 
     record hit {
@@ -71,6 +109,20 @@ interface types {
         doc: doc-ref,
         valid-from: string,
     }
+
+    /// v1.2 faceting bucket. `value` is stringified so the WIT type
+    /// stays uniform across string / numeric bucket keys.
+    record facet-value {
+        value: string,
+        count: u64,
+    }
+
+    /// v1.2 faceting result — one aggregation over one field. `values`
+    /// is ordered by descending `count` (Manticore's default).
+    record facet-result {
+        field: string,
+        values: list<facet-value>,
+    }
 }
 
 interface host {
@@ -78,10 +130,20 @@ interface host {
 }
 
 world document {
-    use types.{doc-ref, search-opts, hit, document, doc-write, write-result};
+    use types.{
+        doc-ref, search-opts, hit, document, doc-write, write-result,
+        facet-value, facet-result,
+    };
 
     import host;
 
+    /// Search Manticore at `search-url` for `query` in `index`. When
+    /// `opts.include-body` is true, fetch each hit's body from Sirix at
+    /// `sirix-url` and populate `hit.body` / `hit.content-type`.
+    ///
+    /// v1.2: when `opts.indexes` is Some(non-empty), the guest issues
+    /// one cross-index request over the listed set and `index` is
+    /// ignored. Absent or empty = single-index shape (backwards compat).
     export search: func(
         search-url: string,
         sirix-url: string,
@@ -112,7 +174,7 @@ world document {
         ids: list<string>,
     ) -> result<u32, string>;
 
-    /// Insert a new document into Sirix at database.resource.
+    /// v1.1 write-through — insert a new document into Sirix.
     /// Sync: Sirix commits first (durable); Manticore catches up on sweep.
     /// Depends on sirix-sql-server DML support (currently SELECT-only).
     export insert-doc: func(
@@ -123,17 +185,57 @@ world document {
         content-type: string,
     ) -> result<write-result, string>;
 
-    /// Update an existing document in Sirix, addressed by doc-ref.
-    /// doc.revision (when set) is emitted as an OCC predicate.
+    /// v1.1 write-through — update an existing document in Sirix.
+    /// `doc.revision` (when set) is emitted as an OCC predicate.
     export update-doc: func(
         sirix-url: string,
         doc: doc-ref,
         body: list<u8>,
     ) -> result<write-result, string>;
 
-    /// Delete a document from Sirix.
+    /// v1.1 write-through — delete a document from Sirix.
     export delete-doc: func(
         sirix-url: string,
         doc: doc-ref,
     ) -> result<_, string>;
+
+    /// v1.2 faceting. Runs `query` in `index` (or across `opts.indexes`
+    /// if set) and returns aggregation buckets for every field in
+    /// `fields`. Reuses the same Manticore search backend; adds `aggs`
+    /// clauses to the request body.
+    export facet: func(
+        search-url: string,
+        index: string,
+        query: string,
+        fields: list<string>,
+        opts: search-opts,
+    ) -> result<list<facet-result>, string>;
+
+    /// v1.2 MoreLikeThis. Manticore has no native MLT — implemented as
+    /// "seed doc -> extract terms -> search with those terms":
+    ///   1. Fetch the seed doc's body from Sirix (given `doc`).
+    ///   2. Tokenize on ASCII alphanumerics, filter to words > 3 chars,
+    ///      take the top 10 by term frequency.
+    ///   3. OR-match those terms against Manticore, excluding the seed
+    ///      doc's own `_id`.
+    export more-like-this: func(
+        search-url: string,
+        sirix-url: string,
+        index: string,
+        doc: doc-ref,
+        limit: u32,
+        opts: search-opts,
+    ) -> result<list<hit>, string>;
+
+    /// v1.2 vector search. Passes `vector` verbatim to Manticore's k-NN
+    /// operator. The target index MUST have a `vector` field declared
+    /// (operator's responsibility — this substrate does NOT generate
+    /// embeddings). `k` is the requested nearest-neighbor count.
+    export vector-search: func(
+        search-url: string,
+        index: string,
+        vector: list<f32>,
+        k: u32,
+        opts: search-opts,
+    ) -> result<list<hit>, string>;
 }
