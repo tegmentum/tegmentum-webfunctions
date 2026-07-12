@@ -172,6 +172,9 @@ members = [
     "crates/debug_callback_depth",
     "crates/debug_execute_update",
     "crates/webassembly_wat",
+    "crates/sirix_udf_hello",
+    "crates/sirix_commit_hook_logger",
+    "crates/sirix_shredder_uppercase",
 ]
 resolver = "2"
 

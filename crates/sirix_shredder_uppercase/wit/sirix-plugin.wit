@@ -1,0 +1,174 @@
+// Sirix plugin WIT world, v0.1.0.
+//
+// Three plugin surfaces, one shared type + host module. Each surface lives in
+// its own world so a guest only pays for what it implements — a SQL UDF guest
+// does not need to define a shredder export, and vice versa.
+//
+// Deliberately NOT reused from stardog:webfunction. Sirix's node model is a
+// mutable JSONiq/XDM tree; the SPARQL-tuned binding-set shape carries no
+// weight here. Kept honest to Calcite/Sirix/Jackson types instead.
+//
+// v0.1 is the plumbing pass — enough surface for the plugin loader to load,
+// instantiate, and call each interface once. Everything marked "v0.2" below
+// is intentionally out of scope; hook wiring lands in the follow-up phase.
+
+package sirix:plugin@0.1.0;
+
+/// Common value + node model. Shared across all three plugin worlds so a
+/// future world (e.g. an HTTP endpoint plugin) can reuse them cheaply.
+interface types {
+    /// SQL cell value. Mirrors what Calcite hands around at runtime for the
+    /// column types the SirixDB adapter currently produces:
+    ///   * BIGINT / INTEGER / SMALLINT      → integer
+    ///   * DECIMAL / NUMERIC                 → decimal (string-encoded so the
+    ///                                          precision/scale is preserved
+    ///                                          without pinning to f64)
+    ///   * VARCHAR / CHAR                    → text
+    ///   * BOOLEAN                           → boolean
+    ///   * TIMESTAMP / TIMESTAMP_LTZ         → timestamp (epoch millis, UTC)
+    ///   * JSON / structured cell            → json (raw UTF-8 bytes)
+    ///   * SQL NULL                          → null-value
+    /// v0.2: date, time-of-day, interval, blob. Punting until a UDF actually
+    /// needs one — the current adapter never emits them.
+    variant value {
+        null-value,
+        boolean(bool),
+        integer(s64),
+        decimal(string),
+        text(string),
+        timestamp(s64),
+        json(list<u8>),
+    }
+
+    /// JSON payload, as raw UTF-8 bytes. Structured navigation on the guest
+    /// side is the guest's job — pull in serde_json, jaq, etc. Keeping the
+    /// wire format flat avoids paying for a WIT-side JSON variant that
+    /// every guest would then have to unpack.
+    type json-doc = list<u8>;
+
+    /// Sirix node kind exposed to read hooks. Deliberately a small closed
+    /// enum — the plugin surface should not track every internal Sirix
+    /// node subtype. Guests that need finer detail can inspect `path`.
+    enum node-kind {
+        object,
+        array,
+        object-key,
+        text,
+        number,
+        boolean-value,
+        null-value,
+    }
+
+    /// Pre-commit context. `dirty-nodes` is the set of node IDs touched
+    /// since the last commit. Kept as a list<u64> (not a rich record) so
+    /// the plugin loader does not have to synthesize node snapshots for
+    /// hooks that only want a count / audit trail. Hooks that need node
+    /// content will call the host's `read-node` import in v0.2.
+    record commit-context {
+        revision: u32,
+        database: string,
+        // Named `resource-name` because `resource` is a reserved WIT keyword.
+        resource-name: string,
+        dirty-nodes: list<u64>,
+    }
+
+    /// Post-read context. One node's worth of metadata — the caller
+    /// visits nodes and calls the hook per node it wants filtered.
+    record read-context {
+        node-id: u64,
+        kind: node-kind,
+        path: string,
+    }
+
+    /// Result of a post-read hook. If `replacement` is `some`, the caller
+    /// swaps the node's payload for the raw JSON bytes provided; if
+    /// `none`, the node is returned unchanged. `redact` is a v0.1 shortcut
+    /// for "drop this node entirely" — cheaper than materializing a null.
+    record projection {
+        replacement: option<json-doc>,
+        redact: bool,
+    }
+
+    /// Log severity for the host log import.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+
+/// Host imports available to every plugin world. v0.1 keeps this to the
+/// bare minimum — a structured log sink so guests can surface diagnostics
+/// through the host's logging framework instead of writing to stderr.
+///
+/// v0.2 additions (deferred): `read-node(id) -> result<json-doc, string>`
+/// for hooks that need to inspect their dirty set, `now() -> s64` for
+/// deterministic guest timestamps, `emit-metric(name, value)` for tap-in.
+interface host {
+    use types.{log-level};
+
+    log: func(level: log-level, message: string);
+}
+
+/// SQL UDF plugin. One evaluate call, N args in, one value out.
+///
+/// v0.2: `combine(a, b)` + `finalize()` for UDAF. Punting to keep v0.1
+/// surface tight; there's no accumulator state in a scalar UDF and
+/// mixing the two would force every scalar guest to write no-op
+/// accumulator methods just to link.
+interface sql-udf {
+    use types.{value};
+
+    evaluate: func(args: list<value>) -> result<value, string>;
+}
+
+/// Sirix commit/read hook plugin. Two functions, both fire-and-forget
+/// modulo the error return.
+///
+/// on-pre-commit runs before a write transaction commits — the guest can
+/// veto the commit by returning err(reason). The dirty-nodes list is
+/// informational; the guest does not get to mutate it.
+///
+/// on-post-read runs after a node is read and before it's returned to
+/// the caller. The guest can replace the node's payload or redact it.
+/// Called once per visited node; guests that want to filter whole
+/// subtrees should redact the root and let the caller stop descending.
+interface commit-read-hook {
+    use types.{commit-context, read-context, projection};
+
+    on-pre-commit: func(ctx: commit-context) -> result<_, string>;
+    on-post-read: func(ctx: read-context) -> result<projection, string>;
+}
+
+/// JSON shredder plugin. Runs during ingest, before the JSON hits Sirix's
+/// tree builder. One transform in, one transform out. v0.1 uses raw
+/// bytes on both ends — the guest side does its own parse/serialize with
+/// serde_json (or equivalent). This keeps the WIT surface flat and lets
+/// each shredder pick its own JSON library without the plugin loader
+/// having to reify a structural variant.
+///
+/// v0.2 (if the raw-bytes ergonomics prove painful): add a structured
+/// `transform-tree(input: json-value) -> result<json-value, string>`
+/// alongside the byte version and let guests pick their entrypoint.
+interface json-shredder {
+    use types.{json-doc};
+
+    transform: func(input: json-doc) -> result<json-doc, string>;
+}
+
+world sql-udf-plugin {
+    import host;
+    export sql-udf;
+}
+
+world commit-read-hook-plugin {
+    import host;
+    export commit-read-hook;
+}
+
+world json-shredder-plugin {
+    import host;
+    export json-shredder;
+}
