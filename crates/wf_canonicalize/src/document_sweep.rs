@@ -160,6 +160,90 @@ fn default_retention() -> String {
 /// (unlikely) reaches every branch.
 pub const RETENTION_LATEST: &str = "latest";
 pub const RETENTION_ALL: &str = "all";
+/// v1.0 canonical string prefixes for the object-form retention policies
+/// (memo `wf-document-v1.md` §03 retention-policies table). The outer
+/// engine's `DocumentRegistry` canonicalizes `{"window": "30d"}` and
+/// `{"tail": 10}` object forms into these prefixed string forms before
+/// handing config to the sweep; the sweep re-parses them here into
+/// `RetentionPolicy`.
+pub const RETENTION_WINDOW_PREFIX: &str = "window:";
+pub const RETENTION_TAIL_PREFIX: &str = "tail:";
+
+/// Parsed retention policy for a single entry. The wire format between
+/// the outer engine and the sweep stays a plain `String` (v0.2 compat);
+/// this enum is what the sweep dispatches on internally after parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionPolicy {
+    /// v0.2 default — one row per URI, current revision only.
+    Latest,
+    /// v1.0 addition — every revision of every document.
+    All,
+    /// v1.0 addition — revisions whose `_valid_from` (or, absent a
+    /// commit timestamp, `revision` number) is within the last
+    /// `window_millis` milliseconds, plus the currently-open revision
+    /// of every URI. `window_millis == 0` is rejected at parse time so
+    /// the sweep never sees a zero-length window.
+    Window { window_millis: i64 },
+    /// v1.0 addition — the last N revisions per URI (plus the current).
+    Tail { n: u32 },
+}
+
+impl RetentionPolicy {
+    /// Parse the wire-format string the outer engine's `DocumentRegistry`
+    /// canonicalized on the way in.
+    ///
+    /// Unknown or malformed strings fall back to `Latest` because the
+    /// outer engine is the front-line validator — any malformed shape
+    /// here means the deployment is misconfigured (already logged at
+    /// boot). Latest-mode is the safe conservative fallback: it emits
+    /// only current-tip rows, matching v0.2 semantics.
+    fn from_wire(retention: &str) -> Self {
+        if retention == RETENTION_LATEST {
+            return Self::Latest;
+        }
+        if retention == RETENTION_ALL {
+            return Self::All;
+        }
+        if let Some(dur) = retention.strip_prefix(RETENTION_WINDOW_PREFIX) {
+            if let Some(ms) = parse_duration_millis(dur) {
+                return Self::Window { window_millis: ms };
+            }
+        }
+        if let Some(n_str) = retention.strip_prefix(RETENTION_TAIL_PREFIX) {
+            if let Ok(n) = n_str.parse::<u32>() {
+                if n > 0 {
+                    return Self::Tail { n };
+                }
+            }
+        }
+        Self::Latest
+    }
+}
+
+/// Parse a duration literal (`30d`, `24h`, `5m`) into milliseconds.
+/// Returns `None` when the shape doesn't match — used by
+/// `RetentionPolicy::from_wire` to fall back rather than panic. The
+/// outer engine's `DocumentRegistry` already rejects malformed shapes
+/// at boot, so this defensive fallback is a belt-and-braces layer.
+fn parse_duration_millis(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let unit = bytes[bytes.len() - 1];
+    let digits = &s[..s.len() - 1];
+    let n: i64 = digits.parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    let ms = match unit {
+        b'd' => n.checked_mul(24 * 60 * 60 * 1000)?,
+        b'h' => n.checked_mul(60 * 60 * 1000)?,
+        b'm' => n.checked_mul(60 * 1000)?,
+        _ => return None,
+    };
+    Some(ms)
+}
 
 /// Sweep-wide options, threaded through `run_with_options`. Wraps the
 /// v1.0 backfill flag; broken out into a struct so future sweep-scope
@@ -177,6 +261,27 @@ pub struct SweepOptions {
     /// unchanged-check) so an operator can force-refresh a stale
     /// mirror without touching the tracker.
     pub full_scan: bool,
+    /// Wall-clock reference (millis since epoch) used by
+    /// `RetentionPolicy::Window` to compute the "in-window" cutoff.
+    /// `None` = read the real system clock (production default);
+    /// tests inject a fixed value here so window filtering is
+    /// deterministic across timezones and CI machines.
+    pub now_millis: Option<i64>,
+}
+
+impl SweepOptions {
+    /// Resolve the wall-clock reference used by window retention.
+    /// Falls back to the real system clock when the operator (or test
+    /// harness) hasn't pinned one.
+    fn resolve_now_millis(&self) -> i64 {
+        match self.now_millis {
+            Some(t) => t,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }
+    }
 }
 
 /// Per-sweep counts. `unchanged` reports docs whose FNV hash matched
@@ -336,9 +441,14 @@ where
 {
     let mut total = SweepResult::default();
     for entry in entries {
-        let result = match entry.revision_retention.as_str() {
-            RETENTION_ALL => run_one_all(entry, http, sirix, sink, options),
-            _ => run_one(entry, http, sirix, sink, options),
+        let policy = RetentionPolicy::from_wire(&entry.revision_retention);
+        let result = match policy {
+            RetentionPolicy::All => run_one_all(entry, http, sirix, sink, options),
+            RetentionPolicy::Window { window_millis } => {
+                run_one_window(entry, http, sirix, sink, options, window_millis)
+            }
+            RetentionPolicy::Tail { n } => run_one_tail(entry, http, sirix, sink, options, n),
+            RetentionPolicy::Latest => run_one(entry, http, sirix, sink, options),
         };
         match result {
             Ok(c) => total.add(c),
@@ -599,6 +709,411 @@ fn run_one_all<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
     }
 
     Ok(counts)
+}
+
+/// Retention=window branch (memo `wf-document-v1.md` §03).
+///
+/// Enumerate all revisions from Sirix, keep the ones whose
+/// `_valid_from` is within `[now - window_millis, now]` OR whose
+/// `_valid_to` is null (the current-tip revision, always in the
+/// mirror). Bounded by activity.
+///
+/// **Cleanup pass**: composite `(uri, rev)` tracker rows that were
+/// previously mirrored but no longer fall in-window get emitted as
+/// Manticore deletes so operators don't pay for indefinite historical
+/// index bloat.
+fn run_one_window<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
+    entry: &DocumentIndexConfig,
+    http: &H,
+    sirix: &R,
+    sink: &S,
+    options: SweepOptions,
+    window_millis: i64,
+) -> Result<SweepResult, String> {
+    let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
+    sink.ensure_doc_table(&table)?;
+
+    let known: HashMap<(String, u64), KnownDoc> = if options.full_scan {
+        HashMap::new()
+    } else {
+        sink.load_known_docs(&table)?
+    };
+
+    let rows = sirix
+        .list_documents(
+            &entry.storage_backend,
+            &entry.sirix_database,
+            &entry.sirix_resource,
+            None,
+        )
+        .map_err(|e| format!("sirix list_documents: {e}"))?;
+
+    let by_key = group_rows_by_key(&rows);
+    let has_history = by_key.values().any(|v| v.len() > 1);
+    if !by_key.is_empty() && !has_history {
+        // Same honesty invariant as retention=all: without per-revision
+        // history from Sirix we can't compute a "was in window at t?"
+        // interval, so log clearly and bail without touching Manticore.
+        eprintln!(
+            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=window \
+             requested, but sirix-sql-server returned a single row per _nodekey \
+             (no per-revision history exposed via SQL). See wf-document-v1.md §11. \
+             Sweep returning without inserting; `errors=0` because this is a \
+             config/deployment issue, not a runtime error.",
+            entry.name
+        );
+        return Ok(SweepResult::default());
+    }
+
+    let now_millis = options.resolve_now_millis();
+    let cutoff = now_millis.saturating_sub(window_millis);
+
+    let (to_insert, unchanged, timestamp_fallback, kept_keys) =
+        build_diff_windowed(entry, &by_key, &known, cutoff);
+    if timestamp_fallback {
+        eprintln!(
+            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=window \
+             using `_rev` as the interval marker because sirix-sql-server did not \
+             include a `_commit_timestamp` column. Window filtering compares \
+             integers, not timestamps, until Sirix exposes commit times.",
+            entry.name
+        );
+    }
+
+    // Cleanup: any previously-mirrored `(uri, rev)` pair that's not in
+    // `kept_keys` has aged out of the window and needs a Manticore delete
+    // plus a tracker row removal.
+    let to_delete = compute_composite_deletes(&known, &kept_keys);
+
+    emit_all_mode_bulk(entry, http, sink, &table, &to_insert, &to_delete, unchanged)
+}
+
+/// Retention=tail branch (memo `wf-document-v1.md` §03).
+///
+/// Enumerate all revisions from Sirix, group by URI, keep the last
+/// `n` revisions per URI (plus the current tip — the two overlap when
+/// `n >= 1`, and `n == 0` is impossible by parse-time validation).
+///
+/// **Cleanup pass**: composite `(uri, rev)` tracker rows for revisions
+/// that fell out of the tail window get emitted as Manticore deletes.
+fn run_one_tail<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
+    entry: &DocumentIndexConfig,
+    http: &H,
+    sirix: &R,
+    sink: &S,
+    options: SweepOptions,
+    n: u32,
+) -> Result<SweepResult, String> {
+    let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
+    sink.ensure_doc_table(&table)?;
+
+    let known: HashMap<(String, u64), KnownDoc> = if options.full_scan {
+        HashMap::new()
+    } else {
+        sink.load_known_docs(&table)?
+    };
+
+    let rows = sirix
+        .list_documents(
+            &entry.storage_backend,
+            &entry.sirix_database,
+            &entry.sirix_resource,
+            None,
+        )
+        .map_err(|e| format!("sirix list_documents: {e}"))?;
+
+    let by_key = group_rows_by_key(&rows);
+    let has_history = by_key.values().any(|v| v.len() > 1);
+    if !by_key.is_empty() && !has_history {
+        eprintln!(
+            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=tail \
+             requested, but sirix-sql-server returned a single row per _nodekey \
+             (no per-revision history exposed via SQL). See wf-document-v1.md §11. \
+             Sweep returning without inserting; `errors=0` because this is a \
+             config/deployment issue, not a runtime error.",
+            entry.name
+        );
+        return Ok(SweepResult::default());
+    }
+
+    let (to_insert, unchanged, timestamp_fallback, kept_keys) =
+        build_diff_tail(entry, &by_key, &known, n);
+    if timestamp_fallback {
+        eprintln!(
+            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=tail \
+             using `_rev` as the interval marker because sirix-sql-server did not \
+             include a `_commit_timestamp` column.",
+            entry.name
+        );
+    }
+
+    let to_delete = compute_composite_deletes(&known, &kept_keys);
+
+    emit_all_mode_bulk(entry, http, sink, &table, &to_insert, &to_delete, unchanged)
+}
+
+/// Shared insert+delete emission path for the retention modes that use
+/// the composite `<uri>@rev<N>` id scheme (all, window, tail). Latest-
+/// mode keeps its own `run_one` because its id shape and delete
+/// semantics differ (rev=0 sentinel, uri-only delete keys).
+fn emit_all_mode_bulk<H: HttpBridge, S: DocSinkBridge>(
+    entry: &DocumentIndexConfig,
+    http: &H,
+    sink: &S,
+    table: &str,
+    to_insert: &[DocMirror],
+    to_delete: &[(String, u64)],
+    unchanged: u64,
+) -> Result<SweepResult, String> {
+    let mut counts = SweepResult {
+        inserted: 0,
+        deleted: 0,
+        unchanged,
+        errors: 0,
+    };
+
+    if !to_insert.is_empty() {
+        let body = build_bulk_body(&entry.search_index, to_insert);
+        let url = bulk_url(&entry.search_backend);
+        match http.post_json(&url, &body) {
+            Ok(response) => match bulk_response_ok(&response) {
+                Ok(()) => {
+                    counts.inserted = to_insert.len() as u64;
+                    for m in to_insert {
+                        sink.upsert_doc(
+                            table,
+                            &m.uri,
+                            m.revision,
+                            &KnownDoc {
+                                last_seen_rev: m.revision,
+                                doc_hash: m.hash.clone(),
+                            },
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    counts.errors += 1;
+                    eprintln!(
+                        "wf_canonicalize.document_sweep: entry `{}`: insert response: {e}",
+                        entry.name
+                    );
+                }
+            },
+            Err(e) => {
+                counts.errors += 1;
+                eprintln!(
+                    "wf_canonicalize.document_sweep: entry `{}`: insert POST: {e}",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    if !to_delete.is_empty() {
+        let delete_ids: Vec<String> = to_delete
+            .iter()
+            .map(|(uri, rev)| format!("{uri}@rev{rev}"))
+            .collect();
+        let body = build_delete_body(&entry.search_index, &delete_ids);
+        let url = bulk_url(&entry.search_backend);
+        match http.post_json(&url, &body) {
+            Ok(response) => match bulk_response_ok(&response) {
+                Ok(()) => {
+                    counts.deleted = to_delete.len() as u64;
+                    for (uri, rev) in to_delete {
+                        sink.delete_doc(table, uri, *rev)?;
+                    }
+                }
+                Err(e) => {
+                    counts.errors += 1;
+                    eprintln!(
+                        "wf_canonicalize.document_sweep: entry `{}`: delete response: {e}",
+                        entry.name
+                    );
+                }
+            },
+            Err(e) => {
+                counts.errors += 1;
+                eprintln!(
+                    "wf_canonicalize.document_sweep: entry `{}`: delete POST: {e}",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    Ok(counts)
+}
+
+/// Retention=window diff. Returns
+/// `(to_insert, unchanged, timestamp_fallback, kept_composite_keys)`.
+///
+/// A revision is "in-window" if its `_valid_from` (or `_rev` fallback)
+/// is `>= cutoff`, OR it's the current-tip revision of its URI. The
+/// current-tip is always kept so the corpus never loses its
+/// searchable "live now" surface even during a quiet period longer
+/// than the window.
+fn build_diff_windowed(
+    entry: &DocumentIndexConfig,
+    by_key: &BTreeMap<String, Vec<SirixDocRow>>,
+    known: &HashMap<(String, u64), KnownDoc>,
+    cutoff: i64,
+) -> (Vec<DocMirror>, u64, bool, HashSet<(String, u64)>) {
+    let mut to_insert: Vec<DocMirror> = Vec::new();
+    let mut unchanged: u64 = 0;
+    let mut timestamp_fallback = false;
+    let mut kept_keys: HashSet<(String, u64)> = HashSet::new();
+
+    for (node_key, group) in by_key {
+        let base_uri =
+            build_doc_uri(&entry.sirix_database, &entry.sirix_resource, node_key);
+
+        let mut sorted: Vec<&SirixDocRow> = group.iter().collect();
+        sorted.sort_by_key(|r| r.revision);
+        let n = sorted.len();
+
+        for (i, row) in sorted.iter().enumerate() {
+            let (valid_from_val, fell_back_here) = match row.commit_timestamp {
+                Some(ts) => (ts, false),
+                None => (row.revision as i64, true),
+            };
+            timestamp_fallback |= fell_back_here;
+
+            let is_current_tip = i + 1 == n;
+            let in_window = valid_from_val >= cutoff;
+            if !in_window && !is_current_tip {
+                // Aged out of the window and not the tip — skip entirely.
+                continue;
+            }
+
+            let valid_to = if !is_current_tip {
+                match sorted[i + 1].commit_timestamp {
+                    Some(ts) => Some(ts),
+                    None => Some(sorted[i + 1].revision as i64),
+                }
+            } else {
+                None
+            };
+
+            let composite_key = (base_uri.clone(), row.revision);
+            kept_keys.insert(composite_key.clone());
+
+            let hash = fnv1a64_hex(&row.body);
+            match known.get(&composite_key) {
+                Some(prev) if prev.doc_hash == hash => {
+                    unchanged += 1;
+                }
+                _ => {
+                    to_insert.push(DocMirror {
+                        uri: base_uri.clone(),
+                        revision: row.revision,
+                        body: row.body.clone(),
+                        content_type: row.content_type.clone(),
+                        hash,
+                        valid_from: Some(valid_from_val),
+                        valid_to,
+                    });
+                }
+            }
+        }
+    }
+    to_insert.sort_by(|a, b| a.uri.cmp(&b.uri).then(a.revision.cmp(&b.revision)));
+    (to_insert, unchanged, timestamp_fallback, kept_keys)
+}
+
+/// Retention=tail diff. Returns
+/// `(to_insert, unchanged, timestamp_fallback, kept_composite_keys)`.
+///
+/// Groups by URI, sorts revisions ascending, keeps the last `n`
+/// revisions (which naturally includes the current tip). When a URI
+/// has fewer than `n` revisions we keep them all — the memo phrasing
+/// "last N per URI plus current" means "at most N, always including
+/// the current tip."
+fn build_diff_tail(
+    entry: &DocumentIndexConfig,
+    by_key: &BTreeMap<String, Vec<SirixDocRow>>,
+    known: &HashMap<(String, u64), KnownDoc>,
+    tail_n: u32,
+) -> (Vec<DocMirror>, u64, bool, HashSet<(String, u64)>) {
+    let mut to_insert: Vec<DocMirror> = Vec::new();
+    let mut unchanged: u64 = 0;
+    let mut timestamp_fallback = false;
+    let mut kept_keys: HashSet<(String, u64)> = HashSet::new();
+
+    for (node_key, group) in by_key {
+        let base_uri =
+            build_doc_uri(&entry.sirix_database, &entry.sirix_resource, node_key);
+
+        let mut sorted: Vec<&SirixDocRow> = group.iter().collect();
+        sorted.sort_by_key(|r| r.revision);
+        let group_len = sorted.len();
+        let keep_from = group_len.saturating_sub(tail_n as usize);
+
+        for (i, row) in sorted.iter().enumerate() {
+            if i < keep_from {
+                continue;
+            }
+            let (valid_from_val, fell_back_here) = match row.commit_timestamp {
+                Some(ts) => (ts, false),
+                None => (row.revision as i64, true),
+            };
+            timestamp_fallback |= fell_back_here;
+
+            let is_current_tip = i + 1 == group_len;
+            let valid_to = if !is_current_tip {
+                match sorted[i + 1].commit_timestamp {
+                    Some(ts) => Some(ts),
+                    None => Some(sorted[i + 1].revision as i64),
+                }
+            } else {
+                None
+            };
+
+            let composite_key = (base_uri.clone(), row.revision);
+            kept_keys.insert(composite_key.clone());
+
+            let hash = fnv1a64_hex(&row.body);
+            match known.get(&composite_key) {
+                Some(prev) if prev.doc_hash == hash => {
+                    unchanged += 1;
+                }
+                _ => {
+                    to_insert.push(DocMirror {
+                        uri: base_uri.clone(),
+                        revision: row.revision,
+                        body: row.body.clone(),
+                        content_type: row.content_type.clone(),
+                        hash,
+                        valid_from: Some(valid_from_val),
+                        valid_to,
+                    });
+                }
+            }
+        }
+    }
+    to_insert.sort_by(|a, b| a.uri.cmp(&b.uri).then(a.revision.cmp(&b.revision)));
+    (to_insert, unchanged, timestamp_fallback, kept_keys)
+}
+
+/// Compute composite `(uri, rev)` pairs that were in the previous
+/// tracker snapshot but are not in the current retention decision.
+/// These rows have aged out (window) or fallen past the tail cutoff.
+/// The caller emits Manticore deletes keyed as `<uri>@rev<N>` and
+/// clears the corresponding tracker rows.
+///
+/// Deterministic order (uri asc, rev asc) so wire-body assertions are
+/// stable across test runs.
+fn compute_composite_deletes(
+    known: &HashMap<(String, u64), KnownDoc>,
+    kept_keys: &HashSet<(String, u64)>,
+) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = known
+        .keys()
+        .filter(|k| !kept_keys.contains(*k))
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    out
 }
 
 /// Group Sirix rows by node_key, preserving the caller-supplied
@@ -1872,7 +2387,7 @@ mod tests {
             &http2,
             &sirix,
             &sink,
-            SweepOptions { full_scan: true },
+            SweepOptions { full_scan: true, now_millis: None },
         );
         assert_eq!(r_backfill.inserted, 3, "full_scan re-inserts every rev");
         assert_eq!(r_backfill.unchanged, 0);
@@ -1992,5 +2507,319 @@ mod tests {
         assert_eq!(rows[0].commit_timestamp, Some(1_700_000_000));
         assert_eq!(rows[1].commit_timestamp, Some(1_700_005_000));
         assert_eq!(rows[0].body, "{\"title\":\"widget\"}");
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0 window / tail retention policies (memo `wf-document-v1.md` §03)
+    // -----------------------------------------------------------------
+
+    /// Convert days to milliseconds for the pinned test clock.
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    fn cfg_window(name: &str, wire: &str) -> DocumentIndexConfig {
+        let mut c = cfg(name);
+        c.revision_retention = wire.into();
+        c
+    }
+
+    fn cfg_tail(name: &str, wire: &str) -> DocumentIndexConfig {
+        let mut c = cfg(name);
+        c.revision_retention = wire.into();
+        c
+    }
+
+    /// Five revisions of the same doc, spaced 20 days apart so a
+    /// 30-day window keeps the most recent two (revs 4, 5) and rev3
+    /// (20 days ago). Revs 1 and 2 (80d, 60d ago) age out.
+    fn five_revs_spaced_20d(now_ms: i64) -> Vec<SirixDocRow> {
+        (0..5)
+            .map(|i| {
+                let rev = (i + 1) as u64;
+                let periods_ago = 4 - i as i64; // rev1 -> 4 periods ago
+                SirixDocRow {
+                    node_key: "42".into(),
+                    revision: rev,
+                    body: format!("{{\"v\":{rev}}}"),
+                    content_type: "application/json".into(),
+                    commit_timestamp: Some(now_ms - periods_ago * 20 * DAY_MS),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retention_policy_from_wire_parses_all_forms() {
+        assert_eq!(RetentionPolicy::from_wire("latest"), RetentionPolicy::Latest);
+        assert_eq!(RetentionPolicy::from_wire("all"), RetentionPolicy::All);
+        assert_eq!(
+            RetentionPolicy::from_wire("window:30d"),
+            RetentionPolicy::Window { window_millis: 30 * DAY_MS }
+        );
+        assert_eq!(
+            RetentionPolicy::from_wire("window:24h"),
+            RetentionPolicy::Window { window_millis: 24 * 60 * 60 * 1000 }
+        );
+        assert_eq!(
+            RetentionPolicy::from_wire("window:5m"),
+            RetentionPolicy::Window { window_millis: 5 * 60 * 1000 }
+        );
+        assert_eq!(
+            RetentionPolicy::from_wire("tail:10"),
+            RetentionPolicy::Tail { n: 10 }
+        );
+        // Malformed shapes fall back to Latest (belt-and-braces; the
+        // outer engine's DocumentRegistry rejects them at boot).
+        assert_eq!(RetentionPolicy::from_wire("bogus"), RetentionPolicy::Latest);
+        assert_eq!(RetentionPolicy::from_wire("window:30x"), RetentionPolicy::Latest);
+        assert_eq!(RetentionPolicy::from_wire("tail:0"), RetentionPolicy::Latest);
+    }
+
+    #[test]
+    fn window_policy_mirrors_only_recent_revisions() {
+        // 5 revs spaced 20 days apart (80d, 60d, 40d, 20d, 0d ago).
+        // window=30d keeps rev4 (20d, in-window) and rev5 (current
+        // tip, always kept). Revs 1, 2, 3 (80d, 60d, 40d) age out.
+        let now = 1_700_000_000_000_i64;
+        let entry = cfg_window("manuals", "window:30d");
+        let sirix = MockSirix {
+            rows: RefCell::new(five_revs_spaced_20d(now)),
+        };
+        let http = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let sink = MockDocSink::default();
+
+        let r = run_with_options(
+            &[entry],
+            &http,
+            &sirix,
+            &sink,
+            SweepOptions { full_scan: false, now_millis: Some(now) },
+        );
+        assert_eq!(r.inserted, 2, "rev4 (20d in-window) + rev5 (current tip)");
+        assert_eq!(r.deleted, 0);
+        assert_eq!(r.unchanged, 0);
+        assert_eq!(r.errors, 0);
+
+        // The wire body should carry rev4 and rev5 only — not rev1/2/3.
+        let posts = http.posts.borrow();
+        assert_eq!(posts.len(), 1);
+        let ids: Vec<String> = posts[0]
+            .1
+            .lines()
+            .map(|l| {
+                let v: JsonValue = serde_json::from_str(l).unwrap();
+                v["replace"]["id"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "sirix://docs/manuals/42@rev4".to_string(),
+                "sirix://docs/manuals/42@rev5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tail_policy_mirrors_only_last_n() {
+        // 10 revs, tail=5 keeps the last 5 (revs 6..10).
+        let entry = cfg_tail("manuals", "tail:5");
+        let rows: Vec<SirixDocRow> = (1..=10)
+            .map(|rev| SirixDocRow {
+                node_key: "42".into(),
+                revision: rev,
+                body: format!("{{\"v\":{rev}}}"),
+                content_type: "application/json".into(),
+                commit_timestamp: Some(1_700_000_000 + rev as i64 * 1000),
+            })
+            .collect();
+        let sirix = MockSirix {
+            rows: RefCell::new(rows),
+        };
+        let http = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let sink = MockDocSink::default();
+
+        let r = run(&[entry], &http, &sirix, &sink);
+        assert_eq!(r.inserted, 5, "tail=5 keeps the last 5 revs");
+        assert_eq!(r.deleted, 0);
+        assert_eq!(r.errors, 0);
+
+        let posts = http.posts.borrow();
+        assert_eq!(posts.len(), 1);
+        let ids: Vec<String> = posts[0]
+            .1
+            .lines()
+            .map(|l| {
+                let v: JsonValue = serde_json::from_str(l).unwrap();
+                v["replace"]["id"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "sirix://docs/manuals/42@rev6".to_string(),
+                "sirix://docs/manuals/42@rev7".to_string(),
+                "sirix://docs/manuals/42@rev8".to_string(),
+                "sirix://docs/manuals/42@rev9".to_string(),
+                "sirix://docs/manuals/42@rev10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn window_policy_cleans_up_aged_revisions() {
+        // Sweep gen 0: rev at t=now-25d is in-window (30d).
+        //  Manticore + tracker gain the row.
+        // Sweep gen 1: 20 days later, that rev is now t=now-45d — out
+        //  of window. The sweep must emit a delete for it.
+        let now_gen0 = 1_700_000_000_000_i64;
+        let now_gen1 = now_gen0 + 20 * DAY_MS;
+        let entry = cfg_window("manuals", "window:30d");
+
+        // A single doc with two revs: rev1 is 25 days old at gen0,
+        // rev2 is the current tip. Rev1 will still be in-window at gen0
+        // (25d < 30d) but out-of-window by gen1 (45d > 30d).
+        let rev1_ts = now_gen0 - 25 * DAY_MS;
+        let rev2_ts = now_gen0; // current tip at gen0
+        let rows = vec![
+            SirixDocRow {
+                node_key: "42".into(),
+                revision: 1,
+                body: "{\"v\":1}".into(),
+                content_type: "application/json".into(),
+                commit_timestamp: Some(rev1_ts),
+            },
+            SirixDocRow {
+                node_key: "42".into(),
+                revision: 2,
+                body: "{\"v\":2}".into(),
+                content_type: "application/json".into(),
+                commit_timestamp: Some(rev2_ts),
+            },
+        ];
+        let sirix = MockSirix { rows: RefCell::new(rows) };
+        let sink = MockDocSink::default();
+
+        // Gen 0: both revs in-window, both mirror.
+        let http0 = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let r0 = run_with_options(
+            &[entry.clone()],
+            &http0,
+            &sirix,
+            &sink,
+            SweepOptions { full_scan: false, now_millis: Some(now_gen0) },
+        );
+        assert_eq!(r0.inserted, 2, "gen0 mirrors both in-window revs");
+        assert_eq!(r0.deleted, 0);
+
+        // Gen 1: rev1 is now 45 days old — out of window. It's not the
+        // current tip either. Expect exactly one delete keyed as
+        // <uri>@rev1.
+        let http1 = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let r1 = run_with_options(
+            &[entry],
+            &http1,
+            &sirix,
+            &sink,
+            SweepOptions { full_scan: false, now_millis: Some(now_gen1) },
+        );
+        assert_eq!(r1.deleted, 1, "rev1 aged out; sweep must delete it from Manticore");
+        assert_eq!(r1.inserted, 0);
+        // The wire body of the delete carries the composite id.
+        let posts = http1.posts.borrow();
+        let delete_line = posts
+            .iter()
+            .flat_map(|(_, body)| body.lines())
+            .find(|line| line.contains("\"delete\""))
+            .expect("delete line present");
+        assert!(
+            delete_line.contains("sirix://docs/manuals/42@rev1"),
+            "delete wire body missing composite id: {delete_line}"
+        );
+        // And the tracker row for rev1 is gone.
+        let tracker_rows = sink.rows.borrow();
+        assert!(
+            !tracker_rows
+                .keys()
+                .any(|(_, uri, rev)| uri == "sirix://docs/manuals/42" && *rev == 1),
+            "tracker still contains rev1 after aged-out delete"
+        );
+    }
+
+    #[test]
+    fn tail_policy_deletes_older_revisions_that_fall_out_of_window() {
+        // Baseline mirror: 3 revs of one doc under tail=3 (everything
+        // fits). Then Sirix commits 2 more revs; tail=3 now keeps the
+        // last 3 (revs 3, 4, 5), and revs 1 & 2 must get deleted from
+        // Manticore.
+        let entry = cfg_tail("manuals", "tail:3");
+
+        let gen0_rows: Vec<SirixDocRow> = (1..=3)
+            .map(|rev| SirixDocRow {
+                node_key: "42".into(),
+                revision: rev,
+                body: format!("{{\"v\":{rev}}}"),
+                content_type: "application/json".into(),
+                commit_timestamp: Some(1_700_000_000 + rev as i64 * 1000),
+            })
+            .collect();
+        let sirix = MockSirix {
+            rows: RefCell::new(gen0_rows),
+        };
+        let sink = MockDocSink::default();
+        let http0 = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let r0 = run(&[entry.clone()], &http0, &sirix, &sink);
+        assert_eq!(r0.inserted, 3, "gen0 mirrors all three revs");
+        assert_eq!(r0.deleted, 0);
+
+        // Commit revs 4 and 5.
+        for rev in 4..=5u64 {
+            sirix.rows.borrow_mut().push(SirixDocRow {
+                node_key: "42".into(),
+                revision: rev,
+                body: format!("{{\"v\":{rev}}}"),
+                content_type: "application/json".into(),
+                commit_timestamp: Some(1_700_000_000 + rev as i64 * 1000),
+            });
+        }
+        let http1 = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let r1 = run(&[entry], &http1, &sirix, &sink);
+        assert_eq!(r1.inserted, 2, "revs 4 and 5 are new to the tail window");
+        assert_eq!(r1.unchanged, 1, "rev3 was already in the tail window");
+        assert_eq!(r1.deleted, 2, "revs 1 and 2 fell out of the tail window");
+
+        // Wire body carries deletes for rev1 and rev2 specifically.
+        let posts = http1.posts.borrow();
+        let combined: String = posts
+            .iter()
+            .flat_map(|(_, body)| body.lines())
+            .filter(|line| line.contains("\"delete\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("sirix://docs/manuals/42@rev1"),
+            "expected rev1 delete: {combined}"
+        );
+        assert!(
+            combined.contains("sirix://docs/manuals/42@rev2"),
+            "expected rev2 delete: {combined}"
+        );
     }
 }

@@ -406,6 +406,7 @@ impl Guest for Component {
                 &DocSinkBridgeImpl { handle: sink_handle },
                 document_sweep::SweepOptions {
                     full_scan: cfg.full_scan,
+                    now_millis: None,
                 },
             )
         };
