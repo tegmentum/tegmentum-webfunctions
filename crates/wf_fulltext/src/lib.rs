@@ -25,8 +25,12 @@ wit_bindgen::generate!({
 });
 
 pub mod manticore;
+pub mod manticore_admin;
 
 use manticore::{build_request_body, parse_response, PlainOpts};
+use manticore_admin::{
+    build_bulk_body, build_delete_body, parse_bulk_response, PlainDocWrite,
+};
 use wf::fulltext::host;
 
 struct Component;
@@ -68,6 +72,45 @@ impl Guest for Component {
             })
             .collect())
     }
+
+    fn insert_batch(
+        backend_url: String,
+        index: String,
+        docs: Vec<DocWrite>,
+    ) -> Result<u32, String> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        // WIT -> plain-Rust for the pure mapping module.
+        let plain: Vec<PlainDocWrite> = docs
+            .into_iter()
+            .map(|d| PlainDocWrite {
+                id: d.id,
+                fields: d.fields,
+                lang: d.lang,
+            })
+            .collect();
+        let body = build_bulk_body(&index, &plain);
+        let url = bulk_url(&backend_url);
+        let response_body = host::http_post_json(&url, &body)
+            .map_err(|e| format!("wf_fulltext: POST {url}: {e}"))?;
+        parse_bulk_response(&response_body)
+    }
+
+    fn delete_batch(
+        backend_url: String,
+        index: String,
+        ids: Vec<String>,
+    ) -> Result<u32, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let body = build_delete_body(&index, &ids);
+        let url = bulk_url(&backend_url);
+        let response_body = host::http_post_json(&url, &body)
+            .map_err(|e| format!("wf_fulltext: POST {url}: {e}"))?;
+        parse_bulk_response(&response_body)
+    }
 }
 
 /// `backend-url` is a bare host[:port] like `http://localhost:9308`. Append
@@ -79,6 +122,19 @@ fn manticore_url(backend_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/search")
+    }
+}
+
+/// Same idempotent behaviour as [`manticore_url`], but for the `/bulk`
+/// admin endpoint that `insert-batch` / `delete-batch` POST to. If the
+/// caller already terminated their backend URL with `/bulk`, don't
+/// double up.
+fn bulk_url(backend_url: &str) -> String {
+    let trimmed = backend_url.trim_end_matches('/');
+    if trimmed.ends_with("/bulk") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/bulk")
     }
 }
 

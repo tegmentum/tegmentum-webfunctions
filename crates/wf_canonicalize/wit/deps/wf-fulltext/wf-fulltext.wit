@@ -1,0 +1,14 @@
+// Copy of the wf:fulltext@0.1.0 host interface, checked in here so
+// wf_canonicalize's WIT can resolve the `import wf:fulltext/host@0.1.0`
+// declaration at generate! time. Only the `host` interface is included —
+// wf_canonicalize needs the `http-post-json` import for its periodic
+// sweep and doesn't touch `search` / `insert-batch` / `delete-batch`.
+//
+// If wf_fulltext's `host` interface changes shape, mirror the change
+// here. The two files must stay wire-compatible or the linker's
+// `wf:fulltext/host@0.1.0` instance will refuse to bind.
+package wf:fulltext@0.1.0;
+
+interface host {
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}

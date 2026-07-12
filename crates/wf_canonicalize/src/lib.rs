@@ -1,16 +1,36 @@
-//! wf_canonicalize — resolve owl:sameAs at ingest.
+//! wf_canonicalize — resolve owl:sameAs at ingest, plus keep the fulltext
+//! literal-index in sync with the graph.
 //!
 //! Signature: `wf:call(<wf_canonicalize.wasm>, "<config-json>")`
 //!    → binding-set { classes: xsd:integer, aliased: xsd:integer,
-//!                     rewritten: xsd:integer }
+//!                     rewritten: xsd:integer, seeded: xsd:integer,
+//!                     ft_inserted: xsd:integer, ft_deleted: xsd:integer,
+//!                     ft_errors: xsd:integer }
 //!
 //! Config JSON shape (only `sink` is required; `rule` defaults to
-//! `mint_genid`):
+//! `mint_genid`; `fulltext_indexes` defaults to empty and skips the
+//! fulltext-reconcile phase entirely):
 //!
 //! ```json
 //! { "sink": "sqlite:///data/mv.db#aliases",
-//!   "rule": "mint_genid" }
+//!   "rule": "mint_genid",
+//!   "fulltext_indexes": [
+//!     { "name": "products",
+//!       "backend_url": "http://localhost:9308",
+//!       "index": "products",
+//!       "predicates": ["http://ex/label", "http://ex/description"],
+//!       "sweep_interval_secs": 300 }
+//!   ] }
 //! ```
+//!
+//! The fulltext-reconcile phase (§07 of the wf-fulltext design memo) runs
+//! after alias-reconcile and before the sameAs delete. For each entry it
+//! CONSTRUCTs the current subject→(field, literal-lex) mapping for the
+//! registered predicates, diffs it against a per-index "known keys"
+//! tracker persisted in the same sink SQLite, and emits inserts/deletes
+//! to Manticore's `/bulk` endpoint. Errors on the fulltext side are
+//! logged and never crash the sweep — the alias-reconcile outputs stay
+//! usable even when the fulltext backend is down.
 //!
 //! Pipeline (five phases):
 //!
@@ -55,14 +75,20 @@
 wit_bindgen::generate!({
     world: "webfunction",
     path: "wit",
+    generate_all,
 });
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 
+pub mod fulltext_sweep;
+
 use stardog::webfunction::host;
 use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use wf::fulltext::host as fulltext_host;
+
+use fulltext_sweep::{FulltextIndexConfig, SweepCounts};
 
 struct Component;
 
@@ -75,6 +101,12 @@ struct Config {
     sink: String,
     #[serde(default = "default_rule")]
     rule: String,
+    /// Zero or more literal-index registry entries to reconcile against
+    /// the graph on this sweep. Empty (or absent) skips the entire
+    /// fulltext-reconcile phase — first-boot before any index is
+    /// registered is a valid state.
+    #[serde(default)]
+    fulltext_indexes: Vec<FulltextIndexConfig>,
 }
 
 fn default_rule() -> String {
@@ -285,6 +317,35 @@ impl Guest for Component {
                 })?;
             }
         }
+        // Phase 4b: fulltext-reconcile. Runs after alias-reconcile so
+        // any subjects that got rewritten to their canonicals are
+        // reflected in the fulltext index too. Skipped entirely when
+        // no fulltext_indexes are configured — first-boot / no-index
+        // deployments pay zero cost.
+        //
+        // The sweep reuses the same sink handle for its per-index
+        // "known keys" trackers, so a single SQLite file carries both
+        // the alias table and the fulltext state. `run` never bubbles
+        // errors up — it accumulates a per-entry error count into
+        // `SweepCounts` and logs to stderr, which the outer wf:call
+        // frame surfaces to the operator. That keeps the sweep robust
+        // when the fulltext backend is briefly unreachable.
+        let sweep_counts = if cfg.fulltext_indexes.is_empty() {
+            SweepCounts::default()
+        } else {
+            eprintln!(
+                "fulltext sweep: {} literal-index entries, last commit rev={}",
+                cfg.fulltext_indexes.len(),
+                store_rev()
+            );
+            fulltext_sweep::run(
+                &cfg.fulltext_indexes,
+                &FulltextHostBridge,
+                &GraphBridge,
+                &SinkBridgeImpl { handle: sink_handle },
+            )
+        };
+
         host::sink_close(sink_handle).ok();
 
         // Phase 5: delete the sameAs assertions.
@@ -300,6 +361,9 @@ impl Guest for Component {
                 "aliased".into(),
                 "rewritten".into(),
                 "seeded".into(),
+                "ft_inserted".into(),
+                "ft_deleted".into(),
+                "ft_errors".into(),
             ],
             rows: vec![vec![
                 Binding {
@@ -317,6 +381,18 @@ impl Guest for Component {
                 Binding {
                     name: "seeded".into(),
                     value: int_literal(seed_size as i64),
+                },
+                Binding {
+                    name: "ft_inserted".into(),
+                    value: int_literal(sweep_counts.inserted as i64),
+                },
+                Binding {
+                    name: "ft_deleted".into(),
+                    value: int_literal(sweep_counts.deleted as i64),
+                },
+                Binding {
+                    name: "ft_errors".into(),
+                    value: int_literal(sweep_counts.errors as i64),
                 },
             ]],
         })
@@ -535,6 +611,165 @@ fn int_literal(n: i64) -> Value {
         datatype: XSD_INTEGER.into(),
         lang: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Fulltext-sweep bridges
+// ---------------------------------------------------------------------------
+
+/// Returns the current "commit rev" the sweep should log alongside its
+/// start message. v0.1: we don't have a per-store transaction counter
+/// exposed through the WIT world, so use the wall-clock time in
+/// milliseconds since epoch — a monotonic-per-run identifier that lets
+/// an operator scan logs and correlate. If we ever get a real store-rev
+/// import (§07 of the design memo mentions this as a v0.2 want), swap
+/// this for the real thing.
+fn store_rev() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// Wire the sweep module's `HttpBridge` trait through to the
+/// wit-bindgen-generated fulltext host import. Kept as a zero-sized
+/// newtype so the sweep unit tests can substitute an in-memory mock
+/// without pulling in the wit bindings.
+struct FulltextHostBridge;
+
+impl fulltext_sweep::HttpBridge for FulltextHostBridge {
+    fn post_json(&self, url: &str, body: &str) -> Result<String, String> {
+        fulltext_host::http_post_json(url, body)
+    }
+}
+
+/// Wire the sweep module's `GraphBridge` trait through to the
+/// wit-bindgen-generated webfunction host import. Same zero-sized shim
+/// pattern as `FulltextHostBridge`.
+struct GraphBridge;
+
+impl fulltext_sweep::GraphBridge for GraphBridge {
+    fn select_subject_predicate_object(
+        &self,
+        predicates: &[String],
+    ) -> Result<Vec<(String, String, fulltext_sweep::LiteralOrIri)>, String> {
+        let values = predicates
+            .iter()
+            .map(|p| format!("<{p}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sparql = format!(
+            "SELECT ?s ?p ?o WHERE {{ ?s ?p ?o . VALUES ?p {{ {values} }} }}"
+        );
+        let bs = host::execute_query(&sparql, &[], None)
+            .map_err(|e| format!("wf_canonicalize.fulltext_sweep: execute_query: {e}"))?;
+        let mut out: Vec<(String, String, fulltext_sweep::LiteralOrIri)> =
+            Vec::with_capacity(bs.rows.len());
+        for row in &bs.rows {
+            let s = match binding_iri(row, "s") {
+                Some(v) => v,
+                None => continue,
+            };
+            let p = match binding_iri(row, "p") {
+                Some(v) => v,
+                None => continue,
+            };
+            let o_binding = row.iter().find(|b| b.name == "o");
+            let o = match o_binding {
+                Some(b) => match &b.value {
+                    Value::Literal(l) => fulltext_sweep::LiteralOrIri::Literal {
+                        lex: l.label.clone(),
+                        lang: l.lang.clone(),
+                    },
+                    Value::Iri(i) => fulltext_sweep::LiteralOrIri::Iri(i.clone()),
+                    Value::Bnode(_) => continue,
+                },
+                None => continue,
+            };
+            out.push((s, p, o));
+        }
+        Ok(out)
+    }
+}
+
+/// Wire the sweep module's `SinkBridge` through to the WIT `sink-*`
+/// imports. Carries the open sink handle and provides the four
+/// tracker-table primitives the sweep needs.
+struct SinkBridgeImpl {
+    handle: u32,
+}
+
+impl fulltext_sweep::SinkBridge for SinkBridgeImpl {
+    fn ensure_table(&self, table: &str) -> Result<(), String> {
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {table} (\
+             subject_iri TEXT PRIMARY KEY, \
+             doc_hash TEXT NOT NULL, \
+             updated_at INTEGER NOT NULL)"
+        );
+        host::sink_execute(self.handle, &ddl, &[])
+            .map(|_| ())
+            .map_err(|e| format!("ensure_table: {e}"))
+    }
+
+    fn load_known(&self, table: &str) -> Result<HashMap<String, String>, String> {
+        let sql = format!("SELECT subject_iri, doc_hash FROM {table}");
+        let bs = host::sink_execute(self.handle, &sql, &[])
+            .map_err(|e| format!("load_known: {e}"))?;
+        let mut out = HashMap::with_capacity(bs.rows.len());
+        for row in &bs.rows {
+            let subj = row
+                .iter()
+                .find(|b| b.name == "subject_iri")
+                .and_then(|b| match &b.value {
+                    Value::Literal(l) => Some(l.label.clone()),
+                    Value::Iri(i) => Some(i.clone()),
+                    _ => None,
+                });
+            let hash = row
+                .iter()
+                .find(|b| b.name == "doc_hash")
+                .and_then(|b| match &b.value {
+                    Value::Literal(l) => Some(l.label.clone()),
+                    _ => None,
+                });
+            if let (Some(s), Some(h)) = (subj, hash) {
+                out.insert(s, h);
+            }
+        }
+        Ok(out)
+    }
+
+    fn upsert(&self, table: &str, subject: &str, hash: &str) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let sql = format!(
+            "INSERT OR REPLACE INTO {table} (subject_iri, doc_hash, updated_at) \
+             VALUES (?, ?, ?)"
+        );
+        host::sink_execute(
+            self.handle,
+            &sql,
+            &[
+                string_lit(subject),
+                string_lit(hash),
+                int_literal(now_secs),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("upsert: {e}"))
+    }
+
+    fn delete(&self, table: &str, subject: &str) -> Result<(), String> {
+        let sql = format!("DELETE FROM {table} WHERE subject_iri = ?");
+        host::sink_execute(self.handle, &sql, &[string_lit(subject)])
+            .map(|_| ())
+            .map_err(|e| format!("delete: {e}"))
+    }
 }
 
 export!(Component);

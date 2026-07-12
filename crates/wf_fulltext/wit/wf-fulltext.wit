@@ -39,6 +39,20 @@ interface types {
         lang: option<string>,
         fields: list<tuple<string, string>>,
     }
+
+    /// One document to insert/replace in the fulltext backend. `id` is the
+    /// subject IRI in literal-index mode; the periodic sweep in
+    /// `wf_canonicalize` builds one of these per subject-with-matches.
+    /// `fields` carries a (predicate → literal-lex) pair for each covered
+    /// predicate the subject has; `lang` is the language tag (if any) the
+    /// literals shared. Any per-doc structure richer than that stays out of
+    /// this record — Manticore's "flat document" model is the honest v0.1
+    /// scope.
+    record doc-write {
+        id: string,
+        fields: list<tuple<string, string>>,
+        lang: option<string>,
+    }
 }
 
 /// Host callbacks. Provided by the plugin; consumed by the wasm component.
@@ -54,7 +68,7 @@ interface host {
 }
 
 world fulltext {
-    use types.{query-opts, hit};
+    use types.{query-opts, hit, doc-write};
 
     import host;
 
@@ -64,4 +78,37 @@ world fulltext {
         query: string,
         opts: query-opts,
     ) -> result<list<hit>, string>;
+
+    /// Insert/replace `docs` in `index` on the fulltext backend at
+    /// `backend-url`. Returns the number of documents the backend
+    /// acknowledged. Used by `wf_canonicalize`'s periodic sweep (memo
+    /// §07) to keep the literal-index in sync with the graph's
+    /// registered predicates.
+    ///
+    /// Semantics: each `doc-write` becomes an upsert keyed on `id`. The
+    /// backend's `replace` shape is used so re-emitting the same id is
+    /// idempotent — the sweep can safely re-send a document whose fields
+    /// didn't change.
+    ///
+    /// Errors: transport failure (unreachable backend), auth failure,
+    /// backend-side validation failure (unknown index, schema mismatch).
+    /// Callers surface the error and skip the entry — never crash the
+    /// sweep.
+    export insert-batch: func(
+        backend-url: string,
+        index: string,
+        docs: list<doc-write>,
+    ) -> result<u32, string>;
+
+    /// Delete documents by id from `index`. Returns the number of ids
+    /// the backend acknowledged as deleted. Silently skips ids that
+    /// don't exist (the sweep may delete tombstones the backend never
+    /// saw; that's a valid "no-op" per the honesty invariant).
+    ///
+    /// Errors: same shape as `insert-batch`.
+    export delete-batch: func(
+        backend-url: string,
+        index: string,
+        ids: list<string>,
+    ) -> result<u32, string>;
 }

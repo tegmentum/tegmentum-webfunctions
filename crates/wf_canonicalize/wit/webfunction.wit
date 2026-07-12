@@ -139,6 +139,18 @@ world webfunction {
     use types.{value, binding-sets, cardinality};
 
     import host;
+    /// v0.1 fulltext-admin surface. The periodic sweep in
+    /// `wf_canonicalize` uses this to reach Manticore's `/bulk`
+    /// endpoint directly. Once `invoke-wasm` learns to dispatch by
+    /// function name (v0.2 substrate work), the sweep will switch to
+    /// invoking `wf_fulltext`'s typed `insert-batch` / `delete-batch`
+    /// exports through the guest layer and this import can be retired.
+    ///
+    /// The imported interface lives in `wf:fulltext@0.1.0` so it links
+    /// against the same `wf:fulltext/host@0.1.0` linker instance the
+    /// oxigraph-wf plugin already registers for the `wf_fulltext`
+    /// guest — no additional host wiring required.
+    import wf:fulltext/host@0.1.0;
 
     export evaluate: func(args: list<value>) -> result<binding-sets, string>;
     export aggregate-step: func(args: list<value>, mult: u64) -> result<_, string>;
