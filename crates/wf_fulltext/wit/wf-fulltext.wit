@@ -1,0 +1,67 @@
+// wf_fulltext WIT world — v0.1.0.
+//
+// Full-text search dispatch guest. One WIT world, one Manticore adapter
+// today, OpenSearch as a follow-up swap (§12 of the design memo).
+//
+// Design memo: docs/design/wf-fulltext.md in the wf-conformance repo.
+//
+// Two shape notes.
+//
+// 1. `backend-url` is a positional guest arg, not a compile-time constant.
+//    The substrate side folds it with `wf:partial(<wasm>, "<backend-url>",
+//    "<index>", "<query>", <limit>)` so the guest stays stateless and the
+//    same .wasm can point at any Manticore or OpenSearch endpoint. Adjusted
+//    from the memo's §04 signature to match the substrate's arg model.
+//
+// 2. Network I/O is a host import, not client-side ureq. Every other guest
+//    that talks to something out-of-sandbox (wf_sql via `sink-execute`,
+//    wf_fetch via the descriptor's sink) goes through the substrate; the
+//    ureq-in-`wasm32-wasip1` path is fragile enough that the substrate
+//    idiom is to import a network callback and let the host implement it.
+//    `http-post-json` is that callback here.
+
+package wf:fulltext@0.1.0;
+
+interface types {
+    record query-opts {
+        limit: option<u32>,
+        offset: option<u32>,
+        fields: list<string>,
+        highlight: bool,
+        lang: option<string>,
+        filter: option<string>,
+    }
+
+    record hit {
+        doc: string,
+        score: f64,
+        snippet: option<string>,
+        lang: option<string>,
+        fields: list<tuple<string, string>>,
+    }
+}
+
+/// Host callbacks. Provided by the plugin; consumed by the wasm component.
+interface host {
+    /// POST a JSON `body` to `url` and return the response body as a string.
+    ///
+    /// Success = HTTP 2xx; the response body is returned verbatim so the
+    /// guest can parse it with its own serde_json. Any non-2xx response,
+    /// network error, or malformed URL surfaces as `Err(<message>)`. The
+    /// host is expected to set `Content-Type: application/json` on the
+    /// request; the guest does not need to negotiate headers.
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}
+
+world fulltext {
+    use types.{query-opts, hit};
+
+    import host;
+
+    export search: func(
+        backend-url: string,
+        index: string,
+        query: string,
+        opts: query-opts,
+    ) -> result<list<hit>, string>;
+}
