@@ -1,15 +1,37 @@
 //! wf_document — search + storage as one substrate function.
 //!
 //! One guest, two backends: Manticore for search, SirixDB (via
-//! sirix-sql-server) for durable, versioned document storage. When
-//! `opts.include-body` is true, `search` composes both backends: first
-//! it queries Manticore, then it iterates hits and fetches each body
-//! from Sirix inline, returning joined results in a single SERVICE
-//! dispatch.
+//! sirix-sql-server) for durable, versioned document storage. Under the
+//! index-only design (memo `wf-document.md` §08 and v1.0 §03),
+//! **Manticore holds the inverted index only** — document bodies live
+//! in Sirix. When `opts.include-body` is true, the guest queries
+//! Manticore for hits, then iterates each hit and fetches its body from
+//! Sirix inline, returning joined results in a single SERVICE dispatch.
+//! When `opts.include-body` is false, bodies are never fetched — the
+//! caller sees only IDs / scores / (optional) snippets.
+//!
+//! Per-hit Sirix fetch failures are **soft-failed**: the offending hit's
+//! `body` / `content_type` stay `None` and the search returns the other
+//! hits normally. A single bad document never fails the whole SERVICE
+//! call.
+//!
+//! Snippet generation (memo §08) is guest-side: Manticore can't extract
+//! snippets from text it doesn't store, so when `highlight: true` AND
+//! `include_body: true`, the guest builds a substring snippet from the
+//! Sirix body — first query-term hit with ~100 chars of context on each
+//! side, matching runs wrapped in `<mark>...</mark>`. Not linguistic
+//! like Manticore's built-in SNIPPET() (which stems and inflects), but
+//! honest and cheap. When `include_body: false`, `hit.snippet` stays
+//! `None` — no body, no snippet.
+//!
+//! Backwards compat: a corpus mirrored before the design correction may
+//! still carry `body` / `content_type` in Manticore's `_source`. The
+//! adapter picks them up when present and the compose step skips the
+//! Sirix round-trip for those hits.
 //!
 //! Design memo: `docs/design/wf-document.md` in the wf-conformance repo.
 //! Adapter details: memo §04 (WIT), §05 (wire shape), §06 (doc-id
-//! contract), §09 (relationship to wf_fulltext).
+//! contract), §08 (index-only sync), §09 (relationship to wf_fulltext).
 //!
 //! Network I/O is a host import (`host::http-post-json`) rather than
 //! client-side `ureq`. Same substrate-import idiom as wf_fulltext,
@@ -104,10 +126,22 @@ impl Guest for Component {
             }
         }
 
-        // Compose: if the caller asked for bodies, fetch each hit from
-        // Sirix and populate `body` + `content_type` before returning.
+        // Compose: if the caller asked for bodies, fetch each hit's
+        // body from Sirix (unless a backwards-compat sweep already put
+        // it in `_source`). Per-hit fetch failures are soft-failed —
+        // that hit's body stays None and other hits still return.
         let plain_hits = if opts_plain.include_body {
-            fetch_bodies_for_hits(&sirix_url, plain_hits, opts_plain.body_content_type.as_deref())?
+            fetch_bodies_for_hits(&sirix_url, plain_hits, opts_plain.body_content_type.as_deref())
+        } else {
+            plain_hits
+        };
+
+        // Snippet generation: only when the caller asked for highlight
+        // AND asked for bodies (no body → nothing to snippet from).
+        // Preserve any snippet Manticore returned (backwards compat with
+        // a sweep that stored bodies and returned `highlight.*`).
+        let plain_hits = if opts_plain.include_body && opts_plain.highlight {
+            populate_snippets(plain_hits, &query)
         } else {
             plain_hits
         };
@@ -195,29 +229,198 @@ impl Guest for Component {
     }
 }
 
-/// Compose step for `include_body`: for each hit, parse its doc-id as a
-/// Sirix URI, run a fetch, and populate `body` + `content_type`. Fails
-/// the whole search only if the parse fails — a per-hit Sirix fetch
-/// failure is elevated to a full error too, so the caller can't
-/// silently miss bodies. (An alternative would be per-hit soft-fail;
-/// v0.2 opts for the loud choice.)
+/// Compose step for `include_body`: for each hit that doesn't already
+/// carry a body (backwards-compat sweep may have stored it in
+/// `_source`), parse its doc-id as a Sirix URI and fetch the body from
+/// Sirix. Per-hit failure is soft: parse errors, HTTP errors, and
+/// response-parse errors leave that hit's `body` / `content_type` as
+/// `None` — other hits proceed normally. The whole search never fails
+/// on one bad document.
+///
+/// Failures are logged via `host::http_post_json`'s error return; the
+/// guest doesn't have direct stderr under the substrate's host imports.
+/// The visibility is: `body: None` on a hit whose Manticore ID looked
+/// valid but Sirix couldn't serve.
 fn fetch_bodies_for_hits(
     sirix_url: &str,
     mut hits: Vec<PlainHit>,
     body_content_type: Option<&str>,
-) -> Result<Vec<PlainHit>, String> {
+) -> Vec<PlainHit> {
     let url = query_url(sirix_url);
     for hit in hits.iter_mut() {
-        let doc = parse_sirix_uri(&hit.doc)?;
-        let sql = build_fetch_sql(&doc, None);
+        // Backwards compat: if Manticore already served the body
+        // (pre-correction mirror), don't overwrite.
+        if hit.body.is_some() {
+            continue;
+        }
+        let Ok(doc) = parse_sirix_uri(&hit.doc) else {
+            // Malformed doc-id — leave body as None and move on. This
+            // shouldn't happen if the sweep produced valid IDs, but
+            // never fail the whole search on one bad entry.
+            continue;
+        };
+        let sql = build_fetch_sql(&doc, hit.revision);
         let body = build_fetch_body(&sql);
-        let response_body = host::http_post_json(&url, &body)
-            .map_err(|e| format!("wf_document: POST {url}: {e}"))?;
-        let fetched = parse_fetch_response(&response_body, body_content_type)?;
+        let Ok(response_body) = host::http_post_json(&url, &body) else {
+            // Network / Sirix error for this hit — leave as None,
+            // proceed with the rest.
+            continue;
+        };
+        let Ok(fetched) = parse_fetch_response(&response_body, body_content_type) else {
+            // Sirix responded but the body couldn't be parsed. Leave
+            // this hit's body as None.
+            continue;
+        };
         hit.body = Some(fetched.body);
         hit.content_type = Some(fetched.content_type);
     }
-    Ok(hits)
+    hits
+}
+
+/// Populate `hit.snippet` for hits whose body is present. Preserves any
+/// snippet Manticore already supplied (backwards compat with a sweep
+/// that mirrored bodies and let Manticore's SNIPPET() do the highlight).
+/// For hits with no Manticore snippet: build a substring snippet from
+/// the body (memo `wf-document.md` §08).
+///
+/// Any error extracting a snippet leaves `hit.snippet` as `None` and
+/// moves on — snippet generation is strictly best-effort.
+pub fn populate_snippets(mut hits: Vec<PlainHit>, query: &str) -> Vec<PlainHit> {
+    let terms = snippet_terms(query);
+    if terms.is_empty() {
+        return hits;
+    }
+    for hit in hits.iter_mut() {
+        if hit.snippet.is_some() {
+            continue;
+        }
+        let Some(body) = hit.body.as_deref() else {
+            continue;
+        };
+        hit.snippet = generate_snippet(body, &terms);
+    }
+    hits
+}
+
+/// Split the query on whitespace, lowercase each term (ASCII), and
+/// drop empties. ASCII lowering is chosen deliberately: the resulting
+/// byte positions align with the body's `to_ascii_lowercase()` so we
+/// don't have to reconcile grapheme boundaries. Non-ASCII characters
+/// pass through unchanged (matches are then case-sensitive for those
+/// specific characters — honest given the "cheap" scope).
+pub fn snippet_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// Build a substring snippet from `body`: locate the earliest hit of
+/// any term (case-insensitive, ASCII), take ~100 chars on either side
+/// of it, and wrap every matching run with `<mark>...</mark>`.
+///
+/// Returns `None` when: body isn't valid UTF-8, no term matches, or
+/// the char-boundary adjustment somehow produces an empty slice.
+///
+/// Match wrapping is over merged, sorted term ranges so overlapping
+/// terms (e.g. `"water"` + `"waterproof"` in the same body) produce a
+/// single `<mark>` span rather than nested tags.
+pub fn generate_snippet(body: &[u8], terms: &[String]) -> Option<String> {
+    let body_str = std::str::from_utf8(body).ok()?;
+    let body_lower = body_str.to_ascii_lowercase();
+
+    // Earliest occurrence of any term.
+    let first_match = terms
+        .iter()
+        .filter_map(|t| body_lower.find(t.as_str()))
+        .min()?;
+
+    let raw_start = first_match.saturating_sub(100);
+    let raw_end = (first_match + 100).min(body_str.len());
+    let start = floor_char_boundary(body_str, raw_start);
+    let end = ceil_char_boundary(body_str, raw_end);
+    if start >= end {
+        return None;
+    }
+
+    let slice = &body_str[start..end];
+    Some(mark_terms(slice, terms))
+}
+
+/// Walk left until we hit a char boundary. Cheap alternative to the
+/// unstable `str::floor_char_boundary`.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx > s.len() {
+        idx = s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Walk right until we hit a char boundary. Cheap alternative to the
+/// unstable `str::ceil_char_boundary`.
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx > s.len() {
+        return s.len();
+    }
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Wrap every case-insensitive occurrence of any term in `text` with
+/// `<mark>...</mark>`. Overlapping matches are merged (a single span
+/// covers them). Uses ASCII case-insensitive matching so byte indexes
+/// in `text_lower` correspond 1:1 to `text` — non-ASCII characters
+/// pass through unchanged.
+fn mark_terms(text: &str, terms: &[String]) -> String {
+    let text_lower = text.to_ascii_lowercase();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        let mut pos = 0;
+        while let Some(idx) = text_lower[pos..].find(term.as_str()) {
+            let s = pos + idx;
+            let e = s + term.len();
+            ranges.push((s, e));
+            pos = e;
+        }
+    }
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    ranges.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for r in ranges {
+        if let Some(last) = merged.last_mut() {
+            if r.0 <= last.1 {
+                last.1 = last.1.max(r.1);
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    let mut out = String::with_capacity(text.len() + merged.len() * 13);
+    let mut cursor = 0;
+    for (s, e) in merged {
+        // Defence: if boundaries somehow don't align, bail to plain text.
+        if !text.is_char_boundary(s) || !text.is_char_boundary(e) {
+            return text.to_string();
+        }
+        out.push_str(&text[cursor..s]);
+        out.push_str("<mark>");
+        out.push_str(&text[s..e]);
+        out.push_str("</mark>");
+        cursor = e;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 fn hit_wit(h: PlainHit) -> Hit {
@@ -330,5 +533,162 @@ mod tests {
     fn normalize_at_time_empty_errors() {
         assert!(normalize_at_time("").is_err());
         assert!(normalize_at_time("   ").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Snippet generation — pure-function coverage
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn snippet_wraps_matching_term_with_mark() {
+        let body = b"The quick brown fox jumps over the lazy dog.";
+        let snippet =
+            generate_snippet(body, &snippet_terms("fox")).expect("snippet from body");
+        assert!(
+            snippet.contains("<mark>fox</mark>"),
+            "expected <mark>fox</mark>, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_case_insensitive_ascii() {
+        let body = b"Waterproof rig for outdoor use";
+        let snippet =
+            generate_snippet(body, &snippet_terms("WATERPROOF")).expect("snippet");
+        // Case of the mark payload should match the original body.
+        assert!(
+            snippet.contains("<mark>Waterproof</mark>"),
+            "case preserved in mark payload: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_multi_term_all_wrapped() {
+        let body = b"waterproof tarp with sturdy grommets";
+        let snippet =
+            generate_snippet(body, &snippet_terms("tarp grommets")).expect("snippet");
+        assert!(snippet.contains("<mark>tarp</mark>"), "tarp wrapped: {snippet}");
+        assert!(
+            snippet.contains("<mark>grommets</mark>"),
+            "grommets wrapped: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_overlapping_terms_merge_into_one_mark() {
+        // "water" is a prefix of "waterproof". Ranges should merge so the
+        // mark covers the longer span exactly once, not nest tags.
+        let body = b"waterproof spec sheet";
+        let snippet =
+            generate_snippet(body, &snippet_terms("water waterproof")).expect("snippet");
+        // Single wrapper around the longer word, not nested.
+        assert!(
+            snippet.contains("<mark>waterproof</mark>"),
+            "merged mark: {snippet}"
+        );
+        assert!(
+            !snippet.contains("<mark><mark>"),
+            "no nested marks: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_no_match_returns_none() {
+        let body = b"The quick brown fox jumps over the lazy dog";
+        assert!(generate_snippet(body, &snippet_terms("zebra")).is_none());
+    }
+
+    #[test]
+    fn snippet_empty_body_returns_none() {
+        assert!(generate_snippet(b"", &snippet_terms("fox")).is_none());
+    }
+
+    #[test]
+    fn snippet_non_utf8_body_returns_none() {
+        let bad = &[0xff, 0xfe, 0xfd];
+        assert!(generate_snippet(bad, &snippet_terms("fox")).is_none());
+    }
+
+    #[test]
+    fn snippet_takes_roughly_100_chars_each_side() {
+        // Body: 250 chars of 'a' + " needle " + 250 chars of 'b'.
+        let mut body = vec![b'a'; 250];
+        body.extend_from_slice(b" needle ");
+        body.extend(std::iter::repeat(b'b').take(250));
+        let snippet = generate_snippet(&body, &snippet_terms("needle")).expect("snippet");
+        // Snippet length: ~100 before the match + match len + ~100 after.
+        // Add a small allowance for the <mark>...</mark> tags (13 chars).
+        assert!(
+            snippet.len() < 250,
+            "snippet should be windowed, got {} chars",
+            snippet.len()
+        );
+        assert!(snippet.contains("<mark>needle</mark>"));
+    }
+
+    #[test]
+    fn snippet_terms_split_and_lowercase() {
+        assert_eq!(
+            snippet_terms("Waterproof  TARP"),
+            vec!["waterproof".to_string(), "tarp".to_string()]
+        );
+        assert!(snippet_terms("   ").is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // populate_snippets — preserves Manticore-supplied snippet
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn populate_snippets_preserves_manticore_snippet() {
+        // If Manticore returned a `<b>...</b>`-style snippet (backwards
+        // compat with a body-storing sweep), the guest doesn't overwrite.
+        let hit = PlainHit {
+            doc: "sirix://docs/x/1".into(),
+            score: 1.0,
+            snippet: Some("<b>fox</b> from Manticore".into()),
+            lang: None,
+            body: Some(b"the quick brown fox".to_vec()),
+            content_type: Some("text/plain".into()),
+            fields: vec![],
+            revision: None,
+        };
+        let out = populate_snippets(vec![hit], "fox");
+        assert_eq!(
+            out[0].snippet.as_deref(),
+            Some("<b>fox</b> from Manticore")
+        );
+    }
+
+    #[test]
+    fn populate_snippets_generates_when_missing() {
+        let hit = PlainHit {
+            doc: "sirix://docs/x/1".into(),
+            score: 1.0,
+            snippet: None,
+            lang: None,
+            body: Some(b"the quick brown fox".to_vec()),
+            content_type: Some("text/plain".into()),
+            fields: vec![],
+            revision: None,
+        };
+        let out = populate_snippets(vec![hit], "fox");
+        assert!(out[0].snippet.as_deref().unwrap().contains("<mark>fox</mark>"));
+    }
+
+    #[test]
+    fn populate_snippets_body_none_leaves_snippet_none() {
+        let hit = PlainHit {
+            doc: "sirix://docs/x/1".into(),
+            score: 1.0,
+            snippet: None,
+            lang: None,
+            body: None,
+            content_type: None,
+            fields: vec![],
+            revision: None,
+        };
+        let out = populate_snippets(vec![hit], "fox");
+        assert_eq!(out[0].snippet, None);
     }
 }

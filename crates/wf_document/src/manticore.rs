@@ -4,8 +4,13 @@
 //!
 //!   * `PlainOpts` gains `include_body` and `body_content_type` so the
 //!     guest can pass the caller's search-opts through unchanged.
-//!   * `Hit` gains `body` and `content_type` (populated by the compose
-//!     step after Sirix fetches, not by `parse_response` itself).
+//!   * `Hit` gains `body` and `content_type`. Under the index-only
+//!     mirroring design (memo `wf-document.md` §08 and v1.0 §03),
+//!     Manticore holds the inverted index only — bodies live in Sirix
+//!     and are fetched by the compose step. `parse_response` still
+//!     opportunistically populates `body` / `content_type` if a
+//!     backwards-compat sweep happens to store them in `_source`; a
+//!     `None` result means the compose step will round-trip to Sirix.
 //!
 //! v1.0 additions (memo `wf-document-v1.md` §04, §06):
 //!
@@ -72,8 +77,11 @@ impl AtTime {
 }
 
 /// Plain-Rust mirror of the WIT `hit` record. `body` / `content_type`
-/// start `None` after `parse_response`; the compose step in `lib.rs`
-/// fills them from Sirix when `opts.include_body` is true.
+/// start `None` after `parse_response` under the index-only design —
+/// bodies are held in Sirix and the compose step in `lib.rs` fetches
+/// them per-hit when `opts.include_body` is true. If a backwards-compat
+/// sweep happens to store them in Manticore's `_source`, `parse_response`
+/// picks them up so the compose step can skip the Sirix round-trip.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
     pub doc: String,
@@ -288,13 +296,27 @@ fn parse_hit(hit: &JsonValue) -> Result<Hit, String> {
         .and_then(|obj| obj.get("_rev"))
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
 
+    // Backwards compat: under the index-only design the sweep does NOT
+    // store body/content_type in `_source`, but a corpus mirrored before
+    // the design correction may still carry them. If present, pass them
+    // through so the compose step can skip the Sirix round-trip. Absent
+    // = compose fetches from Sirix.
+    let body = source_obj
+        .and_then(|obj| obj.get("body"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.as_bytes().to_vec());
+    let content_type = source_obj
+        .and_then(|obj| obj.get("content_type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Ok(Hit {
         doc,
         score,
         snippet,
         lang,
-        body: None,
-        content_type: None,
+        body,
+        content_type,
         fields,
         revision,
     })

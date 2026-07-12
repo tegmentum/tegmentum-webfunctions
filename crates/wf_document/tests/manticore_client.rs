@@ -227,12 +227,46 @@ fn parse_response_maps_id_score_snippet() {
 }
 
 #[test]
-fn parse_response_leaves_body_and_content_type_none() {
-    // Manticore never populates body/content_type — that's the compose
-    // step's job. Verify parse_response returns None for both.
+fn parse_response_leaves_body_and_content_type_none_when_source_lacks_them() {
+    // Index-only design (memo `wf-document.md` §08): the sweep does NOT
+    // put bodies in Manticore's `_source`, so parse_response returns
+    // `body: None` / `content_type: None`. The guest's compose step
+    // fetches from Sirix. The canned_response above deliberately omits
+    // those fields so this test locks in the index-only shape.
     let hits = parse_response(&canned_response()).unwrap();
     assert_eq!(hits[0].body, None);
     assert_eq!(hits[0].content_type, None);
+    assert_eq!(hits[1].body, None);
+    assert_eq!(hits[1].content_type, None);
+}
+
+#[test]
+fn parse_response_backcompat_populates_body_from_source() {
+    // Backwards compat: if a pre-correction sweep did store bodies in
+    // Manticore's `_source`, the adapter picks them up so the compose
+    // step can skip the Sirix round-trip. Present-in-source is optional;
+    // absent is the norm under the index-only design.
+    let body = json!({
+        "hits": { "hits": [{
+            "_id":    "sirix://docs/manuals/1",
+            "_score": 0.5,
+            "_source": {
+                "title":        "Legacy mirror row",
+                "body":         "waterproof rig full body",
+                "content_type": "text/plain; charset=utf-8"
+            }
+        }]}
+    })
+    .to_string();
+    let hits = parse_response(&body).unwrap();
+    assert_eq!(
+        hits[0].body.as_deref().map(String::from_utf8_lossy).map(|s| s.to_string()),
+        Some("waterproof rig full body".to_string())
+    );
+    assert_eq!(
+        hits[0].content_type.as_deref(),
+        Some("text/plain; charset=utf-8")
+    );
 }
 
 #[test]
