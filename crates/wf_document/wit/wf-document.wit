@@ -1,0 +1,147 @@
+// wf_document WIT world — v0.2.0.
+//
+// One guest, two backends: Manticore for search, SirixDB (via
+// sirix-sql-server) for durable, versioned document storage. Design
+// memo: docs/design/wf-document.md in the wf-conformance repo.
+//
+// Notes:
+//
+// 1. `search-url` and `sirix-url` are positional guest args. The
+//    substrate side folds them through `wf:partial(<wasm>,
+//    "<search-url>", "<sirix-url>", "<index>", "<query>", <limit>,
+//    "<opts-json>")`. Same idiom as wf_fulltext — the guest stays
+//    stateless; the same .wasm can point at any Manticore + Sirix pair.
+//
+// 2. Network I/O is a host import, not client-side ureq. The single
+//    `host::http-post-json` shape matches wf_fulltext's — one primitive
+//    dispatches both backends. No new host-side plumbing.
+//
+// 3. Doc-ids are `sirix://<db>/<resource>/<node-key>` URIs (memo §06).
+//    The URI + revision is the true identity; the URI alone means
+//    "latest committed". Manticore stores the URI in `_id`.
+//
+// 4. Deviation from memo §04: this world also exports `insert-batch` and
+//    `delete-batch` (Manticore admin ops) alongside `search`, `fetch`,
+//    and `list-revisions`. The sweep phase in `wf_canonicalize` (memo
+//    §08) is a separate ship-order deliverable, but its underlying
+//    admin operations live in this same guest so the substrate can
+//    reach them via one component rather than juggling two.
+
+package wf:document@0.2.0;
+
+interface types {
+    /// A reference to a document in Sirix. `id` is a full-path IRI of
+    /// shape `sirix://<db>/<resource>/<node-key>`. `revision` = None
+    /// means "latest committed"; Some(n) picks a specific revision from
+    /// Sirix's history.
+    record doc-ref {
+        id: string,
+        revision: option<u64>,
+    }
+
+    /// Search options. `include-body`, when true, triggers the guest to
+    /// fetch each hit's document body from Sirix inline. This is the
+    /// v0.2 compose surface: search + fetch as one SERVICE dispatch.
+    record search-opts {
+        limit: option<u32>,
+        offset: option<u32>,
+        fields: list<string>,
+        highlight: bool,
+        lang: option<string>,
+        filter: option<string>,
+        include-body: bool,
+        body-content-type: option<string>,
+    }
+
+    /// A search result. `body` and `content-type` are populated only
+    /// when the caller asked for `include-body` in the search opts.
+    record hit {
+        doc: doc-ref,
+        score: f64,
+        snippet: option<string>,
+        lang: option<string>,
+        body: option<list<u8>>,
+        content-type: option<string>,
+        fields: list<tuple<string, string>>,
+    }
+
+    /// A fetched document. `content-type` is the MIME type Sirix
+    /// reports (or the caller's requested override, if any).
+    record document {
+        doc: doc-ref,
+        body: list<u8>,
+        content-type: string,
+    }
+
+    /// One document to insert/replace in the Manticore mirror. Used by
+    /// the sweep phase to mirror Sirix's committed state.
+    record doc-write {
+        id: string,
+        fields: list<tuple<string, string>>,
+        lang: option<string>,
+    }
+}
+
+/// Host callbacks. Provided by the plugin; consumed by the wasm
+/// component. Single primitive — both Manticore and Sirix HTTP endpoints
+/// are dispatched through this one import.
+interface host {
+    /// POST a JSON `body` to `url` and return the response body as a
+    /// string.
+    ///
+    /// Success = HTTP 2xx; response body returned verbatim so the guest
+    /// parses it with its own serde_json. Any non-2xx response, network
+    /// error, or malformed URL surfaces as `Err(<message>)`. The host is
+    /// expected to set `Content-Type: application/json` on the request.
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}
+
+world document {
+    use types.{doc-ref, search-opts, hit, document, doc-write};
+
+    import host;
+
+    /// Search Manticore at `search-url` for `query` in `index`. When
+    /// `opts.include-body` is true, fetch each hit's body from Sirix at
+    /// `sirix-url` and populate `hit.body` / `hit.content-type`.
+    export search: func(
+        search-url: string,
+        sirix-url: string,
+        index: string,
+        query: string,
+        opts: search-opts,
+    ) -> result<list<hit>, string>;
+
+    /// Fetch a document from Sirix. `doc.revision = None` returns the
+    /// latest committed revision.
+    export fetch: func(
+        sirix-url: string,
+        doc: doc-ref,
+    ) -> result<document, string>;
+
+    /// List the revisions Sirix has for a document. Returns latest-only
+    /// as a single-element list until Sirix's history endpoint exposes
+    /// the full revision list to sirix-sql — noted as a Sirix-side gap.
+    export list-revisions: func(
+        sirix-url: string,
+        doc: doc-ref,
+    ) -> result<list<u64>, string>;
+
+    /// Insert/replace docs in the Manticore mirror at `search-url`.
+    /// Used by the sweep phase (memo §08). Idempotent per-id via the
+    /// `replace` op.
+    export insert-batch: func(
+        search-url: string,
+        index: string,
+        docs: list<doc-write>,
+    ) -> result<u32, string>;
+
+    /// Delete docs from the Manticore mirror by id. Silently skips ids
+    /// the backend doesn't recognize (the sweep may delete tombstones
+    /// Manticore never saw).
+    export delete-batch: func(
+        search-url: string,
+        index: string,
+        ids: list<string>,
+    ) -> result<u32, string>;
+}

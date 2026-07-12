@@ -1,0 +1,24 @@
+[package]
+name = "wf_document"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Mock servers for tests are hand-rolled TcpListener + std::io — no
+# third-party HTTP client needed. serde_json is already a runtime dep.
+
+[package.metadata.component]
+package = "wf:document"
+
+[package.metadata.component.target]
+path = "wit"
+world = "document"
