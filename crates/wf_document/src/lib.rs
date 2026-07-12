@@ -39,6 +39,34 @@
 //! toolchains. The pure request-body construction and response-parsing
 //! logic lives in `manticore.rs` / `manticore_admin.rs` / `sirix.rs`
 //! so tests exercise the wire mapping directly.
+//!
+//! ## Write-through (v1.1)
+//!
+//! v1.1 adds three write exports — `insert-doc`, `update-doc`,
+//! `delete-doc` — that route through Sirix (source of truth) and let
+//! Manticore catch up on the next sweep pass. Sirix commit is the
+//! durable acknowledgment; the returned `write-result` carries the
+//! new revision and its ISO-8601 `valid_from` timestamp.
+//!
+//! **Consistency choice**: Sirix-first, Manticore eventual. If Sirix
+//! commits but Manticore hasn't yet mirrored, a search would miss the
+//! new document until the next sweep — the `fetch` path stays honest
+//! (Sirix is authoritative). Chosen for simplicity; a future v1.2
+//! could add an opt-in "immediate mirror" path that pushes the write
+//! through both stores in one call at the cost of doubling the
+//! latency envelope.
+//!
+//! **Prerequisite**: sirix-sql-server exposes a DML surface. As of
+//! this commit, `QueryHandler.java` calls JDBC's
+//! `Statement.executeQuery(sql)` — SELECT-only. INSERT / UPDATE /
+//! DELETE against production sirix-sql-server will surface the JDBC
+//! exception through the guest's `Err(...)` channel. The guest-side
+//! implementation is correct and independently tested against a
+//! compatible mock; the end-to-end write path requires a sibling
+//! change in `sirixdb-sql/sirix-sql-server` to route non-SELECT SQL
+//! through `executeUpdate` and to shape a `_rev`/`_valid_from`
+//! response body. Tracked as a Sirix-side gap; deliberately not
+//! bundled here so the guest can land independently.
 
 wit_bindgen::generate!({
     world: "document",
@@ -48,6 +76,7 @@ wit_bindgen::generate!({
 pub mod manticore;
 pub mod manticore_admin;
 pub mod sirix;
+pub mod sirix_write;
 
 use manticore::{
     build_probe_body, build_request_body, parse_response, schema_has_valid_from, AtTime,
@@ -59,6 +88,9 @@ use manticore_admin::{
 use sirix::{
     build_fetch_body, build_fetch_sql, build_revisions_sql, parse_fetch_response,
     parse_revisions_response, parse_sirix_uri, query_url,
+};
+use sirix_write::{
+    build_delete_sql, build_insert_sql, build_update_sql, parse_write_response,
 };
 use wf::document::host;
 
@@ -226,6 +258,88 @@ impl Guest for Component {
         let response_body = host::http_post_json(&url, &body)
             .map_err(|e| format!("wf_document: POST {url}: {e}"))?;
         parse_bulk_response(&response_body)
+    }
+
+    // -----------------------------------------------------------------
+    // v1.1 write-through — Sirix-first, Manticore eventual
+    //
+    // insert-doc / update-doc / delete-doc emit DML SQL to
+    // sirix-sql-server's POST /query endpoint. Sirix commits and
+    // echoes back {_rev, _valid_from}; the guest lifts that into a
+    // WIT `write-result`. Manticore is caught up on the next sweep
+    // pass — no extra network calls happen here.
+    //
+    // Consistency: Sirix commit is durable ack. If the sweep hasn't
+    // run yet, a search would miss the write, but `fetch` stays
+    // honest (Sirix is authoritative).
+    //
+    // Prerequisite: sirix-sql-server exposes a DML surface. Its
+    // current QueryHandler.java calls Statement.executeQuery(sql) —
+    // SELECT only. Production writes will surface the JDBC exception
+    // through the guest's Err(...) channel until the sirix-sql-server
+    // DML follow-up lands.
+    // -----------------------------------------------------------------
+
+    fn insert_doc(
+        sirix_url: String,
+        database: String,
+        resource_name: String,
+        doc: Vec<u8>,
+        content_type: String,
+    ) -> Result<WriteResult, String> {
+        let _ = content_type; // Informational only in v1.1; Sirix stores JSON natively.
+        let sql = build_insert_sql(&database, &resource_name, &doc)?;
+        let body = build_fetch_body(&sql);
+        let url = query_url(&sirix_url);
+        let response_body = host::http_post_json(&url, &body)
+            .map_err(|e| format!("wf_document: POST {url}: {e}"))?;
+        let ack = parse_write_response(&response_body)?;
+        // On INSERT the caller doesn't know the node-key yet; use the
+        // one Sirix assigns. If the server omits it, fall back to an
+        // empty node-key — the caller can list-revisions and pick it
+        // up out of band. Honest but rare.
+        let node_key = ack.node_key.clone().unwrap_or_default();
+        Ok(WriteResult {
+            doc: DocRef {
+                id: format!("sirix://{database}/{resource_name}/{node_key}"),
+                revision: Some(ack.revision),
+            },
+            valid_from: ack.valid_from,
+        })
+    }
+
+    fn update_doc(
+        sirix_url: String,
+        doc: DocRef,
+        body: Vec<u8>,
+    ) -> Result<WriteResult, String> {
+        let plain_doc = parse_sirix_uri(&doc.id)?;
+        let sql = build_update_sql(&plain_doc, &body, doc.revision)?;
+        let json_body = build_fetch_body(&sql);
+        let url = query_url(&sirix_url);
+        let response_body = host::http_post_json(&url, &json_body)
+            .map_err(|e| format!("wf_document: POST {url}: {e}"))?;
+        let ack = parse_write_response(&response_body)?;
+        Ok(WriteResult {
+            doc: DocRef {
+                id: doc.id,
+                revision: Some(ack.revision),
+            },
+            valid_from: ack.valid_from,
+        })
+    }
+
+    fn delete_doc(sirix_url: String, doc: DocRef) -> Result<(), String> {
+        let plain_doc = parse_sirix_uri(&doc.id)?;
+        let sql = build_delete_sql(&plain_doc);
+        let json_body = build_fetch_body(&sql);
+        let url = query_url(&sirix_url);
+        let response_body = host::http_post_json(&url, &json_body)
+            .map_err(|e| format!("wf_document: POST {url}: {e}"))?;
+        // Delete gets a write-result on the wire (successor revision +
+        // valid_from), but the WIT contract is Result<(), string> —
+        // surface Sirix errors and drop the ack.
+        parse_write_response(&response_body).map(|_| ())
     }
 }
 
