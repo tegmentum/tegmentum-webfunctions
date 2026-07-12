@@ -1,6 +1,14 @@
-// Webfunction WIT world, v0.5.0.
+// Webfunction WIT world, v0.6.0.
 //
-// v0.5.0 adds the `sink-*` host imports — handle-based I/O against an
+// v0.6.0 adds `execute-query-with-bindings` — a variant of `execute-query`
+// that accepts a full `binding-sets` matrix (vars + rows) as pre-seed
+// bindings, rather than the single-row `list<binding>` that v0.5.0's
+// `execute-query` takes. This is what unlocks typed binding-set
+// propagation between wf_pipeline steps: a step's row grid can be handed
+// to the next SPARQL step as a VALUES clause without going through
+// string interpolation. See `wf_pipeline` v3 memo for the arc.
+//
+// v0.5.0 added the `sink-*` host imports — handle-based I/O against an
 // out-of-graph backend (SQLite, DuckDB, Postgres, SirixDB). This is what
 // unlocks polyglot demotion: portable guests can materialize a
 // relational-shaped subgraph to a SQL sink, or a tree-shaped subgraph to
@@ -11,10 +19,10 @@
 // speak its native dialect — SQL for the relational sinks, XQuery/Brackit
 // for SirixDB — without the WIT surface having to pick a lingua franca.
 //
-// Additive; guests importing v0.4.0 or earlier link against v0.5.0
-// unchanged. The `types` and `host` interfaces are supersets of v0.4.0.
+// Additive; guests importing v0.5.0 or earlier link against v0.6.0
+// unchanged. The `types` and `host` interfaces are supersets of v0.5.0.
 
-package stardog:webfunction@0.5.0;
+package stardog:webfunction@0.6.0;
 
 interface types {
     variant value {
@@ -65,6 +73,25 @@ interface host {
     execute-query: func(
         sparql: string,
         bindings: list<binding>,
+        max-rows: option<u32>,
+    ) -> result<binding-sets, string>;
+
+    /// v0.6.0 addition: execute a SPARQL query with a full pre-seed
+    /// binding matrix. `seed.vars` names the columns; `seed.rows` is one
+    /// binding-set per row. The host injects these as a VALUES clause
+    /// (or the engine's native equivalent — Oxigraph splices a
+    /// `GraphPattern::Values` node under the outermost projection so the
+    /// seed joins against WHERE-only variables too, matching Jena's
+    /// initial-bindings semantics).
+    ///
+    /// Additive over `execute-query`: the single-row `list<binding>`
+    /// path stays available for scalar callers. Guests that hold a full
+    /// binding-set from a prior step avoid stringifying it into VALUES
+    /// text and back — the values keep their typed WIT representation
+    /// across the boundary.
+    execute-query-with-bindings: func(
+        query: string,
+        seed: binding-sets,
         max-rows: option<u32>,
     ) -> result<binding-sets, string>;
 
