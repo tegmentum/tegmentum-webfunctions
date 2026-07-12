@@ -5,11 +5,13 @@
 //!    → binding-set { classes: xsd:integer, aliased: xsd:integer,
 //!                     rewritten: xsd:integer, seeded: xsd:integer,
 //!                     ft_inserted: xsd:integer, ft_deleted: xsd:integer,
-//!                     ft_errors: xsd:integer }
+//!                     ft_errors: xsd:integer,
+//!                     doc_inserted: xsd:integer, doc_deleted: xsd:integer,
+//!                     doc_unchanged: xsd:integer, doc_errors: xsd:integer }
 //!
 //! Config JSON shape (only `sink` is required; `rule` defaults to
-//! `mint_genid`; `fulltext_indexes` defaults to empty and skips the
-//! fulltext-reconcile phase entirely):
+//! `mint_genid`; `fulltext_indexes` and `document_indexes` default to
+//! empty and skip their respective reconcile phases entirely):
 //!
 //! ```json
 //! { "sink": "sqlite:///data/mv.db#aliases",
@@ -19,6 +21,16 @@
 //!       "backend_url": "http://localhost:9308",
 //!       "index": "products",
 //!       "predicates": ["http://ex/label", "http://ex/description"],
+//!       "sweep_interval_secs": 300 }
+//!   ],
+//!   "document_indexes": [
+//!     { "name": "manuals",
+//!       "search_backend": "http://localhost:9308",
+//!       "storage_backend": "http://localhost:8080",
+//!       "search_index": "manuals",
+//!       "sirix_database": "docs",
+//!       "sirix_resource": "manuals",
+//!       "revision_retention": "latest",
 //!       "sweep_interval_secs": 300 }
 //!   ] }
 //! ```
@@ -82,12 +94,14 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+pub mod document_sweep;
 pub mod fulltext_sweep;
 
 use stardog::webfunction::host;
 use stardog::webfunction::types::{Accuracy, Binding, Literal};
 use wf::fulltext::host as fulltext_host;
 
+use document_sweep::{DocumentIndexConfig, SweepResult as DocSweepResult};
 use fulltext_sweep::{FulltextIndexConfig, SweepCounts};
 
 struct Component;
@@ -107,6 +121,14 @@ struct Config {
     /// registered is a valid state.
     #[serde(default)]
     fulltext_indexes: Vec<FulltextIndexConfig>,
+    /// Zero or more Managed-mode document-index registry entries to
+    /// reconcile against Sirix on this sweep. Empty (or absent) skips
+    /// the entire document-reconcile phase — Federated-mode entries
+    /// are filtered out by the outer oxigraph-wf handler before the
+    /// config is serialized, so anything that reaches this field is
+    /// Managed by construction.
+    #[serde(default)]
+    document_indexes: Vec<DocumentIndexConfig>,
 }
 
 fn default_rule() -> String {
@@ -346,6 +368,34 @@ impl Guest for Component {
             )
         };
 
+        // Phase 4c: document-mirror sweep. Runs after fulltext_sweep
+        // because both mirror to the same Manticore (different indexes
+        // per registry entry) — running document last means an
+        // operator watching sweep logs sees the two phases in a
+        // consistent order regardless of registry composition. Skipped
+        // entirely when no document_indexes are configured, so
+        // fulltext-only deployments pay zero cost.
+        //
+        // Same fail-soft posture as fulltext_sweep: any per-entry
+        // Sirix/Manticore error logs to stderr and bumps `errors`; the
+        // alias-reconcile outputs stay usable even when the document
+        // backends are down.
+        let doc_sweep = if cfg.document_indexes.is_empty() {
+            DocSweepResult::default()
+        } else {
+            eprintln!(
+                "document sweep: {} managed entries, last commit rev={}",
+                cfg.document_indexes.len(),
+                store_rev()
+            );
+            document_sweep::run(
+                &cfg.document_indexes,
+                &FulltextHostBridge,
+                &SirixHostBridge,
+                &DocSinkBridgeImpl { handle: sink_handle },
+            )
+        };
+
         host::sink_close(sink_handle).ok();
 
         // Phase 5: delete the sameAs assertions.
@@ -364,6 +414,10 @@ impl Guest for Component {
                 "ft_inserted".into(),
                 "ft_deleted".into(),
                 "ft_errors".into(),
+                "doc_inserted".into(),
+                "doc_deleted".into(),
+                "doc_unchanged".into(),
+                "doc_errors".into(),
             ],
             rows: vec![vec![
                 Binding {
@@ -393,6 +447,22 @@ impl Guest for Component {
                 Binding {
                     name: "ft_errors".into(),
                     value: int_literal(sweep_counts.errors as i64),
+                },
+                Binding {
+                    name: "doc_inserted".into(),
+                    value: int_literal(doc_sweep.inserted as i64),
+                },
+                Binding {
+                    name: "doc_deleted".into(),
+                    value: int_literal(doc_sweep.deleted as i64),
+                },
+                Binding {
+                    name: "doc_unchanged".into(),
+                    value: int_literal(doc_sweep.unchanged as i64),
+                },
+                Binding {
+                    name: "doc_errors".into(),
+                    value: int_literal(doc_sweep.errors as i64),
                 },
             ]],
         })
@@ -769,6 +839,139 @@ impl fulltext_sweep::SinkBridge for SinkBridgeImpl {
         host::sink_execute(self.handle, &sql, &[string_lit(subject)])
             .map(|_| ())
             .map_err(|e| format!("delete: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Document-sweep bridges
+// ---------------------------------------------------------------------------
+
+/// Wire the document-sweep `SirixBridge` through to `http-post-json`.
+/// Sirix-sql-server exposes a single `POST /query` endpoint that takes
+/// `{"sql": "..."}` and returns `{"columns":[...],"rows":[[...],...]}`
+/// — same wire shape wf_document uses. Kept as a zero-sized newtype so
+/// the sweep unit tests can substitute a TcpListener-backed mock
+/// without pulling in the wit bindings.
+struct SirixHostBridge;
+
+impl document_sweep::SirixBridge for SirixHostBridge {
+    fn list_documents(
+        &self,
+        sirix_url: &str,
+        database: &str,
+        resource: &str,
+        since_rev: Option<u64>,
+    ) -> Result<Vec<document_sweep::SirixDocRow>, String> {
+        let sql = document_sweep::build_scan_sql(database, resource, since_rev);
+        let body = document_sweep::build_query_body(&sql);
+        let url = document_sweep::sirix_query_url(sirix_url);
+        let response = fulltext_host::http_post_json(&url, &body)
+            .map_err(|e| format!("sirix POST /query: {e}"))?;
+        document_sweep::parse_scan_response(&response)
+    }
+}
+
+/// Wire the document-sweep `DocSinkBridge` through to the WIT `sink-*`
+/// imports. Separate from `SinkBridgeImpl` because the tracker schema
+/// carries an extra `last_seen_rev` column that the fulltext sweep
+/// doesn't need.
+struct DocSinkBridgeImpl {
+    handle: u32,
+}
+
+impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
+    fn ensure_doc_table(&self, table: &str) -> Result<(), String> {
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {table} (\
+             doc_uri TEXT PRIMARY KEY, \
+             last_seen_rev INTEGER NOT NULL, \
+             doc_hash TEXT NOT NULL, \
+             updated_at INTEGER NOT NULL)"
+        );
+        host::sink_execute(self.handle, &ddl, &[])
+            .map(|_| ())
+            .map_err(|e| format!("ensure_doc_table: {e}"))
+    }
+
+    fn load_known_docs(
+        &self,
+        table: &str,
+    ) -> Result<HashMap<String, document_sweep::KnownDoc>, String> {
+        let sql = format!("SELECT doc_uri, last_seen_rev, doc_hash FROM {table}");
+        let bs = host::sink_execute(self.handle, &sql, &[])
+            .map_err(|e| format!("load_known_docs: {e}"))?;
+        let mut out = HashMap::with_capacity(bs.rows.len());
+        for row in &bs.rows {
+            let uri = row
+                .iter()
+                .find(|b| b.name == "doc_uri")
+                .and_then(|b| match &b.value {
+                    Value::Literal(l) => Some(l.label.clone()),
+                    Value::Iri(i) => Some(i.clone()),
+                    _ => None,
+                });
+            let rev = row
+                .iter()
+                .find(|b| b.name == "last_seen_rev")
+                .and_then(|b| match &b.value {
+                    Value::Literal(l) => l.label.parse::<u64>().ok(),
+                    _ => None,
+                });
+            let hash = row
+                .iter()
+                .find(|b| b.name == "doc_hash")
+                .and_then(|b| match &b.value {
+                    Value::Literal(l) => Some(l.label.clone()),
+                    _ => None,
+                });
+            if let (Some(u), Some(r), Some(h)) = (uri, rev, hash) {
+                out.insert(
+                    u,
+                    document_sweep::KnownDoc {
+                        last_seen_rev: r,
+                        doc_hash: h,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    fn upsert_doc(
+        &self,
+        table: &str,
+        doc_uri: &str,
+        entry: &document_sweep::KnownDoc,
+    ) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let sql = format!(
+            "INSERT OR REPLACE INTO {table} \
+             (doc_uri, last_seen_rev, doc_hash, updated_at) \
+             VALUES (?, ?, ?, ?)"
+        );
+        host::sink_execute(
+            self.handle,
+            &sql,
+            &[
+                string_lit(doc_uri),
+                int_literal(entry.last_seen_rev as i64),
+                string_lit(&entry.doc_hash),
+                int_literal(now_secs),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("upsert_doc: {e}"))
+    }
+
+    fn delete_doc(&self, table: &str, doc_uri: &str) -> Result<(), String> {
+        let sql = format!("DELETE FROM {table} WHERE doc_uri = ?");
+        host::sink_execute(self.handle, &sql, &[string_lit(doc_uri)])
+            .map(|_| ())
+            .map_err(|e| format!("delete_doc: {e}"))
     }
 }
 
