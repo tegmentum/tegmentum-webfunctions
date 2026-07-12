@@ -129,6 +129,16 @@ struct Config {
     /// Managed by construction.
     #[serde(default)]
     document_indexes: Vec<DocumentIndexConfig>,
+    /// v1.0 backfill flag on the document sweep. When `true`, the
+    /// retention=all branch ignores the known-keys tracker's
+    /// `last_seen_rev` history and re-mirrors every revision it can
+    /// see from Sirix — used at initial `retention: "all"` enablement
+    /// to pull the full history. Defaults to `false` so scheduled
+    /// invocations stay incremental. Latest-mode branches also honor
+    /// the flag (skip the FNV unchanged-check) so an operator can
+    /// force-refresh a stale mirror.
+    #[serde(default)]
+    full_scan: bool,
 }
 
 fn default_rule() -> String {
@@ -384,15 +394,19 @@ impl Guest for Component {
             DocSweepResult::default()
         } else {
             eprintln!(
-                "document sweep: {} managed entries, last commit rev={}",
+                "document sweep: {} managed entries, last commit rev={}, full_scan={}",
                 cfg.document_indexes.len(),
-                store_rev()
+                store_rev(),
+                cfg.full_scan,
             );
-            document_sweep::run(
+            document_sweep::run_with_options(
                 &cfg.document_indexes,
                 &FulltextHostBridge,
                 &SirixHostBridge,
                 &DocSinkBridgeImpl { handle: sink_handle },
+                document_sweep::SweepOptions {
+                    full_scan: cfg.full_scan,
+                },
             )
         };
 
@@ -881,12 +895,25 @@ struct DocSinkBridgeImpl {
 
 impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
     fn ensure_doc_table(&self, table: &str) -> Result<(), String> {
+        // v1.0 schema: composite (doc_uri, rev) primary key. Latest-
+        // mode rows use rev=0 (SQLite DEFAULT 0); retention=all rows
+        // carry the real Sirix revision. `last_seen_rev` stays as a
+        // value column so a hash-diff can still compare "same rev,
+        // same content" for latest-mode. Existing v0.2 databases will
+        // pick up the new schema on the next sweep because CREATE
+        // TABLE IF NOT EXISTS is a no-op for the same name — deployed
+        // clusters that ran v0.2 need a one-shot migration (`ALTER
+        // TABLE ... ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`) if
+        // they want retention=all data alongside their existing
+        // latest-mode rows. Documented behavior at first cutover.
         let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
-             doc_uri TEXT PRIMARY KEY, \
+             doc_uri TEXT NOT NULL, \
+             rev INTEGER NOT NULL DEFAULT 0, \
              last_seen_rev INTEGER NOT NULL, \
              doc_hash TEXT NOT NULL, \
-             updated_at INTEGER NOT NULL)"
+             updated_at INTEGER NOT NULL, \
+             PRIMARY KEY (doc_uri, rev))"
         );
         host::sink_execute(self.handle, &ddl, &[])
             .map(|_| ())
@@ -896,8 +923,8 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
     fn load_known_docs(
         &self,
         table: &str,
-    ) -> Result<HashMap<String, document_sweep::KnownDoc>, String> {
-        let sql = format!("SELECT doc_uri, last_seen_rev, doc_hash FROM {table}");
+    ) -> Result<HashMap<(String, u64), document_sweep::KnownDoc>, String> {
+        let sql = format!("SELECT doc_uri, rev, last_seen_rev, doc_hash FROM {table}");
         let bs = host::sink_execute(self.handle, &sql, &[])
             .map_err(|e| format!("load_known_docs: {e}"))?;
         let mut out = HashMap::with_capacity(bs.rows.len());
@@ -910,7 +937,14 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
                     Value::Iri(i) => Some(i.clone()),
                     _ => None,
                 });
-            let rev = row
+            let rev_col = row
+                .iter()
+                .find(|b| b.name == "rev")
+                .and_then(|b| match &b.value {
+                    Value::Literal(l) => l.label.parse::<u64>().ok(),
+                    _ => None,
+                });
+            let last_seen_rev = row
                 .iter()
                 .find(|b| b.name == "last_seen_rev")
                 .and_then(|b| match &b.value {
@@ -924,9 +958,11 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
                     Value::Literal(l) => Some(l.label.clone()),
                     _ => None,
                 });
-            if let (Some(u), Some(r), Some(h)) = (uri, rev, hash) {
+            if let (Some(u), Some(rev_key), Some(r), Some(h)) =
+                (uri, rev_col, last_seen_rev, hash)
+            {
                 out.insert(
-                    u,
+                    (u, rev_key),
                     document_sweep::KnownDoc {
                         last_seen_rev: r,
                         doc_hash: h,
@@ -941,6 +977,7 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
         &self,
         table: &str,
         doc_uri: &str,
+        rev: u64,
         entry: &document_sweep::KnownDoc,
     ) -> Result<(), String> {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -950,14 +987,15 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
             .unwrap_or(0);
         let sql = format!(
             "INSERT OR REPLACE INTO {table} \
-             (doc_uri, last_seen_rev, doc_hash, updated_at) \
-             VALUES (?, ?, ?, ?)"
+             (doc_uri, rev, last_seen_rev, doc_hash, updated_at) \
+             VALUES (?, ?, ?, ?, ?)"
         );
         host::sink_execute(
             self.handle,
             &sql,
             &[
                 string_lit(doc_uri),
+                int_literal(rev as i64),
                 int_literal(entry.last_seen_rev as i64),
                 string_lit(&entry.doc_hash),
                 int_literal(now_secs),
@@ -967,11 +1005,20 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
         .map_err(|e| format!("upsert_doc: {e}"))
     }
 
-    fn delete_doc(&self, table: &str, doc_uri: &str) -> Result<(), String> {
-        let sql = format!("DELETE FROM {table} WHERE doc_uri = ?");
-        host::sink_execute(self.handle, &sql, &[string_lit(doc_uri)])
-            .map(|_| ())
-            .map_err(|e| format!("delete_doc: {e}"))
+    fn delete_doc(
+        &self,
+        table: &str,
+        doc_uri: &str,
+        rev: u64,
+    ) -> Result<(), String> {
+        let sql = format!("DELETE FROM {table} WHERE doc_uri = ? AND rev = ?");
+        host::sink_execute(
+            self.handle,
+            &sql,
+            &[string_lit(doc_uri), int_literal(rev as i64)],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("delete_doc: {e}"))
     }
 }
 
