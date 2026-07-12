@@ -4,6 +4,59 @@
 //! that keeps Manticore mirroring the latest committed state of every
 //! Sirix document per `DocumentRegistry` entry (Managed mode only).
 //!
+//! # Index-only mirroring (memo §08 / v1.0 §03)
+//!
+//! Manticore holds the **inverted index only** — not document bodies.
+//! This is load-bearing: Sirix's whole value proposition is structural-
+//! sharing delta storage across revisions. Copying full bodies into
+//! Manticore at every sweep (worse: at every revision under
+//! `retention_all`) would completely defeat that story — a 100 MB Sirix
+//! corpus with 10x average revisions would balloon to a 1 GB Manticore
+//! blob store, and Sirix would be doing nothing the substrate observes.
+//!
+//! So: the sweep sends `_uri`, `_rev`, `_valid_from`, `_valid_to`, plus
+//! the tokenized body text under the JSON key `text`. Manticore
+//! tokenizes it into the inverted index. Body retrieval (snippets,
+//! `include_body: true`) happens via a Sirix round-trip on demand,
+//! guest-side.
+//!
+//! # Operator schema requirement — `text stored='0'`
+//!
+//! Manticore's `/bulk` API has no per-request "index but don't store"
+//! flag — that property is set once at `CREATE TABLE` time on the column.
+//! Operators MUST declare the `text` column with the `stored='0'`
+//! attribute so Manticore indexes the tokens but does NOT keep the raw
+//! text in `_source` (the row payload it returns from `SELECT`). Example:
+//!
+//! ```sql
+//! CREATE TABLE manuals (
+//!     _uri        string,
+//!     _rev        integer,
+//!     _valid_from bigint,
+//!     _valid_to   bigint,
+//!     text        text stored='0'   -- indexed, NOT stored in _source
+//! )
+//! ```
+//!
+//! The sweep sends the same NDJSON `/bulk` body regardless — the schema
+//! is what decides whether the raw text lingers in Manticore's `_source`.
+//! With `stored='0'`, `SELECT *` returns only metadata; bodies come from
+//! Sirix, exactly matching the memo intent.
+//!
+//! Retention modes: both `latest` and `all` send the same JSON shape
+//! (index-only). Under `latest`, `_source` is `_uri`+`_rev` metadata;
+//! under `all`, add `_valid_from`+`_valid_to`. Neither carries the body.
+//! The v0.2 draft text implied bodies-in-`_source`; the memo correction
+//! at wf-conformance commit `dfe456a` retracted that for both modes.
+//!
+//! # Backwards compat
+//!
+//! A Manticore corpus populated by an older sweep (pre-rename) will have
+//! rows under the `body` column. Those rows remain searchable — Manticore
+//! doesn't care which column holds tokens. The sweep re-populates rows
+//! under `text` on the next change; the operator drops the old `body`
+//! column at their convenience. No wire break; no query break.
+//!
 //! Contract:
 //!
 //! * Input: a list of `DocumentIndexConfig` entries plus three "bridge"
@@ -691,17 +744,26 @@ fn compute_deletes(
 }
 
 /// Build the NDJSON body for a batch of `replace` ops into Manticore.
-/// Doc payload carries `_uri`, `_rev`, `body`, and `content_type` — an
+/// Doc payload carries `_uri`, `_rev`, `text`, and `content_type` — an
 /// index schema that mirrors the memo §06 doc-ref surface. The `_id`
 /// on the outer `replace` envelope is the same `sirix://` URI so
 /// re-sending the same doc is idempotent.
+///
+/// The body text goes on the wire under the JSON key `text` (memo §08
+/// index-only correction, wf-conformance commit `dfe456a`). Operators
+/// declare the `text` column at `CREATE TABLE` time with the
+/// `stored='0'` attribute so Manticore tokenizes it into the inverted
+/// index but does NOT retain the raw bytes in `_source`. See the
+/// crate-level doc comment for the exact DDL and rationale (Sirix's
+/// structural sharing must not be defeated by a duplicated blob store
+/// in Manticore).
 ///
 /// v1.0 addition: retention=all `DocMirror`s carry `valid_from` /
 /// `valid_to` and are keyed as `<uri>@rev<N>` on the wire so multiple
 /// revisions of one URI coexist. When the mirror carries validity
 /// intervals we emit `_valid_from` / `_valid_to` columns alongside;
-/// latest-mode rows omit them entirely so the wire shape matches v0.2
-/// byte-for-byte.
+/// latest-mode rows omit them entirely so `_source` shrinks to just
+/// `_uri` + `_rev` metadata.
 pub fn build_bulk_body(index: &str, docs: &[DocMirror]) -> String {
     use serde_json::{json, Map, Value as J};
     let mut out = String::new();
@@ -709,7 +771,11 @@ pub fn build_bulk_body(index: &str, docs: &[DocMirror]) -> String {
         let mut doc_obj = Map::new();
         doc_obj.insert("_uri".into(), J::String(doc.uri.clone()));
         doc_obj.insert("_rev".into(), J::Number(doc.revision.into()));
-        doc_obj.insert("body".into(), J::String(doc.body.clone()));
+        // Body text on the wire under `text`, per memo §08 index-only
+        // correction. Operator DDL declares this column as
+        // `text stored='0'` — indexed for full-text search, not kept
+        // in `_source`. Bodies are fetched from Sirix on demand.
+        doc_obj.insert("text".into(), J::String(doc.body.clone()));
         doc_obj.insert(
             "content_type".into(),
             J::String(doc.content_type.clone()),
@@ -1838,6 +1904,77 @@ mod tests {
         assert_eq!(v["replace"]["id"], "sirix://docs/manuals/42");
         assert!(v["replace"]["doc"].get("_valid_from").is_none());
         assert!(v["replace"]["doc"].get("_valid_to").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Index-only wire shape (memo §08 correction, dfe456a)
+    // -----------------------------------------------------------------
+
+    /// The sweep emits the body text under the JSON key `text`, not
+    /// `body`. Operators declare that column as `text stored='0'` so
+    /// Manticore indexes but doesn't keep the raw text in `_source`.
+    #[test]
+    fn latest_mode_bulk_body_uses_text_key_not_body() {
+        let entry = cfg("manuals");
+        let sirix = MockSirix {
+            rows: RefCell::new(vec![SirixDocRow {
+                node_key: "42".into(),
+                revision: 1,
+                body: "widget spec sheet".into(),
+                content_type: "text/plain".into(),
+                commit_timestamp: None,
+            }]),
+        };
+        let http = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let sink = MockDocSink::default();
+        run(&[entry], &http, &sirix, &sink);
+
+        let posts = http.posts.borrow();
+        let line = posts[0].1.trim_end_matches('\n');
+        let v: JsonValue = serde_json::from_str(line).unwrap();
+        let doc = &v["replace"]["doc"];
+        // Body text goes on the wire under `text` — Manticore indexes
+        // it, DDL `stored='0'` keeps it out of `_source`.
+        assert_eq!(doc["text"], JsonValue::String("widget spec sheet".into()));
+        // The pre-memo-correction key `body` is no longer emitted.
+        assert!(
+            doc.get("body").is_none(),
+            "sweep must not emit `body` field: {doc}"
+        );
+    }
+
+    /// Retention=all also uses `text` for every revision — the memo
+    /// correction covers both latest and all modes.
+    #[test]
+    fn retention_all_bulk_body_uses_text_key_not_body() {
+        let entry = cfg_all("manuals");
+        let sirix = MockSirix {
+            rows: RefCell::new(three_rev_history_with_ts()),
+        };
+        let http = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let sink = MockDocSink::default();
+        run(&[entry], &http, &sirix, &sink);
+
+        let posts = http.posts.borrow();
+        let ndjson = &posts[0].1;
+        for line in ndjson.lines() {
+            let v: JsonValue = serde_json::from_str(line).unwrap();
+            let doc = &v["replace"]["doc"];
+            assert!(
+                doc.get("text").is_some(),
+                "every retention_all row must carry `text`: {doc}"
+            );
+            assert!(
+                doc.get("body").is_none(),
+                "retention_all rows must not emit `body`: {doc}"
+            );
+        }
     }
 
     #[test]
