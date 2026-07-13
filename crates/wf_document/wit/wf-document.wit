@@ -1,16 +1,16 @@
-// wf_document WIT world — v1.2.0 (additive over v1.1 write-through).
+// wf_document WIT world — v1.3.0 (additive over v1.2 search extensions).
 //
 // One guest, two backends: Manticore for search, SirixDB (via
 // sirix-sql-server) for durable, versioned document storage. Design
 // memo: docs/design/wf-document.md in the wf-conformance repo.
 //
-// v1.1 (already shipped, commit 3e5d833) adds write-through:
+// v1.1 (shipped, commit 3e5d833) adds write-through:
 // `insert-doc`, `update-doc`, `delete-doc`. Writes go into Sirix
 // (source of truth); Manticore catches up on the periodic sweep.
 //
-// v1.2 (this bump) adds four search-side capabilities from the memos'
-// deferred list (`wf-document.md` §12, `wf-document-v1.md` §08).
-// All four are additive on top of v1.1 — every earlier call is
+// v1.2 (shipped, commit 9e1643d) adds four search-side capabilities from
+// the memos' deferred list (`wf-document.md` §12, `wf-document-v1.md`
+// §08). All four are additive on top of v1.1 — every earlier call is
 // byte-for-byte unchanged when the new fields are None.
 //   * Cross-index queries — `search-opts.indexes` unions multiple
 //     registered indexes into a single Manticore request. `index`
@@ -25,6 +25,27 @@
 //     verbatim to Manticore's k-NN. The target index MUST have a
 //     `vector` field declared (operator's responsibility — this
 //     substrate does not generate embeddings).
+//
+// v1.3 (this bump) closes the last row on the memo's deferred list
+// (`wf-document-v1.md` §08 — range queries). `search-opts` gains two
+// optional inclusive bounds:
+//
+//   * `after`  — lower bound on `_valid_from` (ISO-8601 UTC or Unix
+//     epoch as decimal string).
+//   * `before` — upper bound on `_valid_from`.
+//
+// Semantics:
+//   * Both bounds inclusive (Manticore `gte` / `lte`).
+//   * Either bound optional — set only `after` for an open right-hand
+//     range, only `before` for an open left-hand range, or both for a
+//     closed range.
+//   * Mutually exclusive with `at-time` / `at-rev`. Setting `after` or
+//     `before` alongside either time-travel selector returns Err.
+//   * Range mode drops the default `_valid_to IS NULL` current-only
+//     guard — each matching revision returns as its own hit, so a
+//     document URI may repeat across hits.
+//   * Empty range (`after > before` after ISO parse) — returns the
+//     empty hit list. Honest empty result, not an error.
 //
 // Notes:
 //
@@ -42,7 +63,7 @@
 //    `delete-batch` (Manticore admin ops) alongside `search`, `fetch`,
 //    and `list-revisions`.
 
-package wf:document@1.2.0;
+package wf:document@1.3.0;
 
 interface types {
     record doc-ref {
@@ -79,6 +100,17 @@ interface types {
         /// The `index` positional argument is the DEFAULT when this is
         /// None or empty.
         indexes: option<list<string>>,
+        /// v1.3 range-query lower bound. ISO-8601 UTC or Unix epoch as
+        /// a decimal string, mirroring `at-time`. Inclusive (`gte`).
+        /// Mutually exclusive with `at-time` and `at-rev`; the guest
+        /// returns Err when combined. Range mode drops the default
+        /// `_valid_to IS NULL` guard — every matching revision returns
+        /// as its own hit, so a document URI may repeat across hits.
+        after: option<string>,
+        /// v1.3 range-query upper bound. Same shape as `after`, inclusive
+        /// (`lte`). Both bounds optional individually; empty range
+        /// (`after > before`) returns an empty hit list.
+        before: option<string>,
     }
 
     record hit {

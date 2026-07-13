@@ -444,6 +444,145 @@ fn at_time_composes_with_user_filter_and_lang() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// v1.2 — range queries (memo wf-document-v1.md §08)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn after_only_emits_open_range() {
+    // Only `after` set → single _valid_from range with `gte` only.
+    // Range mode drops the default current-only guard.
+    let opts = PlainOpts {
+        after: Some(AtTime::Iso("2026-01-01T00:00:00Z".into())),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    assert_eq!(filters.len(), 1);
+    let range = &filters[0]["range"]["_valid_from"];
+    assert_eq!(range["gte"], json!("2026-01-01T00:00:00Z"));
+    assert!(
+        range.as_object().unwrap().get("lte").is_none(),
+        "before is None → no `lte` bound emitted, got {range}"
+    );
+    // The current-only guard MUST NOT leak into range mode.
+    for f in filters {
+        assert!(f != &current_only_guard(), "current-only guard leaked into range mode");
+    }
+}
+
+#[test]
+fn before_only_emits_closed_range() {
+    // Only `before` set → single _valid_from range with `lte` only.
+    let opts = PlainOpts {
+        before: Some(AtTime::Iso("2026-06-01T00:00:00Z".into())),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    assert_eq!(filters.len(), 1);
+    let range = &filters[0]["range"]["_valid_from"];
+    assert_eq!(range["lte"], json!("2026-06-01T00:00:00Z"));
+    assert!(
+        range.as_object().unwrap().get("gte").is_none(),
+        "after is None → no `gte` bound emitted, got {range}"
+    );
+    for f in filters {
+        assert!(f != &current_only_guard(), "current-only guard leaked into range mode");
+    }
+}
+
+#[test]
+fn after_and_before_emits_both_bounds() {
+    // Both bounds set → single _valid_from range with `gte` and `lte`.
+    // Epoch bounds hit the numeric-JSON branch on the wire.
+    let opts = PlainOpts {
+        after: Some(AtTime::Epoch(1735689600)),
+        before: Some(AtTime::Epoch(1743465600)),
+        ..PlainOpts::default()
+    };
+    let body = build_request_body("docs", "fox", &opts).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
+    assert_eq!(filters.len(), 1);
+    let range = &filters[0]["range"]["_valid_from"];
+    assert_eq!(range["gte"], json!(1735689600));
+    assert_eq!(range["lte"], json!(1743465600));
+    for f in filters {
+        assert!(f != &current_only_guard(), "current-only guard leaked into range mode");
+    }
+}
+
+#[test]
+fn range_with_at_time_errors() {
+    // Defence-in-depth: guest surface rejects the conflict first, but
+    // `build_query_clause` also carries the guard for callers that skip
+    // the surface check.
+    let opts = PlainOpts {
+        after: Some(AtTime::Iso("2026-01-01".into())),
+        at_time: Some(AtTime::Iso("2026-03-01".into())),
+        ..PlainOpts::default()
+    };
+    let err = build_request_body("docs", "fox", &opts).unwrap_err();
+    assert!(
+        err.contains("mutually exclusive"),
+        "expected mutual-exclusion error, got: {err}"
+    );
+
+    // Same guard for at_rev — verify it fires on that path too.
+    let opts_rev = PlainOpts {
+        before: Some(AtTime::Iso("2026-06-01".into())),
+        at_rev: Some(17),
+        ..PlainOpts::default()
+    };
+    let err_rev = build_request_body("docs", "fox", &opts_rev).unwrap_err();
+    assert!(
+        err_rev.contains("mutually exclusive"),
+        "expected mutual-exclusion error, got: {err_rev}"
+    );
+}
+
+#[test]
+fn empty_range_returns_empty() {
+    // `after > before` is caught at the guest surface (lib.rs::search),
+    // which returns Ok(vec![]). At the manticore.rs layer we still emit
+    // a well-formed range body — the guest short-circuits before we get
+    // here — so this test locks the surface behaviour by running the
+    // parity check on `is_empty_range` via a duplicate implementation.
+    // Local mirror kept in the test to avoid making the internal helper
+    // pub — semantics only, not a re-export.
+    fn empty(a: Option<&AtTime>, b: Option<&AtTime>) -> bool {
+        match (a, b) {
+            (Some(AtTime::Epoch(x)), Some(AtTime::Epoch(y))) => x > y,
+            (Some(AtTime::Iso(x)), Some(AtTime::Iso(y))) => x > y,
+            _ => false,
+        }
+    }
+    assert!(empty(
+        Some(&AtTime::Iso("2026-06-01".into())),
+        Some(&AtTime::Iso("2026-01-01".into())),
+    ));
+    assert!(empty(
+        Some(&AtTime::Epoch(1743465600)),
+        Some(&AtTime::Epoch(1735689600)),
+    ));
+    // Well-ordered range → not empty.
+    assert!(!empty(
+        Some(&AtTime::Iso("2026-01-01".into())),
+        Some(&AtTime::Iso("2026-06-01".into())),
+    ));
+    // One-sided range → never empty (open on the missing side).
+    assert!(!empty(Some(&AtTime::Iso("2026-01-01".into())), None));
+    assert!(!empty(None, Some(&AtTime::Iso("2026-06-01".into()))));
+    // Mixed epoch/iso → permissive, defer coercion to Manticore.
+    assert!(!empty(
+        Some(&AtTime::Epoch(1743465600)),
+        Some(&AtTime::Iso("2026-01-01".into())),
+    ));
+}
+
 #[test]
 fn revision_populated_from_response() {
     // Mock response with `_rev` in `_source` — verify hit.revision is

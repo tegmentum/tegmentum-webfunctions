@@ -43,6 +43,16 @@
 //!     required on the target index; this substrate does not generate
 //!     embeddings.
 //!
+//! v1.2 additions (memo `wf-document-v1.md` §08 range queries):
+//!
+//!   * `PlainOpts.after` / `PlainOpts.before` — inclusive lower / upper
+//!     bounds on `_valid_from`. `build_query_clause` emits a
+//!     `{"range":{"_valid_from":{"gte":<after>,"lte":<before>}}}` filter,
+//!     dropping the default current-only guard so every matching revision
+//!     surfaces as its own hit. Mutually exclusive with `at_time` /
+//!     `at_rev`; the guest surface rejects the conflict first, this
+//!     module carries a defence-in-depth guard.
+//!
 //! Kept out of `lib.rs` so the tests can exercise the wire mapping
 //! without having to instantiate the wit-bindgen `Guest` trait or stub
 //! the host import. Both the guest export and the tests call these
@@ -78,6 +88,15 @@ pub struct PlainOpts {
     /// separated `table` field so Manticore unions across the listed
     /// indexes. See `resolve_table` for the small helper.
     pub indexes: Vec<String>,
+    /// v1.2 range-query lower bound (inclusive). When Some, the built
+    /// request filters `_valid_from >= after`. Mutually exclusive with
+    /// `at_time` / `at_rev`; the guest surface enforces exclusivity and
+    /// `build_query_clause` carries a defence-in-depth guard.
+    pub after: Option<AtTime>,
+    /// v1.2 range-query upper bound (inclusive). When Some, the built
+    /// request filters `_valid_from <= before`. Either bound may be
+    /// None; both None = no range clause emitted.
+    pub before: Option<AtTime>,
 }
 
 /// A normalized `at_time` value. `Epoch` is emitted as a JSON number so
@@ -216,6 +235,17 @@ fn build_query_clause(query: &str, opts: &PlainOpts) -> Result<JsonValue, String
     let has_filter = opts.filter.as_deref().map_or(false, |s| !s.is_empty());
     let has_at_time = opts.at_time.is_some();
     let has_at_rev = opts.at_rev.is_some();
+    let has_range = opts.after.is_some() || opts.before.is_some();
+
+    // v1.2 range queries — mutually exclusive with either time-travel
+    // selector. Guest surface rejects first; this is defence-in-depth
+    // for callers that skip the surface check.
+    if has_range && (has_at_time || has_at_rev) {
+        return Err(
+            "wf_document: after/before are mutually exclusive with at_time and at_rev"
+                .to_string(),
+        );
+    }
 
     let mut filter_list: Vec<JsonValue> = Vec::new();
 
@@ -229,32 +259,48 @@ fn build_query_clause(query: &str, opts: &PlainOpts) -> Result<JsonValue, String
         filter_list.push(parsed);
     }
 
-    // Time-travel selectors — mutually exclusive at the guest surface.
-    match (opts.at_time.as_ref(), opts.at_rev) {
-        (Some(at), None) => {
-            let at_json = at.to_json();
-            filter_list.push(json!({
-                "range": { "_valid_from": { "lte": at_json.clone() } }
-            }));
-            filter_list.push(json!({
-                "bool": {
-                    "should": [
-                        { "equals": { "_valid_to": null } },
-                        { "range":  { "_valid_to": { "gt": at_json } } },
-                    ]
-                }
-            }));
+    if has_range {
+        // Range mode: emit a single _valid_from range with whichever
+        // bounds were provided. Drop the default _valid_to IS NULL
+        // guard so every matching revision returns as its own hit.
+        let mut bounds = Map::new();
+        if let Some(after) = opts.after.as_ref() {
+            bounds.insert("gte".into(), after.to_json());
         }
-        (None, Some(rev)) => {
-            filter_list.push(json!({ "equals": { "_rev": rev } }));
+        if let Some(before) = opts.before.as_ref() {
+            bounds.insert("lte".into(), before.to_json());
         }
-        (None, None) => {
-            filter_list.push(json!({ "equals": { "_valid_to": null } }));
-        }
-        (Some(_), Some(_)) => {
-            return Err(
-                "wf_document: at_time and at_rev are mutually exclusive".to_string()
-            );
+        let mut range_field = Map::new();
+        range_field.insert("_valid_from".into(), JsonValue::Object(bounds));
+        filter_list.push(json!({ "range": JsonValue::Object(range_field) }));
+    } else {
+        // Time-travel selectors — mutually exclusive at the guest surface.
+        match (opts.at_time.as_ref(), opts.at_rev) {
+            (Some(at), None) => {
+                let at_json = at.to_json();
+                filter_list.push(json!({
+                    "range": { "_valid_from": { "lte": at_json.clone() } }
+                }));
+                filter_list.push(json!({
+                    "bool": {
+                        "should": [
+                            { "equals": { "_valid_to": null } },
+                            { "range":  { "_valid_to": { "gt": at_json } } },
+                        ]
+                    }
+                }));
+            }
+            (None, Some(rev)) => {
+                filter_list.push(json!({ "equals": { "_rev": rev } }));
+            }
+            (None, None) => {
+                filter_list.push(json!({ "equals": { "_valid_to": null } }));
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    "wf_document: at_time and at_rev are mutually exclusive".to_string()
+                );
+            }
         }
     }
 

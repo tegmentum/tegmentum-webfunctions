@@ -112,8 +112,21 @@ impl Guest for Component {
         if opts.at_time.is_some() && opts.at_rev.is_some() {
             return Err("at_time and at_rev are mutually exclusive".to_string());
         }
+        let has_range = opts.after.is_some() || opts.before.is_some();
+        if has_range && (opts.at_time.is_some() || opts.at_rev.is_some()) {
+            return Err(
+                "after/before are mutually exclusive with at_time and at_rev".to_string(),
+            );
+        }
 
         let opts_plain = wit_opts_to_plain(&opts)?;
+
+        // v1.2: empty range (after > before after ISO parse) is honest —
+        // return the empty hit list rather than round-tripping to
+        // Manticore for a guaranteed-empty response.
+        if is_empty_range(opts_plain.after.as_ref(), opts_plain.before.as_ref()) {
+            return Ok(vec![]);
+        }
 
         let body = build_request_body(&index, &query, &opts_plain)?;
         let url = manticore_url(&search_url);
@@ -565,6 +578,16 @@ fn wit_opts_to_plain(opts: &SearchOpts) -> Result<PlainOpts, String> {
         .as_deref()
         .map(normalize_at_time)
         .transpose()?;
+    let after_norm = opts
+        .after
+        .as_deref()
+        .map(normalize_at_time)
+        .transpose()?;
+    let before_norm = opts
+        .before
+        .as_deref()
+        .map(normalize_at_time)
+        .transpose()?;
     Ok(PlainOpts {
         limit: opts.limit,
         offset: opts.offset,
@@ -577,7 +600,25 @@ fn wit_opts_to_plain(opts: &SearchOpts) -> Result<PlainOpts, String> {
         at_time: at_time_norm,
         at_rev: opts.at_rev,
         indexes: opts.indexes.clone().unwrap_or_default(),
+        after: after_norm,
+        before: before_norm,
     })
+}
+
+/// v1.2 range mode: returns true when `after > before` after normalization.
+/// Empty range is honest: the guest returns `Ok(vec![])` rather than an
+/// error — the caller asked for a well-defined empty slice.
+///
+/// The comparison keeps epoch<->epoch and iso<->iso paths separate; the
+/// mixed case is left permissive (returns false) so the request goes to
+/// Manticore, which will do the string-vs-number coercion itself. This
+/// preserves parity with `at_time`'s Manticore-side normalization.
+fn is_empty_range(after: Option<&AtTime>, before: Option<&AtTime>) -> bool {
+    match (after, before) {
+        (Some(AtTime::Epoch(a)), Some(AtTime::Epoch(b))) => a > b,
+        (Some(AtTime::Iso(a)), Some(AtTime::Iso(b))) => a > b,
+        _ => false,
+    }
 }
 
 fn normalize_at_time(raw: &str) -> Result<AtTime, String> {
