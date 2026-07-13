@@ -87,6 +87,21 @@
 //!   as a v0.2 perf gap; a future sirix-sql endpoint that exposes
 //!   `_rev` as a filterable column collapses this to O(delta).
 //!
+//! * Per-revision history (retention=all/window/tail): sirix-sql-server
+//!   commit `50f28a9` (July 2026) added a `TABLE(HISTORY_OF('<db>',
+//!   '<res>'))` table function that returns one row per (node, revision)
+//!   with `(_key BIGINT, _revision BIGINT, _commit_timestamp BIGINT,
+//!   document VARCHAR)`. History-walking retention policies emit that
+//!   SQL surface (via `build_scan_sql` when `wants_history=true`) so
+//!   the sweep can enumerate per-revision rows without depending on
+//!   adapter-fork behavior of the plain SELECT. Older sirix-sql-server
+//!   builds without the table function reject the SQL cleanly; the
+//!   `list_documents` bridge surfaces the error and the sweep bumps
+//!   `errors` for that entry — no silent degradation. Latest-mode
+//!   keeps the plain `SELECT _nodekey, _rev, document FROM
+//!   "<db>"."<res>"` scan (HISTORY_OF would be a needless over-fetch
+//!   when we only want the current tip).
+//!
 //! * Wire format: `HttpBridge::post_json` speaks the Manticore `/bulk`
 //!   NDJSON protocol. Same shape as `fulltext_sweep` — one
 //!   `{ "replace": { "index": "<name>", "id": "<sirix-uri>", "doc":
@@ -342,6 +357,12 @@ pub struct KnownDoc {
 /// lands the sweep passes `Some(last_seen_rev)` here and Sirix does
 /// the filtering server-side. The trait shape stays stable across
 /// that migration.
+///
+/// `wants_history` selects between the plain current-tip scan (false;
+/// what latest-mode wants) and sirix-sql's per-revision
+/// `TABLE(HISTORY_OF(...))` surface (true; what retention=all,
+/// retention=window, and retention=tail want). See `build_scan_sql`
+/// for the wire shape each mode emits.
 pub trait SirixBridge {
     fn list_documents(
         &self,
@@ -349,6 +370,7 @@ pub trait SirixBridge {
         database: &str,
         resource: &str,
         since_rev: Option<u64>,
+        wants_history: bool,
     ) -> Result<Vec<SirixDocRow>, String>;
 }
 
@@ -492,12 +514,15 @@ fn run_one<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
     // 3. Full-scan of the resource from Sirix (v0.2 gap: no
     //    changes-since endpoint on sirix-sql-server; noted in the memo
     //    §08 sync semantics). `since_rev: None` = "everything".
+    //    `wants_history: false` = plain current-tip scan; HISTORY_OF is
+    //    reserved for the retention modes that walk revisions.
     let rows = sirix
         .list_documents(
             &entry.storage_backend,
             &entry.sirix_database,
             &entry.sirix_resource,
             None,
+            false,
         )
         .map_err(|e| format!("sirix list_documents: {e}"))?;
 
@@ -621,36 +646,27 @@ fn run_one_all<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
         sink.load_known_docs(&table)?
     };
 
-    // Same SQL surface as latest-mode. If sirix-sql-server ever grows
-    // history-including semantics for the standard SELECT, the sweep
-    // benefits transparently.
+    // Enumerate per-revision history via sirix-sql's HISTORY_OF table
+    // function (`wants_history: true`). Older sirix-sql-server builds
+    // without HISTORY_OF reject the SQL cleanly and the error surfaces
+    // through `list_documents` — retention=all becomes a no-op with a
+    // bumped `errors` count in that case, which the outer sweep loop
+    // logs. On a HISTORY_OF-capable server the response carries every
+    // revision of every node key, so a single row per key is now a
+    // legitimate response (that resource has one committed revision),
+    // not the "no history exposed via SQL" gap the earlier plain-scan
+    // code had to detect and bail on.
     let rows = sirix
         .list_documents(
             &entry.storage_backend,
             &entry.sirix_database,
             &entry.sirix_resource,
             None,
+            true,
         )
         .map_err(|e| format!("sirix list_documents: {e}"))?;
 
     let by_key = group_rows_by_key(&rows);
-    let has_history = by_key.values().any(|v| v.len() > 1);
-    if !by_key.is_empty() && !has_history {
-        // Honesty invariant (memo §11). If Sirix only gave us the
-        // current-tip revision for every doc, we can't index history —
-        // log clearly and bail out without touching Manticore. A
-        // healthy retention=all invocation should never hit this on a
-        // corpus that actually has multiple revisions per doc.
-        eprintln!(
-            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=\"all\" \
-             requested, but sirix-sql-server returned a single row per _nodekey \
-             (no per-revision history exposed via SQL). This is a known Sirix-side \
-             gap — see wf-document-v1.md §11. Sweep returning without inserting; \
-             `errors=0` because this is a config/deployment issue, not a runtime error.",
-            entry.name
-        );
-        return Ok(SweepResult::default());
-    }
 
     let (to_insert, unchanged, timestamp_fallback) =
         build_diff_all(entry, &by_key, &known);
@@ -739,31 +755,19 @@ fn run_one_window<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
         sink.load_known_docs(&table)?
     };
 
+    // History-walking retention needs per-revision rows — route through
+    // sirix-sql's HISTORY_OF table function via `wants_history: true`.
     let rows = sirix
         .list_documents(
             &entry.storage_backend,
             &entry.sirix_database,
             &entry.sirix_resource,
             None,
+            true,
         )
         .map_err(|e| format!("sirix list_documents: {e}"))?;
 
     let by_key = group_rows_by_key(&rows);
-    let has_history = by_key.values().any(|v| v.len() > 1);
-    if !by_key.is_empty() && !has_history {
-        // Same honesty invariant as retention=all: without per-revision
-        // history from Sirix we can't compute a "was in window at t?"
-        // interval, so log clearly and bail without touching Manticore.
-        eprintln!(
-            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=window \
-             requested, but sirix-sql-server returned a single row per _nodekey \
-             (no per-revision history exposed via SQL). See wf-document-v1.md §11. \
-             Sweep returning without inserting; `errors=0` because this is a \
-             config/deployment issue, not a runtime error.",
-            entry.name
-        );
-        return Ok(SweepResult::default());
-    }
 
     let now_millis = options.resolve_now_millis();
     let cutoff = now_millis.saturating_sub(window_millis);
@@ -813,28 +817,19 @@ fn run_one_tail<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
         sink.load_known_docs(&table)?
     };
 
+    // History-walking retention needs per-revision rows — route through
+    // sirix-sql's HISTORY_OF table function via `wants_history: true`.
     let rows = sirix
         .list_documents(
             &entry.storage_backend,
             &entry.sirix_database,
             &entry.sirix_resource,
             None,
+            true,
         )
         .map_err(|e| format!("sirix list_documents: {e}"))?;
 
     let by_key = group_rows_by_key(&rows);
-    let has_history = by_key.values().any(|v| v.len() > 1);
-    if !by_key.is_empty() && !has_history {
-        eprintln!(
-            "wf_canonicalize.document_sweep: entry `{}`: revision_retention=tail \
-             requested, but sirix-sql-server returned a single row per _nodekey \
-             (no per-revision history exposed via SQL). See wf-document-v1.md §11. \
-             Sweep returning without inserting; `errors=0` because this is a \
-             config/deployment issue, not a runtime error.",
-            entry.name
-        );
-        return Ok(SweepResult::default());
-    }
 
     let (to_insert, unchanged, timestamp_fallback, kept_keys) =
         build_diff_tail(entry, &by_key, &known, n);
@@ -1393,7 +1388,37 @@ fn bulk_response_ok(body: &str) -> Result<(), String> {
 /// full-resource scan. Kept adjacent so the guest bridge impl and the
 /// test mocks can both call it (avoids drift between "what the sweep
 /// asks for" and "what the mock knows how to answer").
-pub fn build_scan_sql(database: &str, resource: &str, since_rev: Option<u64>) -> String {
+///
+/// * `wants_history = false` (latest-mode): plain scan of the resource's
+///   virtual table `"<db>"."<res>"`, columns `_nodekey`, `_rev`,
+///   `document`. Current-tip only — cheap.
+/// * `wants_history = true` (retention=all / window / tail): route
+///   through sirix-sql's `TABLE(HISTORY_OF('<db>', '<res>'))` table
+///   function (added in sirixdb-sql commit `50f28a9`, July 2026),
+///   which returns one row per (node, revision) with columns `_key`,
+///   `_revision`, `_commit_timestamp`, `document`. Older sirix-sql
+///   builds reject that SQL cleanly; the `list_documents` bridge
+///   surfaces the error and the sweep bumps `errors` for that entry.
+///
+/// `since_rev` is honored only on the plain-scan path — the `WHERE
+/// _rev > N` filter has no analogue on the HISTORY_OF surface today,
+/// and history-walking modes always want the full trace anyway.
+pub fn build_scan_sql(
+    database: &str,
+    resource: &str,
+    since_rev: Option<u64>,
+    wants_history: bool,
+) -> String {
+    if wants_history {
+        // HISTORY_OF takes the database and resource as SQL string
+        // literals; escape embedded single quotes by doubling.
+        return format!(
+            "SELECT _key, _revision, _commit_timestamp, document \
+             FROM TABLE(HISTORY_OF('{db}', '{res}'))",
+            db = escape_sql_string(database),
+            res = escape_sql_string(resource),
+        );
+    }
     // Sirix-sql exposes the resource as a virtual table under
     // "<db>"."<resource>". `_nodekey`, `_rev`, and `document` are the
     // implicit metadata columns (per wf_document::sirix::build_fetch_sql
@@ -1538,6 +1563,14 @@ fn escape_ident(s: &str) -> String {
     s.replace('"', "\"\"")
 }
 
+/// Escape a SQL string literal — double any embedded single quotes.
+/// Used for the arguments to `TABLE(HISTORY_OF('<db>', '<res>'))`,
+/// which takes its database and resource names as string literals
+/// rather than as quoted identifiers.
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// FNV-1a 64-bit hash rendered as a lowercase 16-char hex string. Same
 /// primitive `fulltext_sweep` uses — we're just detecting change, not
 /// resisting adversaries.
@@ -1594,6 +1627,7 @@ mod tests {
             _database: &str,
             _resource: &str,
             _since_rev: Option<u64>,
+            _wants_history: bool,
         ) -> Result<Vec<SirixDocRow>, String> {
             Ok(self.rows.borrow().clone())
         }
@@ -1832,13 +1866,68 @@ mod tests {
 
     #[test]
     fn scan_sql_full_and_since_rev() {
-        let full = build_scan_sql("docs", "manuals", None);
+        let full = build_scan_sql("docs", "manuals", None, false);
         assert_eq!(
             full,
             "SELECT _nodekey, _rev, document FROM \"docs\".\"manuals\""
         );
-        let since = build_scan_sql("docs", "manuals", Some(7));
+        let since = build_scan_sql("docs", "manuals", Some(7), false);
         assert!(since.ends_with("WHERE _rev > 7"));
+    }
+
+    #[test]
+    fn retention_all_uses_history_of_table_function() {
+        // History-walking retention modes (all/window/tail) route
+        // through sirix-sql's TABLE(HISTORY_OF('<db>','<res>')) function
+        // so we get one row per (node, revision) with a
+        // `_commit_timestamp` column — no more relying on adapter-fork
+        // behavior of the plain SELECT to expose history.
+        let sql = build_scan_sql("docs", "manuals", None, true);
+        assert!(
+            sql.contains("TABLE(HISTORY_OF('docs', 'manuals'))"),
+            "expected HISTORY_OF call for history-walking policies: {sql}"
+        );
+        assert!(sql.contains("_key"), "must select _key column: {sql}");
+        assert!(sql.contains("_revision"), "must select _revision column: {sql}");
+        assert!(
+            sql.contains("_commit_timestamp"),
+            "must select _commit_timestamp column: {sql}"
+        );
+        assert!(sql.contains("document"), "must select document column: {sql}");
+        assert!(
+            !sql.contains("\"docs\".\"manuals\""),
+            "must not fall back to the plain scan surface: {sql}"
+        );
+    }
+
+    #[test]
+    fn latest_still_uses_plain_scan() {
+        // Latest-mode wants the current-tip only; HISTORY_OF would
+        // return one row per (node, revision) — an expensive over-fetch
+        // we discard immediately. The plain-scan surface stays byte-
+        // identical to the v0.2 wire.
+        let sql = build_scan_sql("docs", "manuals", None, false);
+        assert_eq!(
+            sql,
+            "SELECT _nodekey, _rev, document FROM \"docs\".\"manuals\""
+        );
+        assert!(
+            !sql.contains("HISTORY_OF"),
+            "latest-mode must not route through HISTORY_OF: {sql}"
+        );
+    }
+
+    #[test]
+    fn history_of_escapes_single_quotes_in_database_name() {
+        // Defensive: a database name with an apostrophe would break out
+        // of the SQL string literal without escaping. Sirix names don't
+        // usually carry quotes but the sweep can't rely on that; double
+        // the quote to keep the query well-formed.
+        let sql = build_scan_sql("d'ocs", "man'uals", None, true);
+        assert!(
+            sql.contains("HISTORY_OF('d''ocs', 'man''uals')"),
+            "expected quote-escaped literals: {sql}"
+        );
     }
 
     #[test]
@@ -1985,8 +2074,9 @@ mod tests {
             database: &str,
             resource: &str,
             since_rev: Option<u64>,
+            wants_history: bool,
         ) -> Result<Vec<SirixDocRow>, String> {
-            let sql = build_scan_sql(database, resource, since_rev);
+            let sql = build_scan_sql(database, resource, since_rev, wants_history);
             let body = build_query_body(&sql);
             let url = sirix_query_url(sirix_url);
             let response = http_post_via_tcp(&url, &body)?;
@@ -2269,10 +2359,17 @@ mod tests {
     }
 
     #[test]
-    fn retention_all_gracefully_reports_when_sirix_has_no_history() {
-        // sirix-sql-server today returns a single row per node_key.
-        // Retention=all must recognize that gap, log it clearly, and
-        // return without inserting.
+    fn retention_all_single_revision_per_key_is_legitimate_history() {
+        // Semantics update: retention=all now routes through
+        // sirix-sql's TABLE(HISTORY_OF(...)) surface, so what comes
+        // back is exactly what we asked for — every revision the
+        // resource has committed. A response with one row per node_key
+        // means the resource legitimately has a single revision per
+        // doc; the sweep inserts those revisions rather than bailing
+        // out. (Before the HISTORY_OF wiring, the same shape from the
+        // plain SELECT was ambiguous — could be "one revision" or
+        // "history exists but SQL didn't expose it" — and the sweep
+        // conservatively bailed. HISTORY_OF removes that ambiguity.)
         let entry = cfg_all("manuals");
         let sirix = MockSirix {
             rows: RefCell::new(vec![
@@ -2299,14 +2396,20 @@ mod tests {
         let sink = MockDocSink::default();
 
         let r = run(&[entry], &http, &sirix, &sink);
-        assert_eq!(r.inserted, 0);
-        assert_eq!(r.unchanged, 0);
-        assert_eq!(r.deleted, 0);
-        assert_eq!(r.errors, 0, "the gap is a config issue, not a runtime error");
-        assert!(
-            http.posts.borrow().is_empty(),
-            "no POSTs go to Manticore when we can't distinguish revisions"
+        assert_eq!(
+            r.inserted, 2,
+            "two docs, one revision each — both legitimately mirror"
         );
+        assert_eq!(r.deleted, 0);
+        assert_eq!(r.errors, 0);
+        // Both revs land as the current-tip (open interval); no
+        // `_valid_to` because HISTORY_OF didn't return a later rev.
+        let posts = http.posts.borrow();
+        assert_eq!(posts.len(), 1);
+        for line in posts[0].1.lines() {
+            let v: JsonValue = serde_json::from_str(line).unwrap();
+            assert_eq!(v["replace"]["doc"]["_valid_to"], JsonValue::Null);
+        }
     }
 
     #[test]

@@ -876,8 +876,10 @@ impl document_sweep::SirixBridge for SirixHostBridge {
         database: &str,
         resource: &str,
         since_rev: Option<u64>,
+        wants_history: bool,
     ) -> Result<Vec<document_sweep::SirixDocRow>, String> {
-        let sql = document_sweep::build_scan_sql(database, resource, since_rev);
+        let sql =
+            document_sweep::build_scan_sql(database, resource, since_rev, wants_history);
         let body = document_sweep::build_query_body(&sql);
         let url = document_sweep::sirix_query_url(sirix_url);
         let response = fulltext_host::http_post_json(&url, &body)
