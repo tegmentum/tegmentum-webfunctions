@@ -18,3 +18,6 @@ package = "tegmentum:wf-canonicalize"
 [package.metadata.component.target]
 path = "wit"
 world = "webfunction"
+
+[package.metadata.component.target.dependencies]
+"wf:fulltext" = { path = "wit/deps/wf-fulltext" }
