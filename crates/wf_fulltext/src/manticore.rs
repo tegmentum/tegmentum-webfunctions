@@ -42,7 +42,7 @@ pub struct Hit {
 ///     "limit":   <limit>,
 ///     "offset":  <offset>,     -- only if opts.offset is Some
 ///     "_source": { "includes": [...] },  -- only if opts.fields non-empty
-///     "highlight": {},         -- only if opts.highlight
+///     "highlight": { "pre_tags": "…", "post_tags": "…" }
 ///   }
 ///
 /// `opts.lang` becomes `bool.filter.equals.lang = "<lang>"`. This assumes
@@ -54,6 +54,28 @@ pub struct Hit {
 /// the `bool.filter` slot. The guest doesn't parse it — if the caller
 /// passed nonsense, Manticore rejects the request and the guest surfaces
 /// the error.
+///
+/// # `opts.highlight` and the always-emit-a-snippet policy
+///
+/// Snippets are always requested from Manticore so `hit.snippet` gets
+/// populated on every match. This closes the design gap in memo §10 —
+/// the substrate is meant to smart-set `highlight: true` whenever the
+/// SPARQL SERVICE body projects `?snippet`, but the `wf_search_rewrite`
+/// pass doesn't inspect the body for that today (the URL sugar has no
+/// visibility into which columns the caller will bind). Rather than
+/// hand the decoder a systematically-missing column, the guest always
+/// asks Manticore for the fragment and lets the SPARQL side drop it
+/// silently when not projected. Manticore's SNIPPET cost is negligible
+/// for a query it's already scoring.
+///
+/// `opts.highlight` picks the wrapping style, not whether a snippet
+/// comes back:
+///   * `true`  → Manticore's default `<b>…</b>` wrapping (UI mode).
+///   * `false` → empty pre/post tags → plain-text fragment (data mode).
+/// The design memo's `snippet: option<string>` return shape is
+/// preserved — `None` still happens when Manticore has no matching
+/// text to highlight (rare in practice; the response `hits.hits` array
+/// wouldn't contain the doc at all in that case).
 pub fn build_request_body(
     index: &str,
     query: &str,
@@ -75,10 +97,17 @@ pub fn build_request_body(
             json!({ "includes": opts.fields.clone() }),
         );
     }
-    if opts.highlight {
-        // Empty object = highlight all fields; per §11 of the memo.
-        body.insert("highlight".into(), JsonValue::Object(Map::new()));
-    }
+    // Always request a snippet. See the "always-emit-a-snippet policy"
+    // note above for the rationale. `opts.highlight` selects tags:
+    // `true` = Manticore default (`<b>…</b>`), `false` = plain fragment.
+    let highlight_body = if opts.highlight {
+        // Empty object = default `<b>` wrapping across all fields; per
+        // §11 of the memo.
+        JsonValue::Object(Map::new())
+    } else {
+        json!({ "pre_tags": "", "post_tags": "" })
+    };
+    body.insert("highlight".into(), highlight_body);
 
     serde_json::to_string(&JsonValue::Object(body))
         .map_err(|e| format!("wf_fulltext: serialize request body: {e}"))

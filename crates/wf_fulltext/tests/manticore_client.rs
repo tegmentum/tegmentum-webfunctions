@@ -27,11 +27,14 @@ use wf_fulltext::manticore::{build_request_body, parse_response, Hit, PlainOpts}
 fn body_minimal() {
     let body = build_request_body("docs", "fox", &PlainOpts::default()).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
+    // `highlight` is unconditionally present per the always-emit-a-snippet
+    // policy on `build_request_body`; empty pre/post tags = plain fragment.
     assert_eq!(
         parsed,
         json!({
             "table": "docs",
             "query": { "match": { "*": "fox" } },
+            "highlight": { "pre_tags": "", "post_tags": "" },
         })
     );
 }
@@ -79,7 +82,9 @@ fn body_omits_source_when_fields_empty() {
 }
 
 #[test]
-fn body_with_highlight() {
+fn body_with_highlight_true_uses_default_wrapping() {
+    // `opts.highlight = true` → Manticore default (`<b>…</b>`) tags.
+    // Signals "UI mode" — the caller wants the marked-up fragment.
     let opts = PlainOpts {
         highlight: true,
         ..PlainOpts::default()
@@ -90,10 +95,18 @@ fn body_with_highlight() {
 }
 
 #[test]
-fn body_omits_highlight_when_false() {
+fn body_always_requests_highlight_plain_when_false() {
+    // `opts.highlight = false` still asks Manticore for a snippet, but
+    // with empty pre/post tags so the fragment is plain text. Backs the
+    // always-emit-a-snippet policy documented on `build_request_body` —
+    // the substrate's rewrite pass doesn't smart-set highlight per
+    // memo §10, so the guest closes the gap here.
     let body = build_request_body("docs", "fox", &PlainOpts::default()).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
-    assert!(!parsed.as_object().unwrap().contains_key("highlight"));
+    assert_eq!(
+        parsed["highlight"],
+        json!({ "pre_tags": "", "post_tags": "" })
+    );
 }
 
 #[test]
