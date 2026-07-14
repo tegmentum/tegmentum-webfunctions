@@ -44,6 +44,28 @@ struct Descriptor {
     shape: String,
     columns: Vec<Column>,
     sink: Option<String>,
+    /// wf-relational v0.1 (design memo `wf-relational.md` §04): when
+    /// `false`, `_graph` is omitted from the SELECT projection. Real
+    /// Postgres tables don't carry a `_graph` column, so a Postgres-
+    /// backed shape must set this false or the SQL will fail with
+    /// `column "_graph" does not exist`. Defaults to `true` to keep
+    /// backward compatibility with the SQLite sink path where the
+    /// materializer always adds `_graph` at seed time.
+    #[serde(default = "default_include_graph")]
+    include_graph: bool,
+    /// wf-relational v0.1 (memo §04): informational field naming the
+    /// sink family (`"sqlite"`, `"duckdb"`, `"postgres"`, `"sirix"`).
+    /// v0.1 does not branch on this — the sink URL scheme is what
+    /// picks the host backend at `sink_open` time — but the descriptor
+    /// carries it so a v0.2+ SQL-dialect selector can lift it without
+    /// a shape migration.
+    #[allow(dead_code)]
+    #[serde(default)]
+    sink_kind: Option<String>,
+}
+
+fn default_include_graph() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -91,8 +113,14 @@ impl Guest for Component {
         // _graph goes ahead of user columns in the projection so
         // downstream binding lookup finds it under a stable name. Sink
         // consumers that don't project ?_graph in their outer SELECT
-        // just ignore it.
-        let mut projection: Vec<String> = vec!["_graph".to_string()];
+        // just ignore it. wf-relational sources (Postgres tables that
+        // never grew a _graph column) suppress this by setting
+        // `include_graph: false` in the descriptor — the projection
+        // then contains only the declared shape columns.
+        let mut projection: Vec<String> = Vec::with_capacity(d.columns.len() + 1);
+        if d.include_graph {
+            projection.push("_graph".to_string());
+        }
         projection.extend(d.columns.iter().map(|c| c.name.clone()));
         let column_list = projection.join(", ");
         let sql = if sql_tail.is_empty() {
@@ -110,7 +138,10 @@ impl Guest for Component {
         // remap them into WIT value shapes matched to the descriptor's
         // declared column types (the sink's own type inference is looser
         // — TEXT → xsd:string always — so we tighten it here).
-        let mut vars: Vec<String> = vec!["_graph".into()];
+        let mut vars: Vec<String> = Vec::with_capacity(d.columns.len() + 1);
+        if d.include_graph {
+            vars.push("_graph".into());
+        }
         vars.extend(d.columns.iter().map(|c| c.name.clone()));
 
         let mut rows: Vec<Vec<Binding>> = Vec::with_capacity(raw.rows.len());
@@ -120,8 +151,15 @@ impl Guest for Component {
             // the binding entirely for default-graph rows so consumers
             // see it as UNDEF rather than as an empty-string literal
             // (matches SPARQL's convention that default-graph facts
-            // have no graph identifier at all).
-            if let Some(gv) = row.iter().find(|b| b.name == "_graph").map(|b| &b.value) {
+            // have no graph identifier at all). Suppressed entirely
+            // for wf-relational-style sinks whose table has no
+            // `_graph` column (memo §04).
+            let graph_val = if d.include_graph {
+                row.iter().find(|b| b.name == "_graph").map(|b| &b.value)
+            } else {
+                None
+            };
+            if let Some(gv) = graph_val {
                 let non_empty = match gv {
                     Value::Literal(l) if l.label.is_empty() => false,
                     Value::Literal(_) | Value::Iri(_) => true,
