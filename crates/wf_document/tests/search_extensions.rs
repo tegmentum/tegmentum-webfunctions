@@ -243,11 +243,16 @@ fn more_like_this_extracts_terms_and_queries() {
     let fetch_response = http_post_via_tcp(&sirix_query_url, &fetch_body).expect("sirix");
     let fetched = parse_fetch_response(&fetch_response, None).unwrap();
 
-    // Verify Sirix saw a fetch for the seed doc.
+    // Verify Sirix saw a fetch for the seed doc. Sirix exposes
+    // `_key` as a BIGINT internal node key, not the caller's business
+    // key, so identity goes through JSON_VALUE on `$._id`.
     let received_sirix = s_rx.recv().unwrap();
     let sirix_body: JsonValue = serde_json::from_str(&received_sirix).unwrap();
     assert!(
-        sirix_body["sql"].as_str().unwrap().contains("_nodekey = '1'"),
+        sirix_body["sql"]
+            .as_str()
+            .unwrap()
+            .contains("JSON_VALUE(\"document\", '$._id') = '1'"),
         "sirix saw sql: {}",
         sirix_body["sql"]
     );

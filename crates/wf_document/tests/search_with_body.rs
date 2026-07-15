@@ -142,11 +142,27 @@ fn search_then_fetch_composes_across_two_backends() {
     let body1 = String::from_utf8(hits[1].body.clone().unwrap()).unwrap();
     assert!(body1.contains("full doc 2"));
 
-    // Verify Sirix saw the correct SQL for each hit.
+    // Verify Sirix saw the correct SQL for each hit. Rows are
+    // addressed by JSON path on `$._id` — Sirix's `_key` column is a
+    // BIGINT internal node key, not the caller's business key.
     let s0: JsonValue = serde_json::from_str(&s_rx.recv().unwrap()).unwrap();
-    assert!(s0["sql"].as_str().unwrap().contains("_nodekey = '1'"));
+    assert!(
+        s0["sql"]
+            .as_str()
+            .unwrap()
+            .contains("JSON_VALUE(\"document\", '$._id') = '1'"),
+        "s0 sql={}",
+        s0["sql"]
+    );
     let s1: JsonValue = serde_json::from_str(&s_rx.recv().unwrap()).unwrap();
-    assert!(s1["sql"].as_str().unwrap().contains("_nodekey = '2'"));
+    assert!(
+        s1["sql"]
+            .as_str()
+            .unwrap()
+            .contains("JSON_VALUE(\"document\", '$._id') = '2'"),
+        "s1 sql={}",
+        s1["sql"]
+    );
 
     manticore_thread.join().unwrap();
     sirix_thread.join().unwrap();

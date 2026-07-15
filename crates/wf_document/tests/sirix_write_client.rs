@@ -96,7 +96,7 @@ fn update_increments_revision() {
         send_ok(&mut socket, &response_body);
     });
 
-    let doc = parse_sirix_uri("sirix://docs/manuals/42").unwrap();
+    let doc = parse_sirix_uri("sirix://docs/manuals/manual-01").unwrap();
     let sql = build_update_sql(&doc, br#"{"title":"updated"}"#, Some(5)).unwrap();
     let body = build_fetch_body(&sql);
     let url = format!("http://{addr}/query");
@@ -110,9 +110,15 @@ fn update_increments_revision() {
         received_sql.starts_with("UPDATE \"docs\".\"manuals\" SET document = "),
         "sql={received_sql:?}"
     );
-    assert!(received_sql.contains("WHERE _nodekey = '42'"));
+    // Identity is by JSON path on `$._id`; Sirix's `_key` is a BIGINT
+    // internal node key so it can't stand in for a business key.
     assert!(
-        received_sql.contains("AND _rev = 5"),
+        received_sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+        "sql={received_sql:?}"
+    );
+    // Sirix's metadata column is `_revision`, not `_rev`.
+    assert!(
+        received_sql.contains("AND _revision = 5"),
         "expected OCC predicate, sql={received_sql:?}"
     );
 
@@ -124,15 +130,21 @@ fn update_increments_revision() {
 #[test]
 fn update_without_expected_revision_is_unconditional() {
     // No optimistic-concurrency predicate — the SQL should not
-    // contain a `_rev =` filter clause.
+    // contain a `_revision =` filter clause.
     let doc = DocId {
         database: "docs".into(),
         resource: "manuals".into(),
-        node_key: "42".into(),
+        node_key: "manual-01".into(),
     };
     let sql = build_update_sql(&doc, b"{}", None).unwrap();
-    assert!(!sql.contains("_rev ="), "should be unconditional, sql={sql:?}");
-    assert!(sql.contains("WHERE _nodekey = '42'"));
+    assert!(
+        !sql.contains("_revision ="),
+        "should be unconditional, sql={sql:?}"
+    );
+    assert!(
+        sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+        "sql={sql:?}"
+    );
 }
 
 #[test]
@@ -156,7 +168,7 @@ fn delete_removes_doc() {
         send_ok(&mut socket, &response_body);
     });
 
-    let doc = parse_sirix_uri("sirix://docs/manuals/42").unwrap();
+    let doc = parse_sirix_uri("sirix://docs/manuals/manual-01").unwrap();
     let sql = build_delete_sql(&doc);
     let body = build_fetch_body(&sql);
     let url = format!("http://{addr}/query");
@@ -168,7 +180,8 @@ fn delete_removes_doc() {
     let received_sql = parsed_received["sql"].as_str().unwrap();
     assert_eq!(
         received_sql,
-        "DELETE FROM \"docs\".\"manuals\" WHERE _nodekey = '42'"
+        "DELETE FROM \"docs\".\"manuals\" \
+         WHERE JSON_VALUE(\"document\", '$._id') = 'manual-01'"
     );
 
     let ack = parse_write_response(&response_body).unwrap();

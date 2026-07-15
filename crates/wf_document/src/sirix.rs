@@ -74,27 +74,51 @@ pub fn query_url(sirix_url: &str) -> String {
 /// Build the SQL body sirix-sql-server expects for a document fetch.
 ///
 /// The exposed surface today is SQL:2016 SELECT over a Sirix resource.
-/// A document is addressed by its node-key. Optional revision selects a
-/// point-in-time view; `None` means "latest committed".
+/// A document is addressed by a **business key** carried as the last
+/// segment of the doc-id URI. Optional revision selects a point-in-time
+/// view; `None` means "latest committed".
 ///
-/// The exact WHERE-clause column names (`_nodekey`, `_rev`) match
-/// Sirix's implicit metadata columns as documented in the sirix-sql
-/// project. A revision-scoped SELECT filters on both.
+/// **Column-name shape**: Sirix's Calcite adapter exposes three columns
+/// per resource (`_key BIGINT`, `_revision BIGINT`, `document VARCHAR`).
+/// `_key` is Sirix's *internal* node key assigned on insert (2/6/10/…
+/// for the first three top-level array elements), NOT a business
+/// identifier the caller chose. Callers pin documents by business key
+/// (e.g. `"manual-01"`) stored inside the JSON payload at `$._id`, so
+/// the WHERE clause here uses `JSON_VALUE("document", '$._id')` for
+/// identity and `_revision` (not `_rev`) for time-travel.
+///
+/// **Convention**: the URI's last segment MUST match `$._id` in the
+/// stored JSON. Sirix-imported seed documents are expected to carry
+/// their business key under `_id`; the guest's write path
+/// (`sirix_write::build_insert_sql`) injects `_id` on insert when the
+/// caller supplies a `DocRef.id` URI with a chosen business-key segment.
+/// If the JSON doesn't carry `_id`, JSON_VALUE returns NULL and the
+/// row is filtered out — the fetch reports zero rows and surfaces as
+/// "document not found" up the stack.
+///
+/// The full-scan + Calcite-side JSON_VALUE filter is O(N) in the
+/// resource. That's honest given Sirix's current schema — there is no
+/// secondary index on JSON-path values. A resource with millions of
+/// documents would want a proper external index; for the current
+/// federated-search sizing (dozens to thousands of documents per
+/// resource) it's fine.
 pub fn build_fetch_sql(doc: &DocId, revision: Option<u64>) -> String {
-    // We escape the node-key by embedding it as a SQL string literal.
-    // Sirix node-keys are integers in practice; we still quote them so
-    // a non-integer node-key surfaces as a Sirix-side error rather than
-    // a syntax error the guest can't attribute.
+    // We escape the business key by embedding it as a SQL string
+    // literal. JSON_VALUE returns VARCHAR, so comparing against a
+    // string literal matches naturally.
     match revision {
         Some(rev) => format!(
-            "SELECT * FROM \"{}\".\"{}\" WHERE _nodekey = '{}' AND _rev = {}",
+            "SELECT * FROM \"{}\".\"{}\" \
+             WHERE JSON_VALUE(\"document\", '$._id') = '{}' \
+             AND _revision = {}",
             escape_ident(&doc.database),
             escape_ident(&doc.resource),
             escape_sql_str(&doc.node_key),
             rev,
         ),
         None => format!(
-            "SELECT * FROM \"{}\".\"{}\" WHERE _nodekey = '{}'",
+            "SELECT * FROM \"{}\".\"{}\" \
+             WHERE JSON_VALUE(\"document\", '$._id') = '{}'",
             escape_ident(&doc.database),
             escape_ident(&doc.resource),
             escape_sql_str(&doc.node_key),
@@ -207,14 +231,17 @@ fn guess_content_type(s: &str) -> String {
 
 /// Build the SQL body for a revision listing.
 ///
-/// Sirix's history query surface isn't standardized in sirix-sql yet;
-/// see the report's "Sirix-side gaps" section. We construct a query
-/// that would work if sirix-sql exposed a `_rev` column on the resource
-/// row-scan surface, and fall back to stubbing on the guest side if the
-/// response is empty or lacks `_rev`.
+/// Same column-name / identity shape as `build_fetch_sql`:
+/// `_revision` is Sirix's metadata column (`_rev` doesn't exist), and
+/// the row is addressed by JSON-path lookup on `$._id` because Sirix
+/// exposes `_key` as a BIGINT internal node key, not the caller's
+/// business key. Falls back to stubbing on the guest side if the
+/// response is empty or lacks `_revision` (see `parse_revisions_response`).
 pub fn build_revisions_sql(doc: &DocId) -> String {
     format!(
-        "SELECT _rev FROM \"{}\".\"{}\" WHERE _nodekey = '{}' ORDER BY _rev",
+        "SELECT _revision FROM \"{}\".\"{}\" \
+         WHERE JSON_VALUE(\"document\", '$._id') = '{}' \
+         ORDER BY _revision",
         escape_ident(&doc.database),
         escape_ident(&doc.resource),
         escape_sql_str(&doc.node_key),
@@ -224,10 +251,16 @@ pub fn build_revisions_sql(doc: &DocId) -> String {
 /// Parse sirix-sql's response into a revision list.
 ///
 /// Expected shape:
-///   { "columns": ["_REV"], "rows": [[1], [2], ...] }
+///   { "columns": ["_REVISION"], "rows": [[1], [2], ...] }
 ///
-/// If the response is present but lacks a `_rev`-like column, or comes
-/// back empty, we return the caller-supplied fallback (typically
+/// Sirix's metadata column is named `_revision` (per
+/// `SirixTable.getRowType`); Calcite may upcase the label to
+/// `_REVISION` on the way back through JDBC. The lookup is
+/// case-insensitive and also tolerates the historical `_rev` label so
+/// callers stubbing responses in tests don't have to churn.
+///
+/// If the response is present but lacks a revision-like column, or
+/// comes back empty, we return the caller-supplied fallback (typically
 /// `[latest_rev]`) with an Err-in-Ok tag so the guest can propagate the
 /// gap. See `list_revisions` in `lib.rs` for the fallback plumbing.
 pub fn parse_revisions_response(json_str: &str) -> Result<Vec<u64>, String> {
@@ -247,12 +280,17 @@ pub fn parse_revisions_response(json_str: &str) -> Result<Vec<u64>, String> {
         .and_then(|r| r.as_array())
         .ok_or_else(|| "wf_document: sirix response missing `rows` array".to_string())?;
 
-    // Find the _rev column.
+    // Find the revision column. Sirix exposes `_revision`; tolerate the
+    // legacy `_rev` label for callers stubbing responses in tests.
     let idx = columns
         .iter()
-        .position(|c| c.as_str().map_or(false, |s| s.eq_ignore_ascii_case("_rev")))
+        .position(|c| {
+            c.as_str().map_or(false, |s| {
+                s.eq_ignore_ascii_case("_revision") || s.eq_ignore_ascii_case("_rev")
+            })
+        })
         .ok_or_else(|| {
-            "wf_document: sirix revisions response has no `_rev` column".to_string()
+            "wf_document: sirix revisions response has no `_revision` column".to_string()
         })?;
 
     let mut revs: Vec<u64> = Vec::with_capacity(rows.len());
@@ -262,11 +300,11 @@ pub fn parse_revisions_response(json_str: &str) -> Result<Vec<u64>, String> {
             .ok_or_else(|| format!("wf_document: sirix row was not an array: {row}"))?;
         let cell = cells
             .get(idx)
-            .ok_or_else(|| "wf_document: sirix row missing _rev cell".to_string())?;
+            .ok_or_else(|| "wf_document: sirix row missing _revision cell".to_string())?;
         let rev = cell
             .as_u64()
             .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
-            .ok_or_else(|| format!("wf_document: _rev cell was not an integer: {cell}"))?;
+            .ok_or_else(|| format!("wf_document: _revision cell was not an integer: {cell}"))?;
         revs.push(rev);
     }
     Ok(revs)
@@ -327,13 +365,20 @@ mod tests {
         let d = DocId {
             database: "docs".into(),
             resource: "manuals".into(),
-            node_key: "42".into(),
+            node_key: "manual-01".into(),
         };
         let sql = build_fetch_sql(&d, None);
         assert!(sql.contains("\"docs\""));
         assert!(sql.contains("\"manuals\""));
-        assert!(sql.contains("_nodekey = '42'"));
-        assert!(!sql.contains("_rev"));
+        // Identity filter is `JSON_VALUE("document", '$._id') = '<key>'`.
+        // Sirix's `_key` column is a BIGINT internal node key, not the
+        // caller's business key — hence the JSON-path lookup.
+        assert!(
+            sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+            "sql={sql}"
+        );
+        // No _revision predicate when revision is None.
+        assert!(!sql.contains("_revision"), "sql={sql}");
     }
 
     #[test]
@@ -341,10 +386,37 @@ mod tests {
         let d = DocId {
             database: "docs".into(),
             resource: "manuals".into(),
-            node_key: "42".into(),
+            node_key: "manual-01".into(),
         };
         let sql = build_fetch_sql(&d, Some(17));
-        assert!(sql.contains("_rev = 17"));
+        // Sirix exposes `_revision` (BIGINT), not `_rev`.
+        assert!(sql.contains("_revision = 17"), "sql={sql}");
+        assert!(sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"));
+    }
+
+    #[test]
+    fn build_fetch_sql_uses_no_legacy_column_names() {
+        // Regression guard: the guest used to emit `_nodekey` / `_rev`,
+        // neither of which Sirix exposes. Sirix's Calcite adapter
+        // rejects the query with `Column '_NODEKEY' not found in any
+        // table` before it reaches an enumerator. This test fails
+        // fast if either name reappears.
+        let d = DocId {
+            database: "docs".into(),
+            resource: "manuals".into(),
+            node_key: "manual-01".into(),
+        };
+        let with_rev = build_fetch_sql(&d, Some(3));
+        let without_rev = build_fetch_sql(&d, None);
+        for sql in [&with_rev, &without_rev] {
+            assert!(!sql.contains("_nodekey"), "legacy `_nodekey`: {sql}");
+            // `_rev` as a whole word — `_revision` legitimately contains
+            // the substring, so match on the bare form.
+            assert!(
+                !sql.split_whitespace().any(|tok| tok == "_rev"),
+                "legacy `_rev` token: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -352,11 +424,11 @@ mod tests {
         let d = DocId {
             database: "docs\"; DROP".into(),
             resource: "manuals".into(),
-            node_key: "42' OR '1' = '1".into(),
+            node_key: "manual-01' OR '1' = '1".into(),
         };
         let sql = build_fetch_sql(&d, None);
         assert!(sql.contains("\"docs\"\"; DROP\""));
-        assert!(sql.contains("_nodekey = '42'' OR ''1'' = ''1'"));
+        assert!(sql.contains("'manual-01'' OR ''1'' = ''1'"));
     }
 
     #[test]
@@ -425,18 +497,21 @@ mod tests {
         let d = DocId {
             database: "docs".into(),
             resource: "manuals".into(),
-            node_key: "42".into(),
+            node_key: "manual-01".into(),
         };
         let sql = build_revisions_sql(&d);
-        assert!(sql.contains("SELECT _rev"));
-        assert!(sql.contains("_nodekey = '42'"));
-        assert!(sql.contains("ORDER BY _rev"));
+        assert!(sql.contains("SELECT _revision"), "sql={sql}");
+        assert!(
+            sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("ORDER BY _revision"), "sql={sql}");
     }
 
     #[test]
     fn parse_revisions_response_returns_sorted_list() {
         let body = json!({
-            "columns": ["_rev"],
+            "columns": ["_revision"],
             "rows": [[1], [2], [3]]
         })
         .to_string();
@@ -447,12 +522,38 @@ mod tests {
     #[test]
     fn parse_revisions_response_accepts_string_ints() {
         let body = json!({
-            "columns": ["_rev"],
+            "columns": ["_revision"],
             "rows": [["5"]]
         })
         .to_string();
         let revs = parse_revisions_response(&body).unwrap();
         assert_eq!(revs, vec![5]);
+    }
+
+    #[test]
+    fn parse_revisions_response_accepts_uppercase_calcite_label() {
+        // Calcite / JDBC can uppercase the column name; the parser is
+        // case-insensitive.
+        let body = json!({
+            "columns": ["_REVISION"],
+            "rows": [[7]]
+        })
+        .to_string();
+        let revs = parse_revisions_response(&body).unwrap();
+        assert_eq!(revs, vec![7]);
+    }
+
+    #[test]
+    fn parse_revisions_response_accepts_legacy_rev_label() {
+        // Historical stubs used `_rev` — kept working so pre-existing
+        // integration tests don't have to churn.
+        let body = json!({
+            "columns": ["_rev"],
+            "rows": [[2]]
+        })
+        .to_string();
+        let revs = parse_revisions_response(&body).unwrap();
+        assert_eq!(revs, vec![2]);
     }
 
     #[test]
@@ -463,6 +564,6 @@ mod tests {
         })
         .to_string();
         let err = parse_revisions_response(&body).unwrap_err();
-        assert!(err.contains("_rev"));
+        assert!(err.contains("_revision"));
     }
 }

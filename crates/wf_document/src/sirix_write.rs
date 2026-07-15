@@ -62,13 +62,19 @@ pub fn build_insert_sql(
     ))
 }
 
-/// Build the SQL body for an UPDATE addressed by node-key. When
-/// `expected_revision` is supplied the caller expresses "I saw
-/// revision N; write on top of that" as an optimistic-concurrency
-/// predicate. Sirix's MVCC commits at the current head regardless —
-/// the predicate is a coarse guard, not a compare-and-swap, and its
-/// enforcement lives in sirix-sql-server's DML path (a sibling
-/// deliverable).
+/// Build the SQL body for an UPDATE addressed by the caller's
+/// business key. When `expected_revision` is supplied the caller
+/// expresses "I saw revision N; write on top of that" as an
+/// optimistic-concurrency predicate. Sirix's MVCC commits at the
+/// current head regardless — the predicate is a coarse guard, not a
+/// compare-and-swap, and its enforcement lives in sirix-sql-server's
+/// DML path (a sibling deliverable).
+///
+/// **Column-name / identity shape**: matches `sirix::build_fetch_sql`.
+/// Sirix exposes `_key BIGINT` (internal node key, not a business
+/// identifier) and `_revision BIGINT`. Rows are addressed by JSON path
+/// on `$._id` so the URI's last segment resolves to the same document
+/// the read path sees.
 pub fn build_update_sql(
     doc: &DocId,
     body: &[u8],
@@ -77,22 +83,26 @@ pub fn build_update_sql(
     let body_str = std::str::from_utf8(body)
         .map_err(|e| format!("wf_document: update body is not valid UTF-8: {e}"))?;
     let base = format!(
-        "UPDATE \"{}\".\"{}\" SET document = '{}' WHERE _nodekey = '{}'",
+        "UPDATE \"{}\".\"{}\" SET document = '{}' \
+         WHERE JSON_VALUE(\"document\", '$._id') = '{}'",
         escape_ident(&doc.database),
         escape_ident(&doc.resource),
         escape_sql_str(body_str),
         escape_sql_str(&doc.node_key),
     );
     Ok(match expected_revision {
-        Some(rev) => format!("{base} AND _rev = {rev}"),
+        Some(rev) => format!("{base} AND _revision = {rev}"),
         None => base,
     })
 }
 
-/// Build the SQL body for a DELETE addressed by node-key.
+/// Build the SQL body for a DELETE addressed by the caller's business
+/// key. Same identity shape as `build_update_sql` — see that doc-
+/// comment for the column-name rationale.
 pub fn build_delete_sql(doc: &DocId) -> String {
     format!(
-        "DELETE FROM \"{}\".\"{}\" WHERE _nodekey = '{}'",
+        "DELETE FROM \"{}\".\"{}\" \
+         WHERE JSON_VALUE(\"document\", '$._id') = '{}'",
         escape_ident(&doc.database),
         escape_ident(&doc.resource),
         escape_sql_str(&doc.node_key),
@@ -280,15 +290,19 @@ mod tests {
         let doc = DocId {
             database: "docs".into(),
             resource: "manuals".into(),
-            node_key: "42".into(),
+            node_key: "manual-01".into(),
         };
         let sql = build_update_sql(&doc, b"{\"x\":1}", None).unwrap();
         assert!(
             sql.starts_with("UPDATE \"docs\".\"manuals\" SET document = "),
             "{sql}"
         );
-        assert!(sql.contains("WHERE _nodekey = '42'"), "{sql}");
-        assert!(!sql.contains("_rev ="), "{sql}");
+        assert!(
+            sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+            "{sql}"
+        );
+        assert!(!sql.contains("_revision"), "{sql}");
+        assert!(!sql.contains("_nodekey"), "{sql}");
     }
 
     #[test]
@@ -296,10 +310,11 @@ mod tests {
         let doc = DocId {
             database: "docs".into(),
             resource: "manuals".into(),
-            node_key: "42".into(),
+            node_key: "manual-01".into(),
         };
         let sql = build_update_sql(&doc, b"{\"x\":2}", Some(5)).unwrap();
-        assert!(sql.contains("AND _rev = 5"), "{sql}");
+        assert!(sql.contains("AND _revision = 5"), "{sql}");
+        assert!(!sql.contains("_rev = 5"), "{sql}");
     }
 
     #[test]
@@ -307,12 +322,13 @@ mod tests {
         let doc = DocId {
             database: "docs".into(),
             resource: "manuals".into(),
-            node_key: "42".into(),
+            node_key: "manual-01".into(),
         };
         let sql = build_delete_sql(&doc);
         assert_eq!(
             sql,
-            "DELETE FROM \"docs\".\"manuals\" WHERE _nodekey = '42'"
+            "DELETE FROM \"docs\".\"manuals\" \
+             WHERE JSON_VALUE(\"document\", '$._id') = 'manual-01'"
         );
     }
 

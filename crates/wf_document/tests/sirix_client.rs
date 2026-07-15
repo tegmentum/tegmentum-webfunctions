@@ -35,7 +35,7 @@ fn wire_round_trip_fetch_document_no_revision() {
         send_ok(&mut socket, &response_body);
     });
 
-    let doc = parse_sirix_uri("sirix://docs/manuals/42").unwrap();
+    let doc = parse_sirix_uri("sirix://docs/manuals/manual-01").unwrap();
     let sql = build_fetch_sql(&doc, None);
     let body = build_fetch_body(&sql);
 
@@ -46,11 +46,15 @@ fn wire_round_trip_fetch_document_no_revision() {
 
     let received = rx.recv().unwrap();
     let parsed_received: JsonValue = serde_json::from_str(&received).unwrap();
-    assert!(parsed_received["sql"]
-        .as_str()
-        .unwrap()
-        .contains("_nodekey = '42'"));
-    assert!(!parsed_received["sql"].as_str().unwrap().contains("_rev"));
+    let received_sql = parsed_received["sql"].as_str().unwrap();
+    // Identity is by JSON path on `$._id` — Sirix's `_key` is a BIGINT
+    // internal node key, not a business key.
+    assert!(
+        received_sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+        "sql={received_sql}"
+    );
+    // No revision predicate when revision is None.
+    assert!(!received_sql.contains("_revision"), "sql={received_sql}");
 
     let fetched = parse_fetch_response(&response_body, None).unwrap();
     assert_eq!(fetched.body, b"{\"title\":\"waterproof rig\"}");
@@ -81,7 +85,7 @@ fn wire_round_trip_fetch_document_with_revision() {
     let doc = DocId {
         database: "docs".into(),
         resource: "manuals".into(),
-        node_key: "42".into(),
+        node_key: "manual-01".into(),
     };
     let sql = build_fetch_sql(&doc, Some(17));
     let body = build_fetch_body(&sql);
@@ -91,7 +95,13 @@ fn wire_round_trip_fetch_document_with_revision() {
 
     let received = rx.recv().unwrap();
     let parsed_received: JsonValue = serde_json::from_str(&received).unwrap();
-    assert!(parsed_received["sql"].as_str().unwrap().contains("_rev = 17"));
+    let received_sql = parsed_received["sql"].as_str().unwrap();
+    // Sirix's metadata column is `_revision`, not `_rev`.
+    assert!(received_sql.contains("_revision = 17"), "sql={received_sql}");
+    assert!(
+        received_sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+        "sql={received_sql}"
+    );
 
     let fetched = parse_fetch_response(&response_body, None).unwrap();
     assert_eq!(fetched.body, b"{\"title\":\"older revision\"}");
@@ -111,14 +121,14 @@ fn wire_round_trip_list_revisions() {
         tx.send(String::from_utf8(body).expect("utf8 body")).unwrap();
 
         let response_body = json!({
-            "columns": ["_rev"],
+            "columns": ["_revision"],
             "rows": [[1], [2], [3]]
         })
         .to_string();
         send_ok(&mut socket, &response_body);
     });
 
-    let doc = parse_sirix_uri("sirix://docs/manuals/42").unwrap();
+    let doc = parse_sirix_uri("sirix://docs/manuals/manual-01").unwrap();
     let sql = build_revisions_sql(&doc);
     let body = build_fetch_body(&sql);
 
@@ -127,10 +137,12 @@ fn wire_round_trip_list_revisions() {
 
     let received = rx.recv().unwrap();
     let parsed_received: JsonValue = serde_json::from_str(&received).unwrap();
-    assert!(parsed_received["sql"]
-        .as_str()
-        .unwrap()
-        .contains("SELECT _rev"));
+    let received_sql = parsed_received["sql"].as_str().unwrap();
+    assert!(received_sql.contains("SELECT _revision"), "sql={received_sql}");
+    assert!(
+        received_sql.contains("JSON_VALUE(\"document\", '$._id') = 'manual-01'"),
+        "sql={received_sql}"
+    );
 
     let revs = parse_revisions_response(&response_body).unwrap();
     assert_eq!(revs, vec![1, 2, 3]);
