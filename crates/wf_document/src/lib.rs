@@ -92,7 +92,7 @@ use manticore_admin::{
 };
 use sirix::{
     build_fetch_body, build_fetch_sql, build_revisions_sql, parse_fetch_response,
-    parse_revisions_response, parse_sirix_uri, query_url,
+    parse_revisions_response, parse_sirix_uri, query_url, DocId,
 };
 use sirix_write::{
     build_delete_sql, build_insert_sql, build_update_sql, parse_write_response,
@@ -409,7 +409,16 @@ fn fetch_bodies_for_hits(
         if hit.body.is_some() {
             continue;
         }
-        let Ok(doc) = parse_sirix_uri(&hit.doc) else {
+        let Some(doc) = resolve_sirix_uri_for_hit(hit) else {
+            // hit.doc isn't URI-shaped (typically Manticore's numeric _id
+            // when the subject-sidecar promotion happens on the substrate
+            // return path AFTER this guest round-trip) and no fields.subject
+            // fallback surfaced a sirix:// URI either. Soft-fail: leave
+            // body/content_type None so the rest of the hits still land.
+            eprintln!(
+                "wf_document: hit `{}` has no sirix URI (checked doc + fields.subject); skipping body fetch",
+                hit.doc,
+            );
             continue;
         };
         let sql = build_fetch_sql(&doc, hit.revision);
@@ -424,6 +433,32 @@ fn fetch_bodies_for_hits(
         hit.content_type = Some(fetched.content_type);
     }
     hits
+}
+
+/// Resolve the sirix URI for a hit's body fetch.
+///
+/// Preferred source is `hit.doc` — when the sweep or the ingest path put a
+/// `sirix://…` URI in Manticore's `_id`, everything just works. But the
+/// subject-sidecar promotion (from Manticore's numeric `_id` to a
+/// caller-visible sirix URI) happens on the substrate's return path,
+/// AFTER this guest has already fetched bodies. At guest time, `hit.doc`
+/// is still Manticore's numeric `_id` ("1", "2", "3"), so we look at
+/// `hit.fields["subject"]` for a URI-shaped fallback.
+///
+/// Returns `None` when neither source yields a `sirix://<db>/<res>/<node>`
+/// URI; the caller soft-fails the body fetch for that hit.
+fn resolve_sirix_uri_for_hit(hit: &PlainHit) -> Option<DocId> {
+    if let Ok(doc) = parse_sirix_uri(&hit.doc) {
+        return Some(doc);
+    }
+    for (key, value) in &hit.fields {
+        if key == "subject" {
+            if let Ok(doc) = parse_sirix_uri(value) {
+                return Some(doc);
+            }
+        }
+    }
+    None
 }
 
 pub fn populate_snippets(mut hits: Vec<PlainHit>, query: &str) -> Vec<PlainHit> {
@@ -816,6 +851,84 @@ mod tests {
         };
         let out = populate_snippets(vec![hit], "fox");
         assert!(out[0].snippet.as_deref().unwrap().contains("<mark>fox</mark>"));
+    }
+
+    #[test]
+    fn resolve_sirix_uri_prefers_hit_doc_when_url_shaped() {
+        let hit = PlainHit {
+            doc: "sirix://docs/manuals/from-doc".into(),
+            score: 1.0,
+            snippet: None,
+            lang: None,
+            body: None,
+            content_type: None,
+            fields: vec![(
+                "subject".into(),
+                "sirix://docs/other/from-subject".into(),
+            )],
+            revision: None,
+        };
+        let doc = resolve_sirix_uri_for_hit(&hit).expect("hit.doc should resolve");
+        assert_eq!(doc.database, "docs");
+        assert_eq!(doc.resource, "manuals");
+        assert_eq!(doc.node_key, "from-doc");
+    }
+
+    /// Regression for the document_federated wf-conformance case:
+    /// Manticore returns numeric `_id` values ("1"/"2"/…) and the
+    /// subject-sidecar promotion happens on the substrate return path,
+    /// AFTER the guest's Sirix round-trip. The guest must consult
+    /// `hit.fields["subject"]` as a fallback URI source so `?body`
+    /// still binds on every engine.
+    #[test]
+    fn resolve_sirix_uri_falls_back_to_subject_field_when_doc_is_numeric_id() {
+        let hit = PlainHit {
+            doc: "1".into(),
+            score: 1.0,
+            snippet: None,
+            lang: None,
+            body: None,
+            content_type: None,
+            fields: vec![(
+                "subject".into(),
+                "sirix://docs/manuals/manual-01".into(),
+            )],
+            revision: None,
+        };
+        let doc = resolve_sirix_uri_for_hit(&hit).expect("subject field should resolve");
+        assert_eq!(doc.database, "docs");
+        assert_eq!(doc.resource, "manuals");
+        assert_eq!(doc.node_key, "manual-01");
+    }
+
+    #[test]
+    fn resolve_sirix_uri_none_when_no_url_shaped_source() {
+        let hit = PlainHit {
+            doc: "1".into(),
+            score: 1.0,
+            snippet: None,
+            lang: None,
+            body: None,
+            content_type: None,
+            fields: vec![("title".into(), "not a uri".into())],
+            revision: None,
+        };
+        assert!(resolve_sirix_uri_for_hit(&hit).is_none());
+    }
+
+    #[test]
+    fn resolve_sirix_uri_ignores_non_subject_fields_even_when_url_shaped() {
+        let hit = PlainHit {
+            doc: "1".into(),
+            score: 1.0,
+            snippet: None,
+            lang: None,
+            body: None,
+            content_type: None,
+            fields: vec![("other".into(), "sirix://docs/manuals/42".into())],
+            revision: None,
+        };
+        assert!(resolve_sirix_uri_for_hit(&hit).is_none());
     }
 
     #[test]
