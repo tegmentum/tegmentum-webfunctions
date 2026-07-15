@@ -544,12 +544,18 @@ fn run_one<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
         errors: 0,
     };
 
-    // 5. Emit inserts. Same NDJSON `/bulk` shape as fulltext_sweep.
+    // 5. Emit inserts via SQL REPLACE through `/cli_json`. The
+    //    substrate's `http-post-json` host import hardcodes
+    //    `Content-Type: application/json`, but Manticore's `/bulk`
+    //    endpoint rejects that with `Content-Type must be
+    //    application/x-ndjson` (400). Routing through `/cli_json` +
+    //    SQL keeps the whole write path on the one Content-Type the
+    //    guest can send. See `manticore_replace_sql`.
     if !to_insert.is_empty() {
-        let body = build_bulk_body(&entry.search_index, &to_insert);
-        let url = bulk_url(&entry.search_backend);
-        match http.post_json(&url, &body) {
-            Ok(response) => match bulk_response_ok(&response) {
+        let sql = manticore_replace_sql(&entry.search_index, &to_insert);
+        let url = cli_json_url(&entry.search_backend);
+        match http.post_json(&url, &sql) {
+            Ok(response) => match manticore_ddl_response_ok(&response) {
                 Ok(()) => {
                     counts.inserted = to_insert.len() as u64;
                     for m in &to_insert {
@@ -584,10 +590,19 @@ fn run_one<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
 
     // 6. Emit deletes.
     if !to_delete.is_empty() {
-        let body = build_delete_body(&entry.search_index, &to_delete);
-        let url = bulk_url(&entry.search_backend);
-        match http.post_json(&url, &body) {
-            Ok(response) => match bulk_response_ok(&response) {
+        // Same numeric-id treatment as insert (`manticore_doc_id`) so
+        // the delete WHERE-clause targets the exact row REPLACE
+        // installed. Deletes go through the same `/cli_json` +
+        // SQL route as inserts (Manticore's `/bulk` rejects the
+        // Content-Type the host import sends).
+        let delete_ids: Vec<u64> = to_delete
+            .iter()
+            .map(|uri| manticore_doc_id(uri, None))
+            .collect();
+        let sql = manticore_delete_sql(&entry.search_index, &delete_ids);
+        let url = cli_json_url(&entry.search_backend);
+        match http.post_json(&url, &sql) {
+            Ok(response) => match manticore_ddl_response_ok(&response) {
                 Ok(()) => {
                     counts.deleted = to_delete.len() as u64;
                     for uri in &to_delete {
@@ -641,16 +656,17 @@ fn run_one_all<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
     options: SweepOptions,
 ) -> Result<SweepResult, String> {
     let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
-    sink.ensure_doc_table(&table)?;
+    sink.ensure_doc_table(&table).map_err(|e| format!("ensure_doc_table: {e}"))?;
     // Manticore-side data table — see `ensure_manticore_table`.
-    ensure_manticore_table(http, &entry.search_backend, &entry.search_index)?;
+    ensure_manticore_table(http, &entry.search_backend, &entry.search_index)
+        .map_err(|e| format!("ensure_manticore_table (RUN_ONE_ALL): {e}"))?;
 
     let known: HashMap<(String, u64), KnownDoc> = if options.full_scan {
         // Backfill mode — pretend we've seen nothing so every rev
         // that comes back from Sirix gets mirrored.
         HashMap::new()
     } else {
-        sink.load_known_docs(&table)?
+        sink.load_known_docs(&table).map_err(|e| format!("load_known_docs: {e}"))?
     };
 
     // Enumerate per-revision history via sirix-sql's HISTORY_OF table
@@ -671,7 +687,7 @@ fn run_one_all<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
             None,
             true,
         )
-        .map_err(|e| format!("sirix list_documents: {e}"))?;
+        .map_err(|e| format!("sirix list_documents (RUN_ONE_ALL): {e}"))?;
 
     let by_key = group_rows_by_key(&rows);
 
@@ -695,10 +711,13 @@ fn run_one_all<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
     };
 
     if !to_insert.is_empty() {
-        let body = build_bulk_body(&entry.search_index, &to_insert);
-        let url = bulk_url(&entry.search_backend);
-        match http.post_json(&url, &body) {
-            Ok(response) => match bulk_response_ok(&response) {
+        // SQL REPLACE via `/cli_json` — Manticore's `/bulk` needs
+        // `Content-Type: application/x-ndjson` and the host import
+        // sends `application/json`. Same route as `run_one`.
+        let sql = manticore_replace_sql(&entry.search_index, &to_insert);
+        let url = cli_json_url(&entry.search_backend);
+        match http.post_json(&url, &sql) {
+            Ok(response) => match manticore_ddl_response_ok(&response) {
                 Ok(()) => {
                     counts.inserted = to_insert.len() as u64;
                     for m in &to_insert {
@@ -879,10 +898,10 @@ fn emit_all_mode_bulk<H: HttpBridge, S: DocSinkBridge>(
     };
 
     if !to_insert.is_empty() {
-        let body = build_bulk_body(&entry.search_index, to_insert);
-        let url = bulk_url(&entry.search_backend);
-        match http.post_json(&url, &body) {
-            Ok(response) => match bulk_response_ok(&response) {
+        let sql = manticore_replace_sql(&entry.search_index, to_insert);
+        let url = cli_json_url(&entry.search_backend);
+        match http.post_json(&url, &sql) {
+            Ok(response) => match manticore_ddl_response_ok(&response) {
                 Ok(()) => {
                     counts.inserted = to_insert.len() as u64;
                     for m in to_insert {
@@ -916,14 +935,18 @@ fn emit_all_mode_bulk<H: HttpBridge, S: DocSinkBridge>(
     }
 
     if !to_delete.is_empty() {
-        let delete_ids: Vec<String> = to_delete
+        // Numeric composite-id shape (`manticore_doc_id(uri, Some(rev))`
+        // — matches the insert side). SQL DELETE via `/cli_json`
+        // instead of NDJSON `/bulk` for the same Content-Type reason
+        // (see `run_one`).
+        let delete_ids: Vec<u64> = to_delete
             .iter()
-            .map(|(uri, rev)| format!("{uri}@rev{rev}"))
+            .map(|(uri, rev)| manticore_doc_id(uri, Some(*rev)))
             .collect();
-        let body = build_delete_body(&entry.search_index, &delete_ids);
-        let url = bulk_url(&entry.search_backend);
-        match http.post_json(&url, &body) {
-            Ok(response) => match bulk_response_ok(&response) {
+        let sql = manticore_delete_sql(&entry.search_index, &delete_ids);
+        let url = cli_json_url(&entry.search_backend);
+        match http.post_json(&url, &sql) {
+            Ok(response) => match manticore_ddl_response_ok(&response) {
                 Ok(()) => {
                     counts.deleted = to_delete.len() as u64;
                     for (uri, rev) in to_delete {
@@ -1312,13 +1335,20 @@ pub fn build_bulk_body(index: &str, docs: &[DocMirror]) -> String {
         // sweep-populated Manticore rows round-trip through the same
         // `pick_doc` path as those cases.
         doc_obj.insert("subject".into(), J::String(doc.uri.clone()));
-        // Retention=all rows carry validity intervals + a
-        // rev-qualified id. Latest-mode rows keep the bare URI as
-        // `_id`, matching v0.2 exactly.
-        let (id, is_all_mode) = match doc.valid_from {
-            Some(_) => (format!("{}@rev{}", doc.uri, doc.revision), true),
-            None => (doc.uri.clone(), false),
-        };
+        // Manticore `/bulk` rejects non-integer ids with `Document ids
+        // should be integer or array of integers`. Hash the composite
+        // `(uri, rev?)` to a stable u64 so `replace` remains idempotent
+        // across sweeps (same input → same id → replace-not-duplicate).
+        // Latest-mode rows omit the revision so successive sweeps
+        // overwrite the single per-URI row; retention modes include the
+        // revision so multiple revisions of one URI coexist under
+        // distinct ids. `subject` + `_uri` carry the human-readable
+        // sirix:// identifier so the substrate's `pick_doc` heuristic
+        // still promotes it to `?doc` — the numeric `_id` never
+        // surfaces upstream.
+        let is_all_mode = doc.valid_from.is_some();
+        let id_rev = if is_all_mode { Some(doc.revision) } else { None };
+        let id = manticore_doc_id(&doc.uri, id_rev);
         if is_all_mode {
             if let Some(vf) = doc.valid_from {
                 doc_obj.insert("_valid_from".into(), J::Number(vf.into()));
@@ -1348,8 +1378,133 @@ pub fn build_bulk_body(index: &str, docs: &[DocMirror]) -> String {
     out
 }
 
-/// Build the NDJSON body for a batch of `delete` ops. One line per URI.
-pub fn build_delete_body(index: &str, ids: &[String]) -> String {
+/// Compute Manticore's numeric `_id` for a `(uri, rev?)` pair. FNV-1a
+/// 64-bit hash of `uri` or `<uri>@rev<N>` — the same primitive the
+/// sweep uses elsewhere for change-detection hashes. Deterministic per
+/// input so `replace` stays idempotent across sweeps.
+///
+/// Manticore's `/bulk` endpoint rejects non-integer ids outright
+/// ("Document ids should be integer or array of integers"), so the
+/// string composite id shape the pre-fix sweep emitted (`<uri>` or
+/// `<uri>@rev<N>`) never landed a row. Hashing keeps `_source` intact
+/// (the sirix:// URI still ships in `_uri` and `subject`) while
+/// satisfying Manticore's numeric-id constraint.
+pub fn manticore_doc_id(uri: &str, rev: Option<u64>) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for b in uri.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    if let Some(r) = rev {
+        for b in b"@rev" {
+            h ^= *b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        for b in r.to_string().bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    // Reserve 0 as a sentinel for "auto-assign" so a pathological hash
+    // collision with Manticore's implicit auto-id sentinel can't happen.
+    // Bumping by 1 keeps the collision-avoidance simple without disturbing
+    // the FNV distribution meaningfully.
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// Build a Manticore-SQL `REPLACE INTO ... VALUES (...), (...), ...`
+/// statement that upserts a batch of `DocMirror` rows via `/cli_json`.
+///
+/// **Why not `/bulk`?** The substrate's `http-post-json` host import
+/// hardcodes `Content-Type: application/json`, and Manticore's `/bulk`
+/// endpoint rejects that with `Content-Type must be
+/// application/x-ndjson` (400) — the whole retention=all mirror is a
+/// no-op if we route through `/bulk`. `/cli_json` accepts plain SQL
+/// under `application/json` and does not care about NDJSON. Same-shape
+/// idempotent replace-on-conflict semantics; the numeric ids
+/// `manticore_doc_id` mints keep the multi-VALUES batch collision-free
+/// across the retention modes.
+///
+/// Multi-VALUES batch is a single POST — the sweep already builds one
+/// full batch per entry, so keeping the batch shape preserves the
+/// per-sweep POST count. Manticore accepts up to `max_packet_size`
+/// bytes per statement (default 8MB); each row is <200 bytes of SQL,
+/// so 40 000 rows per POST comfortably fits inside the default limit.
+///
+/// `_valid_to` is emitted as `0` when the mirror carries an open
+/// interval (current-tip revision under retention=all/window/tail).
+/// Manticore SQL rejects `NULL` in `VALUES(...)` (P01 parse error), and
+/// the guest's `build_query_clause` already recognises `_valid_to = 0`
+/// as the "not yet superseded" sentinel — the two conventions must
+/// agree, and 0 is the shared value.
+pub fn manticore_replace_sql(index: &str, docs: &[DocMirror]) -> String {
+    let mut sql = String::new();
+    sql.push_str("REPLACE INTO ");
+    sql.push_str(index);
+    sql.push_str(
+        "(id, _uri, _rev, title, `text`, subject, content_type, _valid_from, _valid_to) VALUES ",
+    );
+    let mut first = true;
+    for doc in docs {
+        if !first {
+            sql.push_str(", ");
+        }
+        first = false;
+        let is_all_mode = doc.valid_from.is_some();
+        let id_rev = if is_all_mode { Some(doc.revision) } else { None };
+        let id = manticore_doc_id(&doc.uri, id_rev);
+        let vf = doc.valid_from.unwrap_or(0);
+        // Manticore-SQL cannot express NULL in VALUES; 0 is the
+        // "open-interval" sentinel the guest's search filter recognises.
+        let vt = doc.valid_to.unwrap_or(0);
+        sql.push_str(&format!(
+            "({id}, '{uri}', {rev}, '', '{body}', '{uri2}', '{ct}', {vf}, {vt})",
+            uri = escape_sql_string(&doc.uri),
+            uri2 = escape_sql_string(&doc.uri),
+            rev = doc.revision,
+            body = escape_sql_string(&doc.body),
+            ct = escape_sql_string(&doc.content_type),
+        ));
+    }
+    sql
+}
+
+/// Build a Manticore-SQL `DELETE FROM <index> WHERE id IN (...)`
+/// statement. Same `/cli_json` reasoning as `manticore_replace_sql`.
+/// Empty `ids` yields an empty string; callers must not POST that.
+pub fn manticore_delete_sql(index: &str, ids: &[u64]) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    let mut sql = String::new();
+    sql.push_str("DELETE FROM ");
+    sql.push_str(index);
+    sql.push_str(" WHERE id IN (");
+    let mut first = true;
+    for id in ids {
+        if !first {
+            sql.push_str(", ");
+        }
+        first = false;
+        sql.push_str(&id.to_string());
+    }
+    sql.push(')');
+    sql
+}
+
+/// Build the NDJSON body for a batch of `delete` ops. One line per id.
+///
+/// Ids are the same u64 values `build_bulk_body` emits (see
+/// `manticore_doc_id`). Manticore's `/bulk` rejects string ids with
+/// "Document ids should be integer or array of integers", so the
+/// delete path must match the insert path's numeric-id convention.
+pub fn build_delete_body(index: &str, ids: &[u64]) -> String {
     use serde_json::json;
     let mut out = String::new();
     for id in ids {
@@ -1431,11 +1586,22 @@ pub fn cli_json_url(backend_url: &str) -> String {
 /// the table survives across invocations; the guard keeps
 /// non-first-run sweeps a no-op on the DDL step.
 pub fn manticore_create_table_ddl(index: &str) -> String {
+    // Manticore rejects `/bulk` inserts that reference columns not
+    // declared at CREATE TABLE time with `unknown column: '<name>'`
+    // (409). `build_bulk_body` emits `_uri`, `_rev`, `title`, `text`,
+    // `subject`, `content_type`, plus `_valid_from`/`_valid_to` on
+    // retention=all/window/tail rows — so every one of those columns
+    // MUST appear in the DDL or the very first sweep insert 409s and
+    // the retention=all mirror never materialises. Regression guard:
+    // `manticore_ddl_carries_every_bulk_body_column`.
     format!(
         "CREATE TABLE IF NOT EXISTS {index}(\
+         _uri string, \
+         _rev bigint, \
          title text, \
          `text` text indexed, \
          subject string, \
+         content_type string, \
          _valid_from bigint, \
          _valid_to bigint)"
     )
@@ -1763,23 +1929,44 @@ mod tests {
 
     #[derive(Default)]
     struct MockHttp {
-        posts: RefCell<Vec<(String, String)>>, // (url, body) — bulk only
+        posts: RefCell<Vec<(String, String)>>, // (url, body) — data POSTs only
         response: String,
     }
     impl HttpBridge for MockHttp {
         fn post_json(&self, url: &str, body: &str) -> Result<String, String> {
-            // The sweep issues a Manticore CREATE TABLE POST against
-            // `/cli_json` before its first `/bulk` POST. That's
-            // orthogonal to what the per-batch bulk-body assertions
-            // exercise, so keep `posts` scoped to bulk POSTs only and
-            // hand back a well-formed `/cli_json` success payload for
-            // the DDL — matches Manticore 28.4.4's shape for a happy
-            // `CREATE TABLE IF NOT EXISTS`, per wave-8
-            // (`wf-conformance` commit `4c6c972`).
+            // The sweep routes both DDL (`CREATE TABLE IF NOT EXISTS`)
+            // and data (`REPLACE INTO ... VALUES ...` / `DELETE FROM
+            // ... WHERE id IN (...)`) through Manticore's `/cli_json`
+            // endpoint — the host's `http-post-json` sends
+            // `Content-Type: application/json` and Manticore's `/bulk`
+            // rejects that with `Content-Type must be
+            // application/x-ndjson` (400). Every write now goes as SQL
+            // through `/cli_json` and every response has the same
+            // `[{"total":N,"error":"","warning":""}]` shape. Filter
+            // DDL out of `posts` so the per-batch assertions keep
+            // measuring "did the sweep POST the data batch?" without
+            // being polluted by the up-front idempotent DDL.
             if url.ends_with("/cli_json") {
-                return Ok(
-                    r#"[{"total":0,"error":"","warning":""}]"#.to_string(),
-                );
+                let ddl_prefix = body.trim_start().to_ascii_uppercase();
+                if ddl_prefix.starts_with("CREATE ") || ddl_prefix.starts_with("DROP ") {
+                    return Ok(
+                        r#"[{"total":0,"error":"","warning":""}]"#.to_string(),
+                    );
+                }
+                // Data statement (REPLACE / DELETE / etc). Record it
+                // for the per-batch assertions, then hand back a
+                // response shape that matches Manticore's `/cli_json`
+                // success format so `manticore_ddl_response_ok`
+                // accepts it. `response` overrides this when set.
+                self.posts
+                    .borrow_mut()
+                    .push((url.to_string(), body.to_string()));
+                let resp = if self.response.is_empty() {
+                    r#"[{"total":1,"error":"","warning":""}]"#.to_string()
+                } else {
+                    self.response.clone()
+                };
+                return Ok(resp);
             }
             self.posts
                 .borrow_mut()
@@ -1865,6 +2052,89 @@ mod tests {
         .to_string()
     }
 
+    /// Parse the `VALUES (...), (...), ...` tail of a Manticore-SQL
+    /// `REPLACE INTO ... VALUES ...` statement into a list of rows,
+    /// each a list of cell strings. Handles the small subset of SQL
+    /// literals the sweep emits: bare integers, `'quoted'` strings with
+    /// doubled-quote escaping (`''`). Whitespace between rows is
+    /// tolerated. Panics on unclosed literals so mis-quoted output
+    /// surfaces at test time rather than silently truncating.
+    fn parse_sql_values_rows(sql: &str) -> Vec<Vec<String>> {
+        let after_values = match sql.to_ascii_uppercase().find("VALUES") {
+            Some(i) => &sql[i + "VALUES".len()..],
+            None => return Vec::new(),
+        };
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let bytes = after_values.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i] == b',' {
+                i += 1;
+                continue;
+            }
+            if bytes[i] != b'(' {
+                break;
+            }
+            i += 1;
+            let mut cells: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            let mut in_str = false;
+            loop {
+                if i >= bytes.len() {
+                    panic!("parse_sql_values_rows: unterminated row: {sql}");
+                }
+                let c = bytes[i];
+                if in_str {
+                    if c == b'\'' {
+                        // '' escape → keep one '.
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            cur.push('\'');
+                            i += 2;
+                            continue;
+                        }
+                        in_str = false;
+                        i += 1;
+                        continue;
+                    }
+                    cur.push(c as char);
+                    i += 1;
+                } else {
+                    match c {
+                        b'\'' => {
+                            in_str = true;
+                            i += 1;
+                        }
+                        b',' => {
+                            cells.push(cur.trim().to_string());
+                            cur.clear();
+                            i += 1;
+                        }
+                        b')' => {
+                            let last = cur.trim().to_string();
+                            if !last.is_empty() || !cells.is_empty() {
+                                cells.push(last);
+                            }
+                            i += 1;
+                            break;
+                        }
+                        _ => {
+                            cur.push(c as char);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            rows.push(cells);
+        }
+        rows
+    }
+
     fn cfg(name: &str) -> DocumentIndexConfig {
         DocumentIndexConfig {
             name: name.into(),
@@ -1898,12 +2168,24 @@ mod tests {
         let (to_insert, _) = build_diff(&entry, &rows, &HashMap::new());
         assert_eq!(to_insert.len(), 1);
         assert_eq!(to_insert[0].uri, "sirix://docs/manuals/42");
-        // Bulk body carries it through as both _id and doc._uri.
+        // Bulk body carries the URI through as `doc._uri` +
+        // `doc.subject`; the outer `_id` is the numeric hash the sweep
+        // uses to satisfy Manticore's integer-only id constraint (see
+        // `manticore_doc_id`). Latest-mode rows hash the bare URI (no
+        // revision suffix) so successive sweeps overwrite the row in
+        // place.
         let body = build_bulk_body("manuals", &to_insert);
         let line = body.trim_end_matches('\n');
         let parsed: JsonValue = serde_json::from_str(line).unwrap();
-        assert_eq!(parsed["replace"]["id"], "sirix://docs/manuals/42");
+        let expected_id = manticore_doc_id("sirix://docs/manuals/42", None);
+        assert_eq!(parsed["replace"]["id"], expected_id);
+        assert!(
+            parsed["replace"]["id"].is_number(),
+            "Manticore /bulk rejects string ids — must be integer: {}",
+            parsed["replace"]["id"]
+        );
         assert_eq!(parsed["replace"]["doc"]["_uri"], "sirix://docs/manuals/42");
+        assert_eq!(parsed["replace"]["doc"]["subject"], "sirix://docs/manuals/42");
     }
 
     // -----------------------------------------------------------------
@@ -2000,11 +2282,31 @@ mod tests {
         assert_eq!(r1.inserted, 0);
         assert_eq!(r1.deleted, 1);
         assert_eq!(r1.unchanged, 1);
-        // The delete request went out with the right URI shape.
+        // Delete now goes through `/cli_json` as a SQL `DELETE FROM
+        // <index> WHERE id IN (...)` — Manticore's `/bulk` rejects the
+        // `Content-Type: application/json` the host import sends, so
+        // every sweep write is a SQL statement. The URI itself never
+        // appears on the delete wire (it's identified by the numeric
+        // `manticore_doc_id` hash); the tracker still records the
+        // human-readable URI so operators reading the SQLite sink can
+        // trace back.
         let posts = http_v1.posts.borrow();
-        assert_eq!(posts.len(), 1);
-        assert!(posts[0].1.contains("\"delete\""));
-        assert!(posts[0].1.contains("sirix://docs/manuals/43"));
+        assert_eq!(posts.len(), 1, "one DELETE POST");
+        assert!(
+            posts[0].0.ends_with("/cli_json"),
+            "delete SQL must go through /cli_json (Manticore /bulk rejects the host's Content-Type)"
+        );
+        let expected_id = manticore_doc_id("sirix://docs/manuals/43", None);
+        assert!(
+            posts[0].1.to_ascii_uppercase().contains("DELETE FROM"),
+            "expected DELETE FROM SQL: {}",
+            posts[0].1
+        );
+        assert!(
+            posts[0].1.contains(&expected_id.to_string()),
+            "delete SQL missing numeric id for removed URI: {}",
+            posts[0].1
+        );
     }
 
     #[test]
@@ -2137,24 +2439,28 @@ mod tests {
         assert_eq!(counts.deleted, 0);
         assert_eq!(counts.errors, 0);
 
-        // Extract `_valid_from` per row from the NDJSON `/bulk` body
-        // and assert three distinct timestamps landed — the schema
-        // probe in `wf_document::manticore::schema_has_valid_from`
-        // requires the column to be present under `_source` for
-        // time-travel search to progress.
+        // Extract `_valid_from` per row from the SQL VALUES tuples and
+        // assert three distinct timestamps landed — the schema probe
+        // in `wf_document::manticore::schema_has_valid_from` requires
+        // the column to be present under `_source` for time-travel
+        // search to progress. Column order matches
+        // `manticore_replace_sql`:
+        //   (id, _uri, _rev, title, `text`, subject, content_type,
+        //    _valid_from, _valid_to)
         let posts = http.posts.borrow();
-        let bulk_body = &posts[0].1;
-        let mut valid_froms: Vec<i64> = Vec::new();
-        for line in bulk_body.lines() {
-            let v: JsonValue = serde_json::from_str(line).unwrap();
-            let doc = &v["replace"]["doc"];
-            let vf = doc["_valid_from"]
-                .as_i64()
-                .unwrap_or_else(|| panic!("row missing `_valid_from`: {doc}"));
-            valid_froms.push(vf);
-        }
+        assert_eq!(posts.len(), 1, "single POST for the retention=all batch");
+        let sql = &posts[0].1;
+        let rows = parse_sql_values_rows(sql);
+        assert_eq!(rows.len(), 3, "three rows in the REPLACE VALUES tuple list: {sql}");
+        let mut valid_froms: Vec<i64> = rows
+            .iter()
+            .map(|cells| {
+                cells[7]
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| panic!("_valid_from cell not an integer: {}", cells[7]))
+            })
+            .collect();
         valid_froms.sort();
-        assert_eq!(valid_froms.len(), 3);
         assert!(
             valid_froms[0] < valid_froms[1] && valid_froms[1] < valid_froms[2],
             "each revision must carry a distinct `_valid_from` value so \
@@ -2258,19 +2564,15 @@ mod tests {
     fn full_sweep_two_generations_against_mock_backend() {
         let entry = cfg("manuals");
 
-        // Manticore mock: accept a single POST /bulk, capture the body,
-        // reply with a canned success. Keep a channel of received bodies.
+        // Manticore mock: reply with a Manticore-`/cli_json`-shape
+        // success payload for both the DDL (CREATE TABLE) and the SQL
+        // data statements (REPLACE / DELETE). Both ride `/cli_json`
+        // now (see `manticore_replace_sql`).
         let manticore_bodies: Arc<Mutex<Vec<String>>> =
             Arc::new(Mutex::new(Vec::new()));
         let manticore_url = spawn_tcp_echo_server(
             Arc::clone(&manticore_bodies),
-            move |_body| {
-                json!({
-                    "items": [{ "replace": { "_id": "x", "result": "created" } }],
-                    "errors": false
-                })
-                .to_string()
-            },
+            move |_body| r#"[{"total":1,"error":"","warning":""}]"#.to_string(),
         );
 
         // Sirix mock: a slot for the currently-committed rows. Each
@@ -2294,22 +2596,21 @@ mod tests {
         assert_eq!(r0.deleted, 0);
         assert_eq!(r0.errors, 0);
         {
-            // Filter out the Manticore CREATE TABLE POST that lands
-            // on `/cli_json` before every `/bulk` — the shared TCP
-            // mock server records all bodies regardless of path, so
-            // bulk-body assertions filter for NDJSON (starts with `{`).
+            // Filter DDL (`CREATE ...`) out of the recording; keep the
+            // data statement (`REPLACE INTO ...`). All go through
+            // `/cli_json` — the mock server records every body
+            // regardless of URL suffix.
             let bodies = manticore_bodies.lock().unwrap();
-            let bulk_bodies: Vec<&String> = bodies
+            let data_bodies: Vec<&String> = bodies
                 .iter()
-                .filter(|b| b.trim_start().starts_with('{'))
+                .filter(|b| b.to_ascii_uppercase().trim_start().starts_with("REPLACE"))
                 .collect();
-            assert_eq!(bulk_bodies.len(), 1);
+            assert_eq!(data_bodies.len(), 1);
             assert!(
-                bulk_bodies[0].contains("sirix://docs/manuals/42"),
+                data_bodies[0].contains("sirix://docs/manuals/42"),
                 "wire body missing sirix URI: {}",
-                bulk_bodies[0]
+                data_bodies[0]
             );
-            assert!(bulk_bodies[0].contains("\"replace\""));
         }
 
         // Commit a new doc to the "Sirix" mock.
@@ -2324,21 +2625,21 @@ mod tests {
         assert_eq!(r1.deleted, 0);
         {
             let bodies = manticore_bodies.lock().unwrap();
-            let bulk_bodies: Vec<&String> = bodies
+            let data_bodies: Vec<&String> = bodies
                 .iter()
-                .filter(|b| b.trim_start().starts_with('{'))
+                .filter(|b| b.to_ascii_uppercase().trim_start().starts_with("REPLACE"))
                 .collect();
-            assert_eq!(bulk_bodies.len(), 2);
+            assert_eq!(data_bodies.len(), 2);
             assert!(
-                bulk_bodies[1].contains("sirix://docs/manuals/99"),
+                data_bodies[1].contains("sirix://docs/manuals/99"),
                 "gen1 body missing new sirix URI: {}",
-                bulk_bodies[1]
+                data_bodies[1]
             );
             // Only the new doc, not the existing one.
             assert!(
-                !bulk_bodies[1].contains("sirix://docs/manuals/42"),
+                !data_bodies[1].contains("sirix://docs/manuals/42"),
                 "gen1 body should not re-insert existing doc: {}",
-                bulk_bodies[1]
+                data_bodies[1]
             );
         }
     }
@@ -2586,42 +2887,53 @@ mod tests {
         assert_eq!(r.deleted, 0);
         assert_eq!(r.errors, 0);
 
-        // Inspect the bulk body: three lines, one per rev, each with
-        // the composite `<uri>@rev<N>` id and the interval columns.
+        // Inspect the SQL REPLACE VALUES: three rows, each row's `id`
+        // is the numeric `manticore_doc_id(uri, Some(rev))` — Manticore
+        // rejects string ids (the pre-fix `<uri>@rev<N>` string ids
+        // never landed rows, wave-15 root cause). `_uri` and `subject`
+        // carry the human-readable sirix:// URI so the substrate's
+        // `pick_doc` still promotes it to `?doc`. Route is
+        // `/cli_json` (see `manticore_replace_sql` for the
+        // Content-Type reason).
         let posts = http.posts.borrow();
         assert_eq!(posts.len(), 1, "single POST for the batch of 3");
-        let ndjson = &posts[0].1;
-        let lines: Vec<&str> = ndjson.lines().collect();
-        assert_eq!(lines.len(), 3);
-
-        let ids: Vec<String> = lines
+        assert!(posts[0].0.ends_with("/cli_json"));
+        let sql = &posts[0].1;
+        let rows = parse_sql_values_rows(sql);
+        assert_eq!(rows.len(), 3, "three VALUES rows: {sql}");
+        // Column order per `manticore_replace_sql`:
+        //   0=id 1=_uri 2=_rev 3=title 4=text 5=subject 6=content_type
+        //   7=_valid_from 8=_valid_to
+        let ids: Vec<u64> = rows
             .iter()
-            .map(|l| {
-                let v: JsonValue = serde_json::from_str(l).unwrap();
-                v["replace"]["id"].as_str().unwrap().to_string()
-            })
+            .map(|c| c[0].parse::<u64>().expect("id must be integer"))
             .collect();
         assert_eq!(
             ids,
             vec![
-                "sirix://docs/manuals/42@rev1",
-                "sirix://docs/manuals/42@rev2",
-                "sirix://docs/manuals/42@rev3",
+                manticore_doc_id("sirix://docs/manuals/42", Some(1)),
+                manticore_doc_id("sirix://docs/manuals/42", Some(2)),
+                manticore_doc_id("sirix://docs/manuals/42", Some(3)),
             ]
         );
-
-        // Interval columns: valid_from = commit ts, valid_to = next rev's
-        // commit ts, except the tip which is null.
-        let docs: Vec<JsonValue> = lines
-            .iter()
-            .map(|l| serde_json::from_str::<JsonValue>(l).unwrap()["replace"]["doc"].clone())
-            .collect();
-        assert_eq!(docs[0]["_valid_from"], JsonValue::from(1_700_000_000_i64));
-        assert_eq!(docs[0]["_valid_to"], JsonValue::from(1_700_005_000_i64));
-        assert_eq!(docs[1]["_valid_from"], JsonValue::from(1_700_005_000_i64));
-        assert_eq!(docs[1]["_valid_to"], JsonValue::from(1_700_010_000_i64));
-        assert_eq!(docs[2]["_valid_from"], JsonValue::from(1_700_010_000_i64));
-        assert_eq!(docs[2]["_valid_to"], JsonValue::Null);
+        use std::collections::HashSet as StdHashSet;
+        let uniq: StdHashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(uniq.len(), ids.len(), "per-revision ids must be distinct: {ids:?}");
+        for r in &rows {
+            assert_eq!(r[1], "sirix://docs/manuals/42");
+            assert_eq!(r[5], "sirix://docs/manuals/42");
+        }
+        // Interval columns: valid_from = commit ts, valid_to = next
+        // rev's commit ts, except the tip which uses 0 (Manticore-SQL
+        // sentinel for "no upper bound" — SQL VALUES rejects NULL and
+        // the guest's search filter already recognises 0 as the
+        // open-interval marker).
+        assert_eq!(rows[0][7], "1700000000");
+        assert_eq!(rows[0][8], "1700005000");
+        assert_eq!(rows[1][7], "1700005000");
+        assert_eq!(rows[1][8], "1700010000");
+        assert_eq!(rows[2][7], "1700010000");
+        assert_eq!(rows[2][8], "0");
     }
 
     #[test]
@@ -2638,12 +2950,20 @@ mod tests {
 
         run(&[entry], &http, &sirix, &sink);
         let posts = http.posts.borrow();
-        let last_line = posts[0].1.lines().last().unwrap();
-        let v: JsonValue = serde_json::from_str(last_line).unwrap();
-        assert_eq!(v["replace"]["id"], "sirix://docs/manuals/42@rev3");
-        // Explicit `null` for the current-tip revision — open
-        // interval, per memo §03.
-        assert_eq!(v["replace"]["doc"]["_valid_to"], JsonValue::Null);
+        let sql = &posts[0].1;
+        let rows = parse_sql_values_rows(sql);
+        let last = rows.last().unwrap();
+        // Numeric id — SQL REPLACE via `/cli_json`. Composite id shape
+        // is `hash("<uri>@rev<N>")`.
+        assert_eq!(
+            last[0].parse::<u64>().unwrap(),
+            manticore_doc_id("sirix://docs/manuals/42", Some(3))
+        );
+        // Current-tip revision uses `0` for `_valid_to` — Manticore-SQL
+        // rejects NULL in VALUES tuples and the guest's search filter
+        // recognises 0 as the open-interval sentinel (memo §03 open
+        // interval, wire-shape adjustment for SQL route).
+        assert_eq!(last[8], "0");
     }
 
     #[test]
@@ -2692,11 +3012,15 @@ mod tests {
         assert_eq!(r.errors, 0);
         // Both revs land as the current-tip (open interval); no
         // `_valid_to` because HISTORY_OF didn't return a later rev.
+        // `_valid_to = 0` on the SQL wire is the open-interval
+        // sentinel — Manticore-SQL rejects NULL in VALUES tuples and
+        // the guest's search filter recognises 0 as "not yet
+        // superseded".
         let posts = http.posts.borrow();
         assert_eq!(posts.len(), 1);
-        for line in posts[0].1.lines() {
-            let v: JsonValue = serde_json::from_str(line).unwrap();
-            assert_eq!(v["replace"]["doc"]["_valid_to"], JsonValue::Null);
+        let rows = parse_sql_values_rows(&posts[0].1);
+        for r in &rows {
+            assert_eq!(r[8], "0", "open-interval sentinel expected: {r:?}");
         }
     }
 
@@ -2725,11 +3049,10 @@ mod tests {
         let r = run(&[entry], &http, &sirix, &sink);
         assert_eq!(r.inserted, 3);
         let posts = http.posts.borrow();
-        let first_line = posts[0].1.lines().next().unwrap();
-        let v: JsonValue = serde_json::from_str(first_line).unwrap();
+        let rows = parse_sql_values_rows(&posts[0].1);
         // Fallback: `_valid_from` uses the revision number.
-        assert_eq!(v["replace"]["doc"]["_valid_from"], JsonValue::from(1));
-        assert_eq!(v["replace"]["doc"]["_valid_to"], JsonValue::from(2));
+        assert_eq!(rows[0][7], "1");
+        assert_eq!(rows[0][8], "2");
     }
 
     #[test]
@@ -2786,8 +3109,11 @@ mod tests {
 
     #[test]
     fn latest_mode_still_produces_v0_2_wire_shape() {
-        // v0.2 regression guard: latest-mode emits the bare
-        // `sirix://...` `_id`, no interval columns.
+        // Latest-mode invariants: numeric `_id` (Manticore /bulk
+        // rejects string ids; the pre-fix `_id: "sirix://..."` never
+        // landed a row and this test caught nothing because the mock
+        // http bridge accepts anything). `_uri` still carries the
+        // human-readable URI; no interval columns.
         let entry = cfg("manuals");
         let sirix = MockSirix {
             rows: RefCell::new(vec![SirixDocRow {
@@ -2805,11 +3131,24 @@ mod tests {
         let sink = MockDocSink::default();
         run(&[entry], &http, &sirix, &sink);
         let posts = http.posts.borrow();
-        let line = posts[0].1.trim_end_matches('\n');
-        let v: JsonValue = serde_json::from_str(line).unwrap();
-        assert_eq!(v["replace"]["id"], "sirix://docs/manuals/42");
-        assert!(v["replace"]["doc"].get("_valid_from").is_none());
-        assert!(v["replace"]["doc"].get("_valid_to").is_none());
+        let sql = &posts[0].1;
+        let rows = parse_sql_values_rows(sql);
+        assert_eq!(rows.len(), 1);
+        let cells = &rows[0];
+        // Latest-mode id is the FNV hash of just the URI (no revision
+        // suffix) so successive sweeps overwrite the same row via
+        // `REPLACE INTO`.
+        assert_eq!(
+            cells[0].parse::<u64>().unwrap(),
+            manticore_doc_id("sirix://docs/manuals/42", None)
+        );
+        assert_eq!(cells[1], "sirix://docs/manuals/42");
+        // Latest-mode still emits `_valid_from`/`_valid_to` columns
+        // (the DDL declares them unconditionally so a corpus can flip
+        // between retention modes without a schema migration). Latest-
+        // mode uses the "0 = no interval" sentinel for both.
+        assert_eq!(cells[7], "0");
+        assert_eq!(cells[8], "0");
     }
 
     // -----------------------------------------------------------------
@@ -2839,17 +3178,21 @@ mod tests {
         run(&[entry], &http, &sirix, &sink);
 
         let posts = http.posts.borrow();
-        let line = posts[0].1.trim_end_matches('\n');
-        let v: JsonValue = serde_json::from_str(line).unwrap();
-        let doc = &v["replace"]["doc"];
-        // Body text goes on the wire under `text` — Manticore indexes
-        // it, DDL `stored='0'` keeps it out of `_source`.
-        assert_eq!(doc["text"], JsonValue::String("widget spec sheet".into()));
-        // The pre-memo-correction key `body` is no longer emitted.
+        let sql = &posts[0].1;
+        // Body text lands in the `\`text\`` column (position 4 in
+        // `manticore_replace_sql`'s column order). The pre-memo
+        // correction column `body` is not declared in the DDL and is
+        // not emitted here — the SQL statement must not name it.
         assert!(
-            doc.get("body").is_none(),
-            "sweep must not emit `body` field: {doc}"
+            sql.contains("`text`"),
+            "REPLACE must list `text` column: {sql}"
         );
+        assert!(
+            !sql.to_ascii_uppercase().contains(" BODY,"),
+            "sweep must not emit `body` column: {sql}"
+        );
+        let rows = parse_sql_values_rows(sql);
+        assert_eq!(rows[0][4], "widget spec sheet");
     }
 
     /// Retention=all also uses `text` for every revision — the memo
@@ -2868,18 +3211,12 @@ mod tests {
         run(&[entry], &http, &sirix, &sink);
 
         let posts = http.posts.borrow();
-        let ndjson = &posts[0].1;
-        for line in ndjson.lines() {
-            let v: JsonValue = serde_json::from_str(line).unwrap();
-            let doc = &v["replace"]["doc"];
-            assert!(
-                doc.get("text").is_some(),
-                "every retention_all row must carry `text`: {doc}"
-            );
-            assert!(
-                doc.get("body").is_none(),
-                "retention_all rows must not emit `body`: {doc}"
-            );
+        let sql = &posts[0].1;
+        assert!(sql.contains("`text`"));
+        assert!(!sql.to_ascii_uppercase().contains(" BODY,"));
+        let rows = parse_sql_values_rows(sql);
+        for r in &rows {
+            assert!(!r[4].is_empty(), "every row must carry a text body: {r:?}");
         }
     }
 
@@ -2994,21 +3331,21 @@ mod tests {
         assert_eq!(r.errors, 0);
 
         // The wire body should carry rev4 and rev5 only — not rev1/2/3.
+        // Ids are the numeric `manticore_doc_id(uri, Some(rev))` hashes
+        // (SQL REPLACE via `/cli_json` — Manticore's /bulk rejects the
+        // host's application/json Content-Type).
         let posts = http.posts.borrow();
         assert_eq!(posts.len(), 1);
-        let ids: Vec<String> = posts[0]
-            .1
-            .lines()
-            .map(|l| {
-                let v: JsonValue = serde_json::from_str(l).unwrap();
-                v["replace"]["id"].as_str().unwrap().to_string()
-            })
+        let rows = parse_sql_values_rows(&posts[0].1);
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|c| c[0].parse::<u64>().unwrap())
             .collect();
         assert_eq!(
             ids,
             vec![
-                "sirix://docs/manuals/42@rev4".to_string(),
-                "sirix://docs/manuals/42@rev5".to_string(),
+                manticore_doc_id("sirix://docs/manuals/42", Some(4)),
+                manticore_doc_id("sirix://docs/manuals/42", Some(5)),
             ]
         );
     }
@@ -3042,23 +3379,16 @@ mod tests {
 
         let posts = http.posts.borrow();
         assert_eq!(posts.len(), 1);
-        let ids: Vec<String> = posts[0]
-            .1
-            .lines()
-            .map(|l| {
-                let v: JsonValue = serde_json::from_str(l).unwrap();
-                v["replace"]["id"].as_str().unwrap().to_string()
-            })
+        let rows = parse_sql_values_rows(&posts[0].1);
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|c| c[0].parse::<u64>().unwrap())
             .collect();
         assert_eq!(
             ids,
-            vec![
-                "sirix://docs/manuals/42@rev6".to_string(),
-                "sirix://docs/manuals/42@rev7".to_string(),
-                "sirix://docs/manuals/42@rev8".to_string(),
-                "sirix://docs/manuals/42@rev9".to_string(),
-                "sirix://docs/manuals/42@rev10".to_string(),
-            ]
+            (6..=10u64)
+                .map(|rev| manticore_doc_id("sirix://docs/manuals/42", Some(rev)))
+                .collect::<Vec<u64>>()
         );
     }
 
@@ -3127,16 +3457,21 @@ mod tests {
         );
         assert_eq!(r1.deleted, 1, "rev1 aged out; sweep must delete it from Manticore");
         assert_eq!(r1.inserted, 0);
-        // The wire body of the delete carries the composite id.
+        // The wire body of the delete carries the composite numeric
+        // id (Manticore /bulk rejects string ids). Composite id is
+        // `manticore_doc_id(uri, Some(rev))` so retention modes'
+        // per-revision inserts and deletes map to the same id. Route
+        // is SQL DELETE via `/cli_json` (see `manticore_delete_sql`).
         let posts = http1.posts.borrow();
-        let delete_line = posts
+        let delete_body = posts
             .iter()
-            .flat_map(|(_, body)| body.lines())
-            .find(|line| line.contains("\"delete\""))
-            .expect("delete line present");
+            .find(|(_, body)| body.to_ascii_uppercase().contains("DELETE FROM"))
+            .map(|(_, body)| body.clone())
+            .expect("delete POST present");
+        let rev1_id = manticore_doc_id("sirix://docs/manuals/42", Some(1));
         assert!(
-            delete_line.contains("sirix://docs/manuals/42@rev1"),
-            "delete wire body missing composite id: {delete_line}"
+            delete_body.contains(&rev1_id.to_string()),
+            "delete SQL missing numeric composite id: {delete_body}"
         );
         // And the tracker row for rev1 is gone.
         let tracker_rows = sink.rows.borrow();
@@ -3196,21 +3531,26 @@ mod tests {
         assert_eq!(r1.unchanged, 1, "rev3 was already in the tail window");
         assert_eq!(r1.deleted, 2, "revs 1 and 2 fell out of the tail window");
 
-        // Wire body carries deletes for rev1 and rev2 specifically.
+        // Wire body carries deletes for rev1 and rev2 specifically,
+        // keyed by the numeric composite ids `manticore_doc_id` emits.
+        // Route is SQL DELETE via `/cli_json` (see
+        // `manticore_delete_sql`).
         let posts = http1.posts.borrow();
-        let combined: String = posts
+        let delete_sql: String = posts
             .iter()
-            .flat_map(|(_, body)| body.lines())
-            .filter(|line| line.contains("\"delete\""))
+            .filter(|(_, body)| body.to_ascii_uppercase().contains("DELETE FROM"))
+            .map(|(_, body)| body.clone())
             .collect::<Vec<_>>()
             .join("\n");
+        let rev1_id = manticore_doc_id("sirix://docs/manuals/42", Some(1));
+        let rev2_id = manticore_doc_id("sirix://docs/manuals/42", Some(2));
         assert!(
-            combined.contains("sirix://docs/manuals/42@rev1"),
-            "expected rev1 delete: {combined}"
+            delete_sql.contains(&rev1_id.to_string()),
+            "expected rev1 numeric-id in DELETE SQL: {delete_sql}"
         );
         assert!(
-            combined.contains("sirix://docs/manuals/42@rev2"),
-            "expected rev2 delete: {combined}"
+            delete_sql.contains(&rev2_id.to_string()),
+            "expected rev2 numeric-id in DELETE SQL: {delete_sql}"
         );
     }
 
@@ -3246,7 +3586,28 @@ mod tests {
                 .borrow_mut()
                 .push((url.to_string(), body.to_string()));
             if url.ends_with("/cli_json") {
-                Ok(self.ddl_response.borrow().clone())
+                // Distinguish DDL (`CREATE ...` / `DROP ...`) from
+                // data (`REPLACE INTO ...` / `DELETE FROM ...`) so
+                // tests can pin a rejection to one or the other via
+                // `ddl_response` / `bulk_response` respectively. Both
+                // ride the `/cli_json` endpoint now (SQL route — the
+                // host import's `application/json` Content-Type is
+                // rejected by Manticore's `/bulk`).
+                let up = body.trim_start().to_ascii_uppercase();
+                if up.starts_with("CREATE ") || up.starts_with("DROP ") {
+                    Ok(self.ddl_response.borrow().clone())
+                } else {
+                    // Data statement — mirror MockHttp's shape so
+                    // `manticore_ddl_response_ok` (now shared with the
+                    // data path) parses it cleanly. Callers who need
+                    // to inject a failure body set `bulk_response`.
+                    let resp = self.bulk_response.borrow().clone();
+                    if resp == r#"{"items":[],"errors":false}"# {
+                        Ok(r#"[{"total":1,"error":"","warning":""}]"#.to_string())
+                    } else {
+                        Ok(resp)
+                    }
+                }
             } else {
                 Ok(self.bulk_response.borrow().clone())
             }
@@ -3280,6 +3641,65 @@ mod tests {
     }
 
     #[test]
+    fn manticore_ddl_carries_every_bulk_body_column() {
+        // Regression guard for the wave-15 root cause: Manticore rejects
+        // `/bulk` inserts that reference columns not declared at CREATE
+        // TABLE time with `unknown column: '<name>'` (409). The pre-fix
+        // DDL declared only `title`, `text`, `subject`, `_valid_from`,
+        // `_valid_to` — but `build_bulk_body` also emits `_uri`, `_rev`,
+        // `content_type`, so the very first insert 409'd and the
+        // retention=all mirror never materialised. This test asserts the
+        // DDL keeps up with the payload shape.
+        let ddl = manticore_create_table_ddl("manuals");
+        // Build a synthetic mirror with every optional column populated
+        // and enumerate its `_source` keys — every one MUST also appear
+        // in the DDL.
+        let mirror = DocMirror {
+            uri: "sirix://docs/manuals/42".into(),
+            revision: 3,
+            body: "hello".into(),
+            content_type: "application/json".into(),
+            hash: "deadbeef".into(),
+            valid_from: Some(1_700_000_000),
+            valid_to: Some(1_700_000_001),
+        };
+        let body = build_bulk_body("manuals", std::slice::from_ref(&mirror));
+        let line = body.trim_end_matches('\n');
+        let parsed: JsonValue = serde_json::from_str(line).unwrap();
+        let doc = parsed["replace"]["doc"].as_object().unwrap();
+        for key in doc.keys() {
+            assert!(
+                ddl.contains(key.as_str()),
+                "bulk-body column `{key}` is missing from DDL — Manticore \
+                 rejects the /bulk POST with `unknown column: '{key}'`. \
+                 Full DDL: {ddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn manticore_doc_id_is_stable_and_distinct_per_composite() {
+        // Same input → same id → `replace` overwrites the same row on
+        // successive sweeps (idempotent).
+        let a = manticore_doc_id("sirix://docs/manuals/42", Some(3));
+        let b = manticore_doc_id("sirix://docs/manuals/42", Some(3));
+        assert_eq!(a, b);
+        // Different rev → different id so multiple revisions of the
+        // same URI coexist under distinct Manticore rows.
+        let c = manticore_doc_id("sirix://docs/manuals/42", Some(4));
+        assert_ne!(a, c);
+        // Latest-mode (rev=None) yields yet another id shape so a
+        // corpus can flip between retention modes without either
+        // overwriting the other's rows.
+        let d = manticore_doc_id("sirix://docs/manuals/42", None);
+        assert_ne!(a, d);
+        assert_ne!(c, d);
+        // Non-zero — 0 is the auto-assign sentinel in some `/bulk`
+        // configurations; the helper bumps a 0 hash to 1 defensively.
+        assert_ne!(a, 0);
+    }
+
+    #[test]
     fn cli_json_url_appends_suffix_idempotently() {
         assert_eq!(
             cli_json_url("http://localhost:9308"),
@@ -3301,7 +3721,9 @@ mod tests {
     fn sweep_issues_ddl_post_before_first_bulk_post() {
         // Rebuild `hash_prevents_reinsert_of_unchanged_doc`'s shape
         // but with a bridge that DOES record `/cli_json` so we can
-        // assert on the ordering.
+        // assert on the ordering. Both DDL and data POSTs go through
+        // `/cli_json` now (SQL route — Manticore's `/bulk` rejects the
+        // host import's `application/json` Content-Type).
         let entry = cfg("manuals");
         let sirix = MockSirix {
             rows: RefCell::new(vec![SirixDocRow {
@@ -3318,10 +3740,10 @@ mod tests {
         assert_eq!(r.errors, 0);
         assert_eq!(r.inserted, 1);
         let posts = http.posts.borrow();
-        // At least two POSTs: DDL first (index 0), then bulk (index 1).
+        // At least two POSTs: DDL first (index 0), then data (index 1).
         assert!(
             posts.len() >= 2,
-            "expected DDL + bulk POSTs, got {}: {:?}",
+            "expected DDL + data POSTs, got {}: {:?}",
             posts.len(),
             posts
         );
@@ -3335,13 +3757,17 @@ mod tests {
             "DDL body must be the CREATE TABLE: {}",
             posts[0].1
         );
-        // The very next POST is the `/bulk` NDJSON insert.
+        // The very next POST is the SQL REPLACE via `/cli_json`.
         assert!(
-            posts[1].0.ends_with("/bulk"),
-            "bulk POST must follow the DDL: {}",
+            posts[1].0.ends_with("/cli_json"),
+            "data POST must also target /cli_json: {}",
             posts[1].0
         );
-        assert!(posts[1].1.contains("\"replace\""));
+        assert!(
+            posts[1].1.to_ascii_uppercase().contains("REPLACE INTO"),
+            "data POST must be a REPLACE INTO statement: {}",
+            posts[1].1
+        );
     }
 
     #[test]
@@ -3433,11 +3859,11 @@ mod tests {
         run(&[entry], &http, &sirix, &sink);
 
         let posts = http.posts.borrow();
-        let line = posts[0].1.trim_end_matches('\n');
-        let v: JsonValue = serde_json::from_str(line).unwrap();
-        assert_eq!(
-            v["replace"]["doc"]["subject"],
-            JsonValue::String("sirix://docs/manuals/42".into())
-        );
+        let sql = &posts[0].1;
+        let rows = parse_sql_values_rows(sql);
+        assert_eq!(rows.len(), 1);
+        // `subject` column is position 5 in `manticore_replace_sql`'s
+        // column order.
+        assert_eq!(rows[0][5], "sirix://docs/manuals/42");
     }
 }

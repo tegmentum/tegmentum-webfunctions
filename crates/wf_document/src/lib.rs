@@ -664,7 +664,96 @@ fn normalize_at_time(raw: &str) -> Result<AtTime, String> {
     if let Ok(epoch) = trimmed.parse::<i64>() {
         return Ok(AtTime::Epoch(epoch));
     }
+    // ISO 8601 (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) → epoch milliseconds.
+    // `_valid_from` is stored as a bigint of Sirix's commit timestamp
+    // in `Instant::toEpochMilli()` units (see wf_canonicalize
+    // `document_sweep::build_diff_all`). A raw ISO string would land
+    // in Manticore's search body as a JSON string and get rejected
+    // with `unsupported filter type 'string' on attribute
+    // '_valid_from'` (Manticore 28.4.4 rejects string-typed range
+    // predicates on numeric columns). Parsing to millis here keeps
+    // the query filter numeric and matches the sweep's stored units.
+    if let Some(ms) = parse_iso8601_to_millis(trimmed) {
+        return Ok(AtTime::Epoch(ms));
+    }
     Ok(AtTime::Iso(trimmed.to_string()))
+}
+
+/// Parse an ISO 8601 date-time in `YYYY-MM-DDTHH:MM:SS[.fff]Z` (or
+/// `... [+-]HH:MM`) shape into milliseconds since epoch. Returns
+/// `None` for shapes this minimal parser doesn't recognise —
+/// `normalize_at_time` falls back to `AtTime::Iso` on `None` so the
+/// legacy path is preserved for any hypothetical operator that has
+/// string-typed timestamp columns.
+fn parse_iso8601_to_millis(s: &str) -> Option<i64> {
+    // Accept only the subset the URL-sugar rewrite emits and the JS
+    // `toISOString()` shape produces. Anything more exotic is left to
+    // the ISO fallback path.
+    // Split date from time.
+    let (date_part, time_part) = match s.find('T') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        // Date-only (YYYY-MM-DD): treat as midnight UTC.
+        None => (s, "00:00:00Z"),
+    };
+    let date_parts: Vec<&str> = date_part.split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let year: i64 = date_parts[0].parse().ok()?;
+    let month: i64 = date_parts[1].parse().ok()?;
+    let day: i64 = date_parts[2].parse().ok()?;
+    // Split trailing zone (Z, +HH:MM, -HH:MM). We only honour Z here;
+    // any explicit offset shifts the epoch reading accordingly.
+    let (hms_part, offset_minutes): (&str, i64) = if let Some(stripped) = time_part.strip_suffix('Z') {
+        (stripped, 0)
+    } else if let Some(idx) = time_part.rfind(['+', '-']) {
+        let sign = if &time_part[idx..idx + 1] == "+" { 1 } else { -1 };
+        let off = &time_part[idx + 1..];
+        let (oh, om) = off.split_once(':').unwrap_or((off, "0"));
+        let oh: i64 = oh.parse().ok()?;
+        let om: i64 = om.parse().ok()?;
+        (&time_part[..idx], sign * (oh * 60 + om))
+    } else {
+        (time_part, 0)
+    };
+    // hms may include a fractional second: HH:MM:SS.fff
+    let (hms, frac) = match hms_part.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (hms_part, ""),
+    };
+    let hms_parts: Vec<&str> = hms.split(':').collect();
+    if hms_parts.len() < 2 {
+        return None;
+    }
+    let hour: i64 = hms_parts[0].parse().ok()?;
+    let minute: i64 = hms_parts[1].parse().ok()?;
+    let second: i64 = if hms_parts.len() >= 3 {
+        hms_parts[2].parse().ok()?
+    } else {
+        0
+    };
+    let frac_ms: i64 = if frac.is_empty() {
+        0
+    } else {
+        // Truncate/pad to 3 digits.
+        let mut buf = String::from(frac);
+        while buf.len() < 3 {
+            buf.push('0');
+        }
+        buf.truncate(3);
+        buf.parse().ok()?
+    };
+    // Days from civil (year, month, day) → days since 1970-01-01.
+    // Howard Hinnant's algorithm, ported to i64.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days_since_epoch = era * 146_097 + doe - 719_468;
+    let seconds = days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
+    let millis = seconds * 1_000 + frac_ms;
+    Some(millis - offset_minutes * 60 * 1_000)
 }
 
 fn manticore_url(backend_url: &str) -> String {
@@ -711,16 +800,41 @@ mod tests {
     }
 
     #[test]
-    fn normalize_at_time_iso_8601_verbatim() {
+    fn normalize_at_time_iso_8601_converts_to_epoch_millis() {
+        // Regression guard: `_valid_from` is stored by the sweep as a
+        // bigint of Sirix's commit_timestamp millis, and Manticore
+        // rejects string-typed range predicates on numeric columns
+        // (`unsupported filter type 'string' on attribute
+        // '_valid_from'`). The guest MUST convert ISO 8601 to millis
+        // before it goes on the wire.
         assert_eq!(
             normalize_at_time("2026-01-01T00:00:00Z").unwrap(),
-            AtTime::Iso("2026-01-01T00:00:00Z".into())
+            AtTime::Epoch(1_767_225_600_000)
+        );
+        assert_eq!(
+            normalize_at_time("1970-01-01T00:00:00Z").unwrap(),
+            AtTime::Epoch(0)
+        );
+        // Fractional seconds.
+        assert_eq!(
+            normalize_at_time("2026-01-01T00:00:00.500Z").unwrap(),
+            AtTime::Epoch(1_767_225_600_500)
+        );
+        // Explicit `+00:00` offset also lands in UTC.
+        assert_eq!(
+            normalize_at_time("2026-01-01T00:00:00+00:00").unwrap(),
+            AtTime::Epoch(1_767_225_600_000)
         );
     }
 
     #[test]
     fn normalize_at_time_trims_whitespace() {
-        assert_eq!(normalize_at_time("  2026-01-01  ").unwrap(), AtTime::Iso("2026-01-01".into()));
+        // Date-only (no `T` component) — treat as UTC midnight, epoch
+        // millis.
+        assert_eq!(
+            normalize_at_time("  2026-01-01  ").unwrap(),
+            AtTime::Epoch(1_767_225_600_000)
+        );
     }
 
     #[test]
