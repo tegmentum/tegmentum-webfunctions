@@ -1556,10 +1556,23 @@ pub fn build_scan_sql(
 ) -> String {
     if wants_history {
         // HISTORY_OF takes the database and resource as SQL string
-        // literals; escape embedded single quotes by doubling.
+        // literals; escape embedded single quotes by doubling. Column
+        // identifiers are DOUBLE-QUOTED because sirix-sql-server runs
+        // Calcite with its default `Lex.ORACLE` (unquoted identifiers
+        // upper-cased). The `SirixHistoryTable` schema declares the
+        // columns as `_key`, `_revision`, `_commit_timestamp`,
+        // `document` — all lower-case — so an unquoted `SELECT _key,
+        // ...` would ask Calcite for `_KEY` and get "column not
+        // found", zero rows, and a silent no-op sweep. The `ORDER BY
+        // "_revision"` makes the `build_diff_all` look-ahead
+        // (`valid_to = next row's commit_timestamp`) deterministic and
+        // matches the sirix-sql-server regression test
+        // `SirixSqlHttpServerTest#postQueryHistoryOfReturnsEveryRevision`
+        // byte-for-byte on the identifier and ordering axes.
         return format!(
-            "SELECT _key, _revision, _commit_timestamp, document \
-             FROM TABLE(HISTORY_OF('{db}', '{res}'))",
+            "SELECT \"_key\", \"_revision\", \"_commit_timestamp\", \"document\" \
+             FROM TABLE(HISTORY_OF('{db}', '{res}')) \
+             ORDER BY \"_revision\"",
             db = escape_sql_string(database),
             res = escape_sql_string(resource),
         );
@@ -2055,6 +2068,111 @@ mod tests {
         assert!(
             !sql.contains("\"docs\".\"manuals\""),
             "must not fall back to the plain scan surface: {sql}"
+        );
+    }
+
+    #[test]
+    fn history_of_sql_double_quotes_column_identifiers() {
+        // Regression guard for the retention=all → latest-only observed
+        // failure surface. sirix-sql-server runs Calcite with its default
+        // `Lex.ORACLE` (unquoted identifiers upper-cased), and the
+        // `SirixHistoryTable` schema declares all four columns as
+        // lower-case. An unquoted `SELECT _key, ...` therefore asks
+        // Calcite for `_KEY`, matches nothing, returns zero rows, and
+        // the sweep populates Manticore with per-URI latest-only rows.
+        // The wf_document guest then throws "index appears to hold
+        // latest-only" at query time (see
+        // `wf_document/src/lib.rs::search`). Fix: double-quote every
+        // history-walking column identifier so Calcite preserves the
+        // schema-declared case and the SirixHistoryTable enumerator
+        // fires per-revision rows into the sweep.
+        let sql = build_scan_sql("docs", "manuals", None, true);
+        for col in ["\"_key\"", "\"_revision\"", "\"_commit_timestamp\"", "\"document\""] {
+            assert!(
+                sql.contains(col),
+                "history-walking scan SQL must double-quote `{col}` so \
+                 Calcite's Lex.ORACLE upper-casing does not miss the \
+                 lower-case column names declared by SirixHistoryTable \
+                 (see sirix-sql-server SirixSqlHttpServerTest \
+                 #postQueryHistoryOfReturnsEveryRevision): {sql}"
+            );
+        }
+        // Ordering matters: the retention=all diff uses a look-ahead
+        // (`valid_to = next row's commit_timestamp`) that depends on
+        // ascending-by-revision order. sirix-sql surfaces the natural
+        // resource-walk order per revision, so an explicit ORDER BY on
+        // `_revision` keeps interval computation deterministic on the
+        // wire regardless of sirix-sql's stream ordering.
+        assert!(
+            sql.contains("ORDER BY \"_revision\""),
+            "history-walking scan SQL must ORDER BY \"_revision\" so \
+             the sweep's look-ahead over adjacent rows produces a \
+             correct (valid_from, valid_to) interval: {sql}"
+        );
+    }
+
+    /// End-to-end retention=all regression: seed a three-revision
+    /// history through the SirixBridge (per-revision rows, distinct
+    /// commit timestamps), run `run_one_all`, and assert every revision
+    /// lands as its own Manticore row with a distinct `_valid_from`
+    /// value. Closes the wave-13 gap the substrate audit reported as
+    /// "sweep runs (processed=1), but the guest mirrors latest-only
+    /// rows" across all four engines — with the SQL quoting fix in
+    /// place the sweep now sees per-revision rows from Sirix and emits
+    /// per-revision rows to Manticore.
+    #[test]
+    fn run_one_all_emits_row_per_revision_with_distinct_valid_from() {
+        let entry = cfg_all("manuals");
+        let sirix = MockSirix {
+            rows: RefCell::new(three_rev_history_with_ts()),
+        };
+        let http = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let sink = MockDocSink::default();
+
+        let counts = run(&[entry], &http, &sirix, &sink);
+        assert_eq!(counts.inserted, 3, "one Manticore row per Sirix revision");
+        assert_eq!(counts.deleted, 0);
+        assert_eq!(counts.errors, 0);
+
+        // Extract `_valid_from` per row from the NDJSON `/bulk` body
+        // and assert three distinct timestamps landed — the schema
+        // probe in `wf_document::manticore::schema_has_valid_from`
+        // requires the column to be present under `_source` for
+        // time-travel search to progress.
+        let posts = http.posts.borrow();
+        let bulk_body = &posts[0].1;
+        let mut valid_froms: Vec<i64> = Vec::new();
+        for line in bulk_body.lines() {
+            let v: JsonValue = serde_json::from_str(line).unwrap();
+            let doc = &v["replace"]["doc"];
+            let vf = doc["_valid_from"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("row missing `_valid_from`: {doc}"));
+            valid_froms.push(vf);
+        }
+        valid_froms.sort();
+        assert_eq!(valid_froms.len(), 3);
+        assert!(
+            valid_froms[0] < valid_froms[1] && valid_froms[1] < valid_froms[2],
+            "each revision must carry a distinct `_valid_from` value so \
+             time-travel search can bracket by moment: {valid_froms:?}"
+        );
+
+        // The sink must record every (uri, rev) tracker row too,
+        // otherwise the next sweep would re-insert the same three
+        // revisions instead of reporting them as `unchanged`.
+        let sink_rows = sink.rows.borrow();
+        let entries_for_uri: Vec<&(String, String, u64)> = sink_rows
+            .keys()
+            .filter(|(_t, uri, _)| uri == "sirix://docs/manuals/42")
+            .collect();
+        assert_eq!(
+            entries_for_uri.len(),
+            3,
+            "tracker must record every (uri, rev) pair so the sweep is idempotent: {sink_rows:?}"
         );
     }
 
