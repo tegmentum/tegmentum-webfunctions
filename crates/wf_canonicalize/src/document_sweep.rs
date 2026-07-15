@@ -497,6 +497,11 @@ fn run_one<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
     let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
     sink.ensure_doc_table(&table)?;
 
+    // 1b. Ensure the Manticore-side data table exists before any
+    //     `/bulk` POST — see `ensure_manticore_table` for the DDL
+    //     shape rationale. Loud failure per wave-8 (`/cli_json`).
+    ensure_manticore_table(http, &entry.search_backend, &entry.search_index)?;
+
     // 2. Load the previously-known docs. Latest-mode keys are
     //    `(uri, 0)` — projected below to the uri-only view `build_diff`
     //    expects. `full_scan` empties the known-map so every doc
@@ -637,6 +642,8 @@ fn run_one_all<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
 ) -> Result<SweepResult, String> {
     let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
     sink.ensure_doc_table(&table)?;
+    // Manticore-side data table — see `ensure_manticore_table`.
+    ensure_manticore_table(http, &entry.search_backend, &entry.search_index)?;
 
     let known: HashMap<(String, u64), KnownDoc> = if options.full_scan {
         // Backfill mode — pretend we've seen nothing so every rev
@@ -748,6 +755,8 @@ fn run_one_window<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
 ) -> Result<SweepResult, String> {
     let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
     sink.ensure_doc_table(&table)?;
+    // Manticore-side data table — see `ensure_manticore_table`.
+    ensure_manticore_table(http, &entry.search_backend, &entry.search_index)?;
 
     let known: HashMap<(String, u64), KnownDoc> = if options.full_scan {
         HashMap::new()
@@ -810,6 +819,8 @@ fn run_one_tail<H: HttpBridge, R: SirixBridge, S: DocSinkBridge>(
 ) -> Result<SweepResult, String> {
     let table = format!("wf_doc_keys_{}", sanitize_index_name(&entry.name));
     sink.ensure_doc_table(&table)?;
+    // Manticore-side data table — see `ensure_manticore_table`.
+    ensure_manticore_table(http, &entry.search_backend, &entry.search_index)?;
 
     let known: HashMap<(String, u64), KnownDoc> = if options.full_scan {
         HashMap::new()
@@ -1290,6 +1301,17 @@ pub fn build_bulk_body(index: &str, docs: &[DocMirror]) -> String {
             "content_type".into(),
             J::String(doc.content_type.clone()),
         );
+        // `subject` = the sirix:// doc URI. Populated so the
+        // substrate's `pick_doc` heuristic (oxigraph-wf
+        // `wf_call.rs::pick_doc` and the parallel qlever / jena / rdf4j
+        // impls) promotes a URI-shaped identifier into `?doc` rather
+        // than falling through to Manticore's numeric implicit `_id`.
+        // Matches the manticore_seed shape used by the hand-declared
+        // federated cases (`document_federated.toml` /
+        // `federation_heterogeneous.toml`) so managed-mode's
+        // sweep-populated Manticore rows round-trip through the same
+        // `pick_doc` path as those cases.
+        doc_obj.insert("subject".into(), J::String(doc.uri.clone()));
         // Retention=all rows carry validity intervals + a
         // rev-qualified id. Latest-mode rows keep the bare URI as
         // `_id`, matching v0.2 exactly.
@@ -1351,6 +1373,129 @@ pub fn bulk_url(backend_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/bulk")
+    }
+}
+
+/// Idempotent Manticore `/cli_json` URL construction — mirrors
+/// `bulk_url`'s shape for the DDL POST target. `/cli_json` (not the
+/// plain `/cli`) is what wave-8 landed on so DDL failures come back
+/// as a structured `{"error":"..."}` payload rather than silently
+/// returning `"Query OK"` on invalid syntax (see wf-conformance commit
+/// `4c6c972`).
+pub fn cli_json_url(backend_url: &str) -> String {
+    let trimmed = backend_url.trim_end_matches('/');
+    if trimmed.ends_with("/cli_json") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/cli_json")
+    }
+}
+
+/// Build the Manticore-side data-table DDL the sweep needs before its
+/// first `/bulk` POST on a fresh index. Managed-mode cases don't
+/// declare `manticore_seed` (the sweep is what populates Manticore),
+/// so nothing else in the pipeline creates this table — Manticore
+/// rejects the very first insert with `unknown local table(s)` unless
+/// the sweep ensures it up front.
+///
+/// Column shape mirrors what an operator would hand-declare for a
+/// `manticore_seed` on the same corpus (see wf-conformance
+/// `document_federated.toml`'s `create_table_ddl`):
+///
+///   * `title text` — future body-field projection (nullable today;
+///     the sweep does not extract per-field titles from the Sirix body
+///     yet, so this column is present-but-empty on v0.2 rows and gets
+///     populated once the extract lands).
+///   * `` `text` text indexed `` — tokens-only body storage. Backticks
+///     because `text` is the type keyword. `indexed` (not
+///     `stored='0'`) — the wave-8 `4c6c972` fix showed Manticore 28.4.4
+///     rejects the `stored='0'` attribute syntax with a P03 parse
+///     error and `text indexed` gives the same tokens-only,
+///     no-raw-body-stored behaviour.
+///   * `subject string` — URI-shaped doc identifier. The sweep emits
+///     `subject = <sirix://...>` in the `/bulk` payload so the
+///     substrate's `pick_doc` heuristic promotes it to `?doc` (see
+///     oxigraph-wf `wf_call.rs::pick_doc` and the parallel qlever /
+///     jena / rdf4j implementations). Same reason the federated
+///     hand-declared DDL includes `subject`.
+///   * `_valid_from bigint`, `_valid_to bigint` — retention=all /
+///     window / tail rows carry a validity interval; latest-mode
+///     rows leave these null. Declared unconditionally so a corpus
+///     can flip between retention modes without a schema migration.
+///
+/// No `id` column: Manticore's implicit `id bigint` primary key would
+/// collide (a per-doc `id` field in `/bulk` payloads yields the 409
+/// "column 'id' specified twice" that wave-8 diagnosed).
+///
+/// `CREATE TABLE IF NOT EXISTS` — the sweep runs on every wf:call and
+/// the table survives across invocations; the guard keeps
+/// non-first-run sweeps a no-op on the DDL step.
+pub fn manticore_create_table_ddl(index: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {index}(\
+         title text, \
+         `text` text indexed, \
+         subject string, \
+         _valid_from bigint, \
+         _valid_to bigint)"
+    )
+}
+
+/// POST the data-table DDL to Manticore's `/cli_json` endpoint.
+/// Returns `Ok(())` on both "table just created" and "table already
+/// exists"; returns `Err` on any structured error the endpoint
+/// reports (wave-8 loud-failure posture).
+pub fn ensure_manticore_table<H: HttpBridge>(
+    http: &H,
+    backend_url: &str,
+    index: &str,
+) -> Result<(), String> {
+    let url = cli_json_url(backend_url);
+    let ddl = manticore_create_table_ddl(index);
+    let response = http
+        .post_json(&url, &ddl)
+        .map_err(|e| format!("manticore CREATE TABLE POST /cli_json: {e}"))?;
+    manticore_ddl_response_ok(&response)
+}
+
+/// Parse the `/cli_json` DDL response. Manticore 28.4.4 returns:
+///   * success  → `[{"total":0,"error":"","warning":""}]`
+///   * failure  → `{"error":"P03: syntax error, ..."}` or an array
+///                whose first element carries a non-empty `error`.
+/// Anything with a non-empty `error` string (top-level object or
+/// first-array-element) fails this call — mirrors the wave-8
+/// `manticore.rs::create_table` parser in `wf-conformance`.
+///
+/// If the response body is not valid JSON we surface it verbatim in
+/// the error string so operators can see what Manticore actually
+/// said (older Manticore builds that don't ship `/cli_json` return
+/// an HTML 404, for example; that's worth seeing raw).
+fn manticore_ddl_response_ok(body: &str) -> Result<(), String> {
+    let parsed: JsonValue = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "manticore /cli_json response is not JSON ({e}): {body}"
+            ));
+        }
+    };
+    let err_msg = match &parsed {
+        JsonValue::Object(_) => parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        JsonValue::Array(items) => items
+            .first()
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        _ => None,
+    };
+    match err_msg {
+        Some(msg) => Err(format!("manticore CREATE TABLE failed: {msg}")),
+        None => Ok(()),
     }
 }
 
@@ -1605,11 +1750,24 @@ mod tests {
 
     #[derive(Default)]
     struct MockHttp {
-        posts: RefCell<Vec<(String, String)>>, // (url, body)
+        posts: RefCell<Vec<(String, String)>>, // (url, body) — bulk only
         response: String,
     }
     impl HttpBridge for MockHttp {
         fn post_json(&self, url: &str, body: &str) -> Result<String, String> {
+            // The sweep issues a Manticore CREATE TABLE POST against
+            // `/cli_json` before its first `/bulk` POST. That's
+            // orthogonal to what the per-batch bulk-body assertions
+            // exercise, so keep `posts` scoped to bulk POSTs only and
+            // hand back a well-formed `/cli_json` success payload for
+            // the DDL — matches Manticore 28.4.4's shape for a happy
+            // `CREATE TABLE IF NOT EXISTS`, per wave-8
+            // (`wf-conformance` commit `4c6c972`).
+            if url.ends_with("/cli_json") {
+                return Ok(
+                    r#"[{"total":0,"error":"","warning":""}]"#.to_string(),
+                );
+            }
             self.posts
                 .borrow_mut()
                 .push((url.to_string(), body.to_string()));
@@ -2018,14 +2176,22 @@ mod tests {
         assert_eq!(r0.deleted, 0);
         assert_eq!(r0.errors, 0);
         {
+            // Filter out the Manticore CREATE TABLE POST that lands
+            // on `/cli_json` before every `/bulk` — the shared TCP
+            // mock server records all bodies regardless of path, so
+            // bulk-body assertions filter for NDJSON (starts with `{`).
             let bodies = manticore_bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 1);
+            let bulk_bodies: Vec<&String> = bodies
+                .iter()
+                .filter(|b| b.trim_start().starts_with('{'))
+                .collect();
+            assert_eq!(bulk_bodies.len(), 1);
             assert!(
-                bodies[0].contains("sirix://docs/manuals/42"),
+                bulk_bodies[0].contains("sirix://docs/manuals/42"),
                 "wire body missing sirix URI: {}",
-                bodies[0]
+                bulk_bodies[0]
             );
-            assert!(bodies[0].contains("\"replace\""));
+            assert!(bulk_bodies[0].contains("\"replace\""));
         }
 
         // Commit a new doc to the "Sirix" mock.
@@ -2040,17 +2206,21 @@ mod tests {
         assert_eq!(r1.deleted, 0);
         {
             let bodies = manticore_bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 2);
+            let bulk_bodies: Vec<&String> = bodies
+                .iter()
+                .filter(|b| b.trim_start().starts_with('{'))
+                .collect();
+            assert_eq!(bulk_bodies.len(), 2);
             assert!(
-                bodies[1].contains("sirix://docs/manuals/99"),
+                bulk_bodies[1].contains("sirix://docs/manuals/99"),
                 "gen1 body missing new sirix URI: {}",
-                bodies[1]
+                bulk_bodies[1]
             );
             // Only the new doc, not the existing one.
             assert!(
-                !bodies[1].contains("sirix://docs/manuals/42"),
+                !bulk_bodies[1].contains("sirix://docs/manuals/42"),
                 "gen1 body should not re-insert existing doc: {}",
-                bodies[1]
+                bulk_bodies[1]
             );
         }
     }
@@ -2923,6 +3093,233 @@ mod tests {
         assert!(
             combined.contains("sirix://docs/manuals/42@rev2"),
             "expected rev2 delete: {combined}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Manticore CREATE TABLE (wave-10 fix)
+    // -----------------------------------------------------------------
+
+    /// A recording HTTP bridge that captures every POST (URL + body)
+    /// in-order without filtering — used by the tests below that need
+    /// to see the `/cli_json` DDL POST alongside the `/bulk` POST.
+    #[derive(Default)]
+    struct RecordingHttp {
+        posts: RefCell<Vec<(String, String)>>,
+        ddl_response: RefCell<String>,
+        bulk_response: RefCell<String>,
+    }
+    impl RecordingHttp {
+        fn new() -> Self {
+            Self {
+                posts: RefCell::new(Vec::new()),
+                ddl_response: RefCell::new(
+                    r#"[{"total":0,"error":"","warning":""}]"#.into(),
+                ),
+                bulk_response: RefCell::new(
+                    r#"{"items":[],"errors":false}"#.into(),
+                ),
+            }
+        }
+    }
+    impl HttpBridge for RecordingHttp {
+        fn post_json(&self, url: &str, body: &str) -> Result<String, String> {
+            self.posts
+                .borrow_mut()
+                .push((url.to_string(), body.to_string()));
+            if url.ends_with("/cli_json") {
+                Ok(self.ddl_response.borrow().clone())
+            } else {
+                Ok(self.bulk_response.borrow().clone())
+            }
+        }
+    }
+
+    #[test]
+    fn manticore_ddl_carries_expected_columns_and_index_name() {
+        let ddl = manticore_create_table_ddl("manuals");
+        // Idempotent — safe to run on every sweep.
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS manuals("));
+        // Backticked `text` — bare `text` is the type keyword and
+        // Manticore 28.4.4 P03-rejects it as a column name (wave-8).
+        assert!(ddl.contains("`text` text indexed"));
+        // `subject string` — populated by `build_bulk_body` so the
+        // substrate's `pick_doc` heuristic promotes the URI-shaped
+        // identifier into `?doc` on the return path.
+        assert!(ddl.contains("subject string"));
+        // Retention=all/window/tail interval columns.
+        assert!(ddl.contains("_valid_from bigint"));
+        assert!(ddl.contains("_valid_to bigint"));
+        // Explicitly NOT emitting `stored='0'` — Manticore 28.4.4 P03
+        // parse error (wave-8). `text indexed` gives equivalent
+        // tokens-only, no-raw-body-stored behavior.
+        assert!(!ddl.contains("stored"));
+        // Explicitly NOT emitting an `id` column — Manticore's
+        // implicit `id bigint` PK collides (409 "column 'id' specified
+        // twice" per wave-8).
+        assert!(!ddl.contains("id text"));
+        assert!(!ddl.contains(" id bigint"));
+    }
+
+    #[test]
+    fn cli_json_url_appends_suffix_idempotently() {
+        assert_eq!(
+            cli_json_url("http://localhost:9308"),
+            "http://localhost:9308/cli_json"
+        );
+        assert_eq!(
+            cli_json_url("http://localhost:9308/"),
+            "http://localhost:9308/cli_json"
+        );
+        // If the operator supplied a full `/cli_json` URL, don't
+        // double it up.
+        assert_eq!(
+            cli_json_url("http://localhost:9308/cli_json"),
+            "http://localhost:9308/cli_json"
+        );
+    }
+
+    #[test]
+    fn sweep_issues_ddl_post_before_first_bulk_post() {
+        // Rebuild `hash_prevents_reinsert_of_unchanged_doc`'s shape
+        // but with a bridge that DOES record `/cli_json` so we can
+        // assert on the ordering.
+        let entry = cfg("manuals");
+        let sirix = MockSirix {
+            rows: RefCell::new(vec![SirixDocRow {
+                node_key: "42".into(),
+                revision: 1,
+                body: "{\"title\":\"widget\"}".into(),
+                content_type: "application/json".into(),
+                commit_timestamp: None,
+            }]),
+        };
+        let http = RecordingHttp::new();
+        let sink = MockDocSink::default();
+        let r = run(&[entry], &http, &sirix, &sink);
+        assert_eq!(r.errors, 0);
+        assert_eq!(r.inserted, 1);
+        let posts = http.posts.borrow();
+        // At least two POSTs: DDL first (index 0), then bulk (index 1).
+        assert!(
+            posts.len() >= 2,
+            "expected DDL + bulk POSTs, got {}: {:?}",
+            posts.len(),
+            posts
+        );
+        assert!(
+            posts[0].0.ends_with("/cli_json"),
+            "first POST must be the DDL on `/cli_json`: {}",
+            posts[0].0
+        );
+        assert!(
+            posts[0].1.contains("CREATE TABLE IF NOT EXISTS manuals"),
+            "DDL body must be the CREATE TABLE: {}",
+            posts[0].1
+        );
+        // The very next POST is the `/bulk` NDJSON insert.
+        assert!(
+            posts[1].0.ends_with("/bulk"),
+            "bulk POST must follow the DDL: {}",
+            posts[1].0
+        );
+        assert!(posts[1].1.contains("\"replace\""));
+    }
+
+    #[test]
+    fn sweep_surfaces_manticore_ddl_failure_as_entry_error() {
+        // When Manticore 28.4.4 rejects a DDL statement, `/cli_json`
+        // returns `{"error":"P03: ..."}`. The sweep must NOT silently
+        // proceed to a `/bulk` POST — the whole entry has to fail loud,
+        // which shows up as an `errors` bump on the aggregated result
+        // and NO `/bulk` POST at all.
+        let entry = cfg("manuals");
+        let sirix = MockSirix {
+            rows: RefCell::new(vec![SirixDocRow {
+                node_key: "42".into(),
+                revision: 1,
+                body: "{}".into(),
+                content_type: "application/json".into(),
+                commit_timestamp: None,
+            }]),
+        };
+        let http = RecordingHttp::new();
+        *http.ddl_response.borrow_mut() =
+            r#"{"error":"P03: syntax error, unexpected TOK_IDENT"}"#.into();
+        let sink = MockDocSink::default();
+        let r = run(&[entry], &http, &sirix, &sink);
+        assert_eq!(r.errors, 1, "DDL failure must bump errors");
+        assert_eq!(r.inserted, 0, "no inserts should have gone out");
+        // Confirm no `/bulk` POST happened.
+        let posts = http.posts.borrow();
+        assert!(
+            posts.iter().all(|(u, _)| !u.ends_with("/bulk")),
+            "no `/bulk` POSTs must follow a failed DDL: {:?}",
+            posts
+        );
+    }
+
+    #[test]
+    fn manticore_ddl_response_ok_accepts_array_success_shape() {
+        // Manticore 28.4.4 `/cli_json` success shape.
+        assert!(manticore_ddl_response_ok(
+            r#"[{"total":0,"error":"","warning":""}]"#
+        )
+        .is_ok());
+        // Also accepts the object shape with an empty error string.
+        assert!(manticore_ddl_response_ok(r#"{"error":""}"#).is_ok());
+        // A response with no `error` key at all (e.g. an unrelated
+        // success payload) is also OK — we only fail on non-empty
+        // error strings.
+        assert!(manticore_ddl_response_ok(r#"{"total":0}"#).is_ok());
+    }
+
+    #[test]
+    fn manticore_ddl_response_ok_rejects_non_empty_error() {
+        // Top-level object error.
+        let err = manticore_ddl_response_ok(r#"{"error":"P03: bad ddl"}"#)
+            .unwrap_err();
+        assert!(err.contains("P03: bad ddl"), "message: {err}");
+        // Array-element error (first-array-element shape).
+        let err = manticore_ddl_response_ok(
+            r#"[{"total":0,"error":"table already open","warning":""}]"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("table already open"), "message: {err}");
+    }
+
+    #[test]
+    fn bulk_body_carries_subject_column_for_pick_doc() {
+        // The substrate's `pick_doc` heuristic (oxigraph-wf
+        // `wf_call.rs::pick_doc` and the parallel qlever / jena / rdf4j
+        // impls) promotes a URI-shaped `subject` in `hit.fields` to the
+        // `?doc` column. Federated cases hand-declare `subject` in
+        // their `manticore_seed`; managed-mode's sweep-populated
+        // Manticore rows have to do the same or `?doc` binds to
+        // Manticore's numeric implicit `_id` instead.
+        let entry = cfg("manuals");
+        let sirix = MockSirix {
+            rows: RefCell::new(vec![SirixDocRow {
+                node_key: "42".into(),
+                revision: 1,
+                body: "{\"title\":\"widget\"}".into(),
+                content_type: "application/json".into(),
+                commit_timestamp: None,
+            }]),
+        };
+        let http = MockHttp {
+            posts: RefCell::new(Vec::new()),
+            response: ok_response(),
+        };
+        let sink = MockDocSink::default();
+        run(&[entry], &http, &sirix, &sink);
+
+        let posts = http.posts.borrow();
+        let line = posts[0].1.trim_end_matches('\n');
+        let v: JsonValue = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            v["replace"]["doc"]["subject"],
+            JsonValue::String("sirix://docs/manuals/42".into())
         );
     }
 }
