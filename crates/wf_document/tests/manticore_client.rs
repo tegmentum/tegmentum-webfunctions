@@ -5,11 +5,14 @@
 //! time signals that don't appear on the wire, so the tests here still
 //! exercise the same JSON shape.
 //!
-//! v1.0 note: every emitted body now carries a `bool.filter` clause —
-//! at minimum the `_valid_to IS NULL` "current-only" guard that
-//! preserves v0.2 semantics on retention=all indexes (memo §04). The
-//! v0.2 test bodies below have been updated to reflect this: the JSON
-//! shape changes, the semantic coverage stays identical.
+//! v1.3 note (Gap 1 in the wave-7 triage): the default `bool.filter`
+//! clause list is now empty when the caller sets neither `at_time` nor
+//! `at_rev`. v1.0 originally emitted `{"equals": {"_valid_to": null}}`
+//! as a "current-only" guard, but Manticore's `equals` filter rejects
+//! null values ("expects numeric or string values") and the guard also
+//! assumed a `_valid_to` column that v0.2 (retention=latest) corpora
+//! don't carry. Callers who want current-only semantics on a
+//! retention=all sweep must pass an explicit `at_time`.
 
 use serde_json::{json, Value as JsonValue};
 use std::io::{Read, Write};
@@ -22,8 +25,9 @@ use wf_document::manticore::{
     PlainOpts,
 };
 
-/// The v1.0 default filter emitted for callers who set neither
-/// `at_time` nor `at_rev` — matches only current revisions.
+/// The historical v1.0 default filter shape. Kept in-place so the
+/// leak-check assertions below stay declarative: no branch of
+/// `build_query_clause` should re-emit this shape.
 fn current_only_guard() -> JsonValue {
     json!({ "equals": { "_valid_to": null } })
 }
@@ -34,10 +38,9 @@ fn current_only_guard() -> JsonValue {
 
 #[test]
 fn body_minimal() {
-    // v1.0: even the "minimal" body carries the current-only guard so
-    // retention=all indexes return only current-time hits when the
-    // caller didn't ask for time-travel. Retention=latest sweeps set
-    // `_valid_to = NULL` uniformly, so the guard is a no-op there.
+    // v1.3: default filter list is empty. Manticore's `equals` filter
+    // rejects null values, and retention=latest v0.2 corpora don't carry
+    // a `_valid_to` column at all — see the wave-7 Gap 1 fix.
     let body = build_request_body("docs", "fox", &PlainOpts::default()).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
     assert_eq!(
@@ -47,7 +50,7 @@ fn body_minimal() {
             "query": {
                 "bool": {
                     "must":   [{ "match": { "*": "fox" } }],
-                    "filter": [{ "equals": { "_valid_to": null } }],
+                    "filter": [],
                 }
             },
         })
@@ -122,16 +125,14 @@ fn body_with_lang_wraps_in_bool_filter() {
     };
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
-    // v1.0: lang filter joins the current-only guard in the same list.
+    // v1.3: no current-only guard is injected. Only the caller-supplied
+    // lang clause appears in the filter list.
     assert_eq!(
         parsed["query"],
         json!({
             "bool": {
                 "must":   [{ "match": { "*": "fox" } }],
-                "filter": [
-                    { "equals": { "lang": "en" } },
-                    { "equals": { "_valid_to": null } },
-                ],
+                "filter": [{ "equals": { "lang": "en" } }],
             }
         })
     );
@@ -145,14 +146,11 @@ fn body_with_filter_string_forwarded_verbatim() {
     };
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
-    // v1.0: forwarded user filter still in slot [0]; current-only guard
-    // appended after.
+    // v1.3: user filter is the only entry in the filter list — no
+    // default current-only guard is appended.
     assert_eq!(
         parsed["query"]["bool"]["filter"],
-        json!([
-            { "equals": { "category": "book" } },
-            { "equals": { "_valid_to": null } },
-        ])
+        json!([{ "equals": { "category": "book" } }])
     );
 }
 
@@ -166,11 +164,13 @@ fn body_with_lang_and_filter_combined() {
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
     let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
-    // v1.0: lang, user filter, then the current-only guard.
-    assert_eq!(filters.len(), 3);
+    // v1.3: lang and user filter — no default current-only guard.
+    assert_eq!(filters.len(), 2);
     assert_eq!(filters[0], json!({ "equals": { "lang": "de" } }));
     assert_eq!(filters[1], json!({ "range": { "price": { "lt": 50 } } }));
-    assert_eq!(filters[2], current_only_guard());
+    for f in filters {
+        assert!(f != &current_only_guard(), "current-only guard leaked in");
+    }
 }
 
 #[test]
@@ -331,13 +331,14 @@ fn parse_response_skips_nested_source_values() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn neither_restricts_to_current_only() {
-    // Neither at_time nor at_rev = current-only guard.
+fn neither_at_time_nor_at_rev_emits_no_temporal_guard() {
+    // v1.3 (Gap 1 fix): neither at_time nor at_rev → no temporal filter
+    // is injected. Manticore's `equals` rejects null values, and v0.2
+    // retention=latest corpora don't carry `_valid_to` at all.
     let body = build_request_body("docs", "fox", &PlainOpts::default()).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
     let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
-    assert_eq!(filters.len(), 1);
-    assert_eq!(filters[0], current_only_guard());
+    assert!(filters.is_empty(), "expected empty filter list, got: {filters:?}");
 }
 
 #[test]
@@ -349,7 +350,9 @@ fn at_time_iso_emits_interval_filter() {
     let body = build_request_body("docs", "fox", &opts).unwrap();
     let parsed: JsonValue = serde_json::from_str(&body).unwrap();
     let filters = parsed["query"]["bool"]["filter"].as_array().unwrap();
-    // interval = two clauses: _valid_from lte, and (_valid_to null or gt)
+    // interval = two clauses: _valid_from lte, and (_valid_to 0 or gt).
+    // v1.3: Manticore rejects `equals: null`, so the "not-yet-superseded"
+    // side compares against 0 (Manticore's unset-timestamp sentinel).
     assert_eq!(filters.len(), 2);
     assert_eq!(
         filters[0],
@@ -360,13 +363,13 @@ fn at_time_iso_emits_interval_filter() {
         json!({
             "bool": {
                 "should": [
-                    { "equals": { "_valid_to": null } },
+                    { "equals": { "_valid_to": 0 } },
                     { "range":  { "_valid_to": { "gt": "2026-01-01T00:00:00Z" } } },
                 ]
             }
         })
     );
-    // and the current-only guard is NOT emitted when time-travel is on.
+    // and the historical null-shape guard is NOT emitted when time-travel is on.
     for f in filters {
         assert!(f != &current_only_guard(), "current-only guard leaked in");
     }

@@ -18,9 +18,14 @@
 //!     `build_request_body` translates them into a `bool.filter` clause
 //!     against the sweep-provided `_valid_from` / `_valid_to` / `_rev`
 //!     columns.
-//!   * Default filter (neither selector set) restricts hits to current
-//!     revisions only (`_valid_to IS NULL`) — matches v0.2 semantics
-//!     exactly, so a retention=latest sweep still sees every hit.
+//!   * Default filter (neither selector set): none. v1.0 originally
+//!     emitted `{"equals": {"_valid_to": null}}` as a "current-only"
+//!     guard, but Manticore's `equals` filter rejects null values
+//!     ("expects numeric or string values") and the guard also assumed
+//!     a `_valid_to` column that v0.2 (retention=latest) corpora don't
+//!     carry. Callers who need current-only semantics on a retention=all
+//!     sweep should pass an explicit `at_time`; retention=latest sweeps
+//!     hold one row per doc and need no guard.
 //!   * `Hit.revision` carries `_rev` back to the caller when present.
 //!   * `build_probe_body` + `schema_has_valid_from` — helpers for the
 //!     "index doesn't hold history" storage gate in `lib.rs`.
@@ -275,16 +280,32 @@ fn build_query_clause(query: &str, opts: &PlainOpts) -> Result<JsonValue, String
         filter_list.push(json!({ "range": JsonValue::Object(range_field) }));
     } else {
         // Time-travel selectors — mutually exclusive at the guest surface.
+        //
+        // v1.3 correction (Gap 1 in the wave-7 triage): the default
+        // (None, None) branch no longer emits an `equals: _valid_to null`
+        // guard. Manticore's `equals` filter rejects null values
+        // (`"equals" filter expects numeric or string values`), and even
+        // for retention=latest v0.2 corpora the column simply does not
+        // exist. Callers who want current-only semantics on a
+        // retention=all sweep should pass `at_time = <now>` explicitly.
+        //
+        // The at_time / at_rev branches still emit their filters — they
+        // are opt-in and the caller has agreed to a schema that carries
+        // the `_valid_from` / `_valid_to` / `_rev` columns.
         match (opts.at_time.as_ref(), opts.at_rev) {
             (Some(at), None) => {
                 let at_json = at.to_json();
                 filter_list.push(json!({
                     "range": { "_valid_from": { "lte": at_json.clone() } }
                 }));
+                // For the upper bound we express "either not yet
+                // superseded or superseded after `at`". Manticore rejects
+                // null equals, so we compare against 0 — the numeric
+                // sentinel Manticore uses for unset timestamps.
                 filter_list.push(json!({
                     "bool": {
                         "should": [
-                            { "equals": { "_valid_to": null } },
+                            { "equals": { "_valid_to": 0 } },
                             { "range":  { "_valid_to": { "gt": at_json } } },
                         ]
                     }
@@ -294,7 +315,9 @@ fn build_query_clause(query: &str, opts: &PlainOpts) -> Result<JsonValue, String
                 filter_list.push(json!({ "equals": { "_rev": rev } }));
             }
             (None, None) => {
-                filter_list.push(json!({ "equals": { "_valid_to": null } }));
+                // Default: no temporal filter. Retention=latest sweeps
+                // yield one row per doc so no filter is needed; retention
+                // =all callers should pass at_time / at_rev explicitly.
             }
             (Some(_), Some(_)) => {
                 return Err(
