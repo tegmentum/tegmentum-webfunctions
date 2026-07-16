@@ -140,11 +140,16 @@ mod wasm_glue {
 // ---------------------------------------------------------------------------
 // Plain-Rust structs mirroring the WIT records.
 //
-// These are the shapes the pure kernels consume. On wasm, the
-// wit-bindgen-generated records are marshalled into these before
-// crossing into the kernel; on the host (unit-test) build, tests
-// construct these directly. Kept fieldwise-identical to the WIT so a
-// mistake in either place shows up as a type error.
+// These are the shapes the pure kernels consume on the host (unit-test)
+// build. Kept fieldwise-identical to the WIT record layout so kernels
+// compile against the same field names in both builds — on wasm the
+// `crate::EmbedOpts` symbol resolves to the wit-bindgen-generated
+// `wf::sagegraph::types::EmbedOpts` re-export (see `bindings.rs`),
+// which carries the same fields. Gated with
+// `#[cfg(not(target_family = "wasm"))]` because the wasm build's
+// wit-bindgen `generate!` re-exports the same identifiers at crate
+// root; declaring plain-Rust structs of the same name there would
+// collide (E0428) and their derived traits would conflict (E0119).
 // ---------------------------------------------------------------------------
 
 pub mod embed_kernel;
@@ -152,6 +157,7 @@ pub mod sweep_kernel;
 pub mod search_kernel;
 
 /// Mirror of the WIT `embed-opts` record.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 pub struct EmbedOpts {
     pub dimensions: u32,
@@ -161,6 +167,7 @@ pub struct EmbedOpts {
 }
 
 /// Mirror of the WIT `sweep-opts` record.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 pub struct SweepOpts {
     pub dimensions: u32,
@@ -170,6 +177,7 @@ pub struct SweepOpts {
 }
 
 /// Mirror of the WIT `search-opts` record.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 pub struct SearchOpts {
     pub metric: Option<String>,
@@ -178,6 +186,7 @@ pub struct SearchOpts {
 
 /// Mirror of the WIT `hit` record. Kernels return this; the wasm
 /// glue re-projects it into the generated `Hit` when crossing back.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub node: String,
