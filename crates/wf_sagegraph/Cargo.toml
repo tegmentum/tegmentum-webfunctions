@@ -15,9 +15,36 @@ license.workspace = true
 #     ML interface that would let the substrate host the runtime. It
 #     wasn't taken here because wiring it requires engine-substrate
 #     changes (a `wasmtime-wasi-nn` linker registration on every
-#     engine's Store) that fall outside this crate's scope fence. A
-#     v0.4 follow-up should revisit once the substrate exposes the
-#     wasi:nn interface uniformly.
+#     engine's Store) that fall outside this crate's scope fence.
+#
+#     v0.4 audit result (wasmtime-wasi-nn 46.0.1, cargo info
+#     wasmtime-wasi-nn -> features): the crate exposes four backends
+#     and NONE is pure Rust:
+#       - `openvino` (default) — needs OpenVINO's C++ SDK on the host
+#       - `winml`    (default) — Windows-only
+#       - `onnx`               — via `ort` v2 -> ort-sys -> libonnxruntime
+#         (`onnx-download` auto-fetches the .so/.dylib at build time,
+#          but the resulting Rust engine binaries still link to the
+#          native ONNX Runtime C++ library at runtime)
+#       - `pytorch`            — via `tch` -> libtorch
+#     Landing any of these on `oxigraph-wf` / `qlever-wf-runtime`
+#     shifts those crates from pure-Rust binaries to Rust binaries
+#     linked against a native C++ ML runtime. That is a substantive
+#     product architecture change, not a task decision.
+#
+#     Deferred to v0.5 pending EITHER (a) a pure-Rust backend landing
+#     in `wasmtime-wasi-nn` (a candle/burn/tract-backed backend is the
+#     natural shape), OR (b) an explicit product decision to accept
+#     libonnxruntime as an engine-substrate dep. Until then the
+#     tract-onnx path in this crate is the honest choice — pure Rust,
+#     ~2 MB compiled, deterministic across engines.
+#
+#     Same wall blocks `~/git/fastembed-wasm/fastembed-component`
+#     composition into this crate: fastembed imports
+#     `wasi:nn/{tensor,graph,inference,errors}@0.2.0-rc-2024-10-28`
+#     and cannot be satisfied without a substrate-side wasi:nn
+#     registration.
+#
 #   * `wonnx` — WebGPU-backed; disabled backend still pulls in
 #     wgpu-hal build deps that don't cleanly cross-compile to
 #     wasm32-wasip1 in a single session.
