@@ -12,38 +12,45 @@ license.workspace = true
 # Runtime-selection notes (kept in Cargo.toml so future readers see
 # them alongside the pin):
 #   * `wasi-nn` was the architecturally preferred path — a WASI-native
-#     ML interface that would let the substrate host the runtime. It
-#     wasn't taken here because wiring it requires engine-substrate
-#     changes (a `wasmtime-wasi-nn` linker registration on every
-#     engine's Store) that fall outside this crate's scope fence.
+#     ML interface that would let the substrate host the runtime.
 #
-#     v0.4 audit result (wasmtime-wasi-nn 46.0.1, cargo info
-#     wasmtime-wasi-nn -> features): the crate exposes four backends
-#     and NONE is pure Rust:
-#       - `openvino` (default) — needs OpenVINO's C++ SDK on the host
-#       - `winml`    (default) — Windows-only
-#       - `onnx`               — via `ort` v2 -> ort-sys -> libonnxruntime
-#         (`onnx-download` auto-fetches the .so/.dylib at build time,
-#          but the resulting Rust engine binaries still link to the
-#          native ONNX Runtime C++ library at runtime)
-#       - `pytorch`            — via `tch` -> libtorch
-#     Landing any of these on `oxigraph-wf` / `qlever-wf-runtime`
-#     shifts those crates from pure-Rust binaries to Rust binaries
-#     linked against a native C++ ML runtime. That is a substantive
-#     product architecture change, not a task decision.
+#     v0.4 substrate landing (this session): the product decision to
+#     accept libonnxruntime as an engine-substrate dep was taken.
+#     `wasmtime-wasi-nn = { version = "46", default-features = false,
+#     features = ["onnx"] }` is now registered on oxigraph-wf and
+#     qlever-wf-runtime (see each engine's Cargo.toml + linker file).
+#     `ort` is pinned to `=2.0.0-rc.10` on both engines because the
+#     wasmtime-wasi-nn 46.0.1 source uses ort's now-private
+#     `Session::outputs` field, which was renamed in rc.11+. Build
+#     env: `ORT_STRATEGY=system ORT_PREFER_DYNAMIC_LINK=1
+#     ORT_LIB_LOCATION=/opt/homebrew` on macOS. Resulting binaries
+#     dynamically link `libonnxruntime.dylib` (1.25.0 via Homebrew,
+#     ~40 MB) at runtime.
 #
-#     Deferred to v0.5 pending EITHER (a) a pure-Rust backend landing
-#     in `wasmtime-wasi-nn` (a candle/burn/tract-backed backend is the
-#     natural shape), OR (b) an explicit product decision to accept
-#     libonnxruntime as an engine-substrate dep. Until then the
-#     tract-onnx path in this crate is the honest choice — pure Rust,
-#     ~2 MB compiled, deterministic across engines.
+#     GUEST-SIDE STATUS — deferred to v0.5. Adding wasi:nn imports
+#     to the wf-sagegraph WIT world here would make this guest fail
+#     to instantiate on Jena / RDF4J (JVM engines don't yet register
+#     wasi:nn — wasmtime4j does not expose it). Two clean landings
+#     for that:
+#       (a) `wasmtime4j` gains a wasi:nn registration surface, and
+#           we register it symmetrically on the JVM engines. Then a
+#           single guest imports wasi:nn on every substrate.
+#       (b) Ship TWO guest wasms: `wf_sagegraph.wasm` (tract, this
+#           crate's default build, universal) and
+#           `wf_sagegraph_nn.wasm` (wasi:nn, requires substrate
+#           support). Substrate operators pick which URL to load per
+#           deployment.
+#     The tract-onnx path in this crate remains the shipping default
+#     — pure Rust, ~2 MB compiled, deterministic across engines,
+#     byte-identical output across all four substrates.
 #
-#     Same wall blocks `~/git/fastembed-wasm/fastembed-component`
-#     composition into this crate: fastembed imports
+#     The v0.4 substrate binding also unblocks composition of
+#     `~/git/fastembed-wasm/fastembed-component` on the two Rust
+#     engines: fastembed imports
 #     `wasi:nn/{tensor,graph,inference,errors}@0.2.0-rc-2024-10-28`
-#     and cannot be satisfied without a substrate-side wasi:nn
-#     registration.
+#     and those imports now resolve. Wiring the composition into
+#     this crate is separate v0.5 work (cargo-component + wasm-tools
+#     compose in the build graph).
 #
 #   * `wonnx` — WebGPU-backed; disabled backend still pulls in
 #     wgpu-hal build deps that don't cleanly cross-compile to
