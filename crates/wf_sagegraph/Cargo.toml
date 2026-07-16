@@ -47,6 +47,20 @@ serde_json = "1"
 # and keeps the compiled wasm small (~2 MB with LTO).
 tract-onnx = { version = "0.21", default-features = false }
 
+# Pure-Rust GraphBLAS sparse-matrix core from ~/git/graphblas-wasm.
+# We consume the `graphblas-sparse` crate directly (not the
+# `graphblas-component` cdylib) because it has no wit-bindgen /
+# no cdylib / no wasm-only deps — plain Rust that compiles to
+# both wasm32-wasip1 and the native host build. Composing the
+# WIT component form would need `wasm-tools compose` in the build,
+# which is the same toolchain wall the ONNX composition attempt hit;
+# consuming the Rust crate directly avoids it.
+#
+# Path dep pointing at the sibling git checkout. If a future move
+# publishes `graphblas-sparse` to a registry, flip this to a version
+# pin without touching the guest source.
+graphblas-sparse = { path = "../../../graphblas-wasm/crates/sparse" }
+
 [package.metadata.component]
 package = "wf:sagegraph"
 

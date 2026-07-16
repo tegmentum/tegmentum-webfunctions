@@ -218,3 +218,40 @@ pub const V0_2_STATUS: &str =
     "wf_sagegraph v0.2: guest body landed with three exports; \
      ONNX forward pass stubbed with a deterministic model-url-hashed \
      linear projection (see crate-level docs).";
+
+/// v0.3.1 delta note. Kept next to `V0_2_STATUS` so a reader tracing
+/// the version story sees every landing in one place.
+///
+///   * **graphblas-sparse aggregation** — the pure-Rust core of
+///     ~/git/graphblas-wasm is now a normal cargo dep. Neighbor
+///     aggregation lands through `reduce_to_vector` (PlusZero for
+///     mean/sum, MaxNegInf for max). Byte-identical to the prior
+///     sequential accumulator for mean pool because the accumulation
+///     order matches. `max` upgrades from a sum-stub to a real
+///     per-feature maximum.
+///
+///   * **literal-filter fix (memo §07)** — `fetch_one_hop` now drops
+///     literal-shaped ?n bindings so degree probes / BFS expansion /
+///     closure sizing all see the same resource-only view. Prior
+///     behavior silently folded a zero into the mean for every
+///     literal neighbor via `unwrap_or(0.0)` on the parse-failing
+///     degree query. Byte parity across engines held before and
+///     holds after; the numbers moved because the semantics moved.
+///
+///   * **fastembed-wasm text-attributed features — v0.4 blocked**.
+///     `~/git/fastembed-wasm` is a wit-bindgen `cdylib` component
+///     that imports `wasi::nn` (wasi-nn). There is no pure-Rust
+///     `fastembed-sparse`-style sibling to consume as a normal
+///     cargo dep. Integrating it into `wf_sagegraph` needs either
+///     `wasm-tools compose` in the build graph (same toolchain wall
+///     the v0.2 ONNX composition attempt hit — see the crate-level
+///     doc above) OR a substrate-wide `wasmtime-wasi-nn` linker
+///     registration on every engine's Store (out of scope for this
+///     crate's fence). Text-attributed features stay unimplemented
+///     for v0.3.1; structural is still the honest default per memo
+///     §06 last paragraph. Revisit in v0.4 once either wall is
+///     scaled.
+pub const V0_3_1_STATUS: &str =
+    "wf_sagegraph v0.3.1: graphblas-sparse aggregation backend + \
+     literal-shaped one-hop filter. fastembed-wasm text-attributed \
+     features deferred to v0.4 (composition wall).";

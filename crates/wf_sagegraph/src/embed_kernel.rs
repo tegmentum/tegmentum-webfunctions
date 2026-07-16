@@ -83,40 +83,36 @@ pub fn embed(
         frontier = next;
     }
 
-    // Step 3: per-neighbor structural features + mean-pool.
+    // Step 3: per-neighbor structural features + pooled aggregation.
+    //
+    // v0.3.1 lands `graphblas-sparse` as the aggregation backend per
+    // memo §07 ("neighbor aggregation is a sparse matrix-vector
+    // product; graphblas-wasm covers both directly"). The pool
+    // operator picks the semiring / monoid:
+    //   * mean  -> PlusZero reduce, then divide by count
+    //   * sum   -> PlusZero reduce
+    //   * max   -> MaxNegInf reduce  (was a `sum` stub in v0.3)
+    // Numeric parity with the prior sequential Rust math holds for
+    // mean/sum on the same input order (both accumulate identity
+    // then Plus in sequence). `max` now returns a real per-feature
+    // maximum instead of the v0.3 sum-stub.
     let mut sum_neighbor_deg = 0.0f32;
     let mut counted = 0.0f32;
-    let mut neighbor_features_sum: [f32; STRUCT_FEATURES] = [0.0; STRUCT_FEATURES];
+    let mut per_neighbor_feats: Vec<[f32; STRUCT_FEATURES]> =
+        Vec::with_capacity(one_hop.len());
     for n in &one_hop {
         let n_deg = fetch_degree(n, host).unwrap_or(0.0);
         sum_neighbor_deg += n_deg;
         counted += 1.0;
-        let feats = struct_features_for(n_deg, closure.len() as f32);
-        for i in 0..STRUCT_FEATURES {
-            neighbor_features_sum[i] += feats[i];
-        }
+        per_neighbor_feats.push(struct_features_for(n_deg, closure.len() as f32));
     }
     let mean_neighbor_degree = if counted > 0.0 {
         sum_neighbor_deg / counted
     } else {
         0.0
     };
-    let neighbor_pool = match opts.pool.as_str() {
-        "sum" => neighbor_features_sum,
-        "max" => neighbor_features_sum, // v0.2: max stub = sum (real max needs per-neighbor tracking; deferred)
-        _ => {
-            // mean (default)
-            if counted > 0.0 {
-                let mut m = neighbor_features_sum;
-                for i in 0..STRUCT_FEATURES {
-                    m[i] /= counted;
-                }
-                m
-            } else {
-                neighbor_features_sum
-            }
-        }
-    };
+    let neighbor_pool =
+        aggregate_neighbor_features_via_graphblas(&per_neighbor_feats, opts.pool.as_str());
 
     // Step 4: self features.
     let self_feats = struct_features_for(degree, closure.len() as f32);
@@ -177,11 +173,19 @@ pub fn embed(
 // Host-callback wrappers
 // ---------------------------------------------------------------------------
 
-/// Return the list of distinct 1-hop neighbors of `node` (both
-/// outgoing and incoming). Issues one SPARQL query via
-/// `host::execute-query`. Neighbors are returned as their lexical
-/// form (IRI or literal-as-string) — the guest doesn't distinguish
-/// for the v0.2 stubbed path.
+/// Return the list of distinct 1-hop **resource** neighbors of
+/// `node` (IRI or blank-node, both outgoing and incoming). Issues
+/// one SPARQL query via `host::execute-query`.
+///
+/// v0.3.1 (memo §07 literal-filter fix): literal-shaped ?n
+/// bindings are dropped here. Prior versions returned every ?n and
+/// then let the degree lookup on `"Alice"@en` etc. either fail
+/// SPARQL parse or silently fold a zero into the mean. That was
+/// cross-engine byte-identical but semantically wrong — literal
+/// values aren't graph neighbors, they're attribute-value payloads
+/// on the node's own triples. The filter now happens up-front so
+/// BFS expansion, closure sizing, and mean-degree folds all see the
+/// same resource-only view.
 pub(crate) fn fetch_one_hop(
     node: &str,
     host: &dyn HostBridge,
@@ -197,7 +201,9 @@ pub(crate) fn fetch_one_hop(
     let mut out = Vec::new();
     for binding in parsed.results.bindings {
         if let Some(b) = binding.get("n") {
-            out.push(b.value.clone());
+            if b.is_resource() {
+                out.push(b.value.clone());
+            }
         }
     }
     Ok(out)
@@ -245,6 +251,99 @@ fn struct_features_for(degree: f32, closure_size: f32) -> [f32; STRUCT_FEATURES]
         0.0
     };
     [degree, degree.ln_1p(), normalized_degree, 1.0]
+}
+
+/// Aggregate per-neighbor structural feature vectors into a single
+/// pooled `[f32; STRUCT_FEATURES]` via `graphblas-sparse` (memo §07).
+///
+/// We lay out the neighbor features as a `STRUCT_FEATURES × N` CSR
+/// where row `i` holds the values of feature `i` across all `N`
+/// neighbors, then call `reduce_to_vector` with the pool-selected
+/// monoid. Row-wise reduction gives one pooled value per feature.
+///
+/// Pool semantics:
+///   * `"mean"` (default when unset or unknown) — PlusZero reduce,
+///     divide by count. Numerically identical to the prior sequential
+///     Rust accumulator on the same input order.
+///   * `"sum"` — PlusZero reduce, no divide.
+///   * `"max"` — MaxNegInf reduce. This is the real per-feature max;
+///     v0.3 shipped a stub that returned the sum here.
+///
+/// Empty-neighbor case: returns `[0.0; STRUCT_FEATURES]` regardless
+/// of monoid, so `max` on empty stays at zero instead of leaking
+/// `f32::NEG_INFINITY` into the ONNX input. Caller relies on that
+/// (see the `input8` build in `embed`).
+fn aggregate_neighbor_features_via_graphblas(
+    per_neighbor: &[[f32; STRUCT_FEATURES]],
+    pool: &str,
+) -> [f32; STRUCT_FEATURES] {
+    use graphblas_sparse::dtype::DynScalar;
+    use graphblas_sparse::ops::reduce::reduce_to_vector;
+    use graphblas_sparse::semiring::MonoidId;
+    use graphblas_sparse::storage::CsrStorage;
+
+    let n = per_neighbor.len();
+    if n == 0 {
+        return [0.0; STRUCT_FEATURES];
+    }
+
+    // Build STRUCT_FEATURES × N CSR. Row i, col j = per_neighbor[j][i].
+    // Order across cols matches the caller's iteration order so f32
+    // Plus-reduce lands the same summation tree as the pre-v0.3.1
+    // sequential accumulator — critical for byte-identical parity on
+    // the default `mean` pool.
+    let mut row_ptrs = vec![0usize; STRUCT_FEATURES + 1];
+    let mut col_indices = Vec::with_capacity(STRUCT_FEATURES * n);
+    let mut values: Vec<DynScalar> = Vec::with_capacity(STRUCT_FEATURES * n);
+    for i in 0..STRUCT_FEATURES {
+        for j in 0..n {
+            col_indices.push(j);
+            values.push(DynScalar::Float32(per_neighbor[j][i]));
+        }
+        row_ptrs[i + 1] = col_indices.len();
+    }
+    let csr = CsrStorage::<DynScalar> {
+        rows: STRUCT_FEATURES,
+        cols: n,
+        row_ptrs,
+        col_indices,
+        values,
+    };
+
+    let monoid = match pool {
+        "max" => MonoidId::MaxNegInf,
+        // sum and mean both start from PlusZero; mean divides after.
+        _ => MonoidId::PlusZero,
+    };
+
+    let (indices, reduced) = match reduce_to_vector(monoid, &csr) {
+        Ok(t) => t,
+        // Reduce only fails on dtype mismatch — we built the CSR
+        // ourselves as all-Float32, so this branch is defensively
+        // impossible. Fall back to zeros to preserve the honest-shape
+        // contract in the impossible-but-not-crashing case.
+        Err(_) => return [0.0; STRUCT_FEATURES],
+    };
+
+    let mut out = [0.0f32; STRUCT_FEATURES];
+    for (idx, v) in indices.iter().zip(reduced.iter()) {
+        if let DynScalar::Float32(f) = v {
+            if *idx < STRUCT_FEATURES {
+                out[*idx] = *f;
+            }
+        }
+    }
+
+    // Mean = plus-reduce then row-normalize by degree (memo §07).
+    // `sum` and `max` skip the normalize.
+    if pool != "sum" && pool != "max" {
+        let count_f = n as f32;
+        for x in out.iter_mut() {
+            *x /= count_f;
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +469,31 @@ pub(crate) struct SparqlResultsBody {
 
 #[derive(Deserialize, Clone)]
 pub(crate) struct SparqlBinding {
+    /// `"uri"`, `"bnode"`, `"literal"`, or `"typed-literal"` per
+    /// SPARQL Results JSON. Load-bearing for the literal-filter fix
+    /// (v0.3.1): degree lookups only make sense for IRI/bnode
+    /// terms, so literal-shaped bindings are dropped before neighbor
+    /// aggregation. See `fetch_one_hop`.
     #[serde(default, rename = "type")]
-    pub _kind: String,
+    pub kind: String,
     pub value: String,
+}
+
+impl SparqlBinding {
+    /// True when this binding names a graph resource (IRI or blank
+    /// node) that can plausibly have its own outgoing/incoming
+    /// triples. False for literal-shaped bindings (`"literal"`,
+    /// `"typed-literal"`) which are attribute values, not neighbors.
+    ///
+    /// v0.3.1 (memo §07) literal-filter fix: `fetch_one_hop` used to
+    /// return every ?n binding regardless of kind, and the degree
+    /// lookup on a literal-shaped ?n would either fail SPARQL parse
+    /// (silently swallowed by `unwrap_or(0.0)`) or fold a spurious
+    /// zero into the mean. Filtering here removes the semantic
+    /// imprecision.
+    pub(crate) fn is_resource(&self) -> bool {
+        matches!(self.kind.as_str(), "uri" | "bnode" | "" )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -518,5 +639,117 @@ mod tests {
         assert_eq!(qs.len(), 2, "expect one-hop + one degree call");
         assert!(qs[0].contains("<http://ex/alice>"), "first query pulls neighbors");
         assert!(qs[1].contains("<http://ex/bob>"), "second query is degree of neighbor");
+    }
+
+    /// v0.3.1 regression — literal-shaped one-hop bindings must NOT
+    /// be treated as graph neighbors. Before the filter went in, the
+    /// guest would fire a `SELECT (COUNT(*)) WHERE { { <Alice> ?p ?o } ... }`
+    /// degree probe against `"Alice"@en`, silently swallow the
+    /// SPARQL parse error via `unwrap_or(0.0)`, and fold a spurious
+    /// zero into the neighbor-degree mean. This test pins the fixed
+    /// behavior: mixed-kind bindings drop the literals, so only the
+    /// resource neighbor's degree probe fires.
+    #[test]
+    fn fetch_one_hop_filters_literals() {
+        // Mixed-kind bindings: two IRIs, one literal, one bnode.
+        // Only the IRIs and the bnode should count as neighbors.
+        let mixed = r#"{"head":{"vars":["n"]},"results":{"bindings":[
+            {"n":{"type":"uri","value":"http://ex/bob"}},
+            {"n":{"type":"literal","value":"Alice"}},
+            {"n":{"type":"typed-literal","value":"165","datatype":"http://www.w3.org/2001/XMLSchema#integer"}},
+            {"n":{"type":"uri","value":"http://ex/carol"}},
+            {"n":{"type":"bnode","value":"b0"}}
+        ]}}"#.to_string();
+        // Three neighbors survive the filter (bob, carol, b0) so we
+        // need three degree canned results.
+        let host = MockHost::new(vec![mixed, count(2), count(3), count(1)]);
+        let v = embed("http://ex/alice", "file:///m.onnx", 1, &opts(4), &host).unwrap();
+        assert_eq!(v.len(), 4);
+        let qs = host.queries.borrow();
+        assert_eq!(
+            qs.len(),
+            4,
+            "one one-hop + three degree probes (literals filtered out)"
+        );
+        // First probe hits alice's one-hop query.
+        assert!(qs[0].contains("<http://ex/alice>"));
+        // The three follow-ups probe the resource neighbors' degrees;
+        // no probe fires against the literal values.
+        let follow_ups: String = qs[1..].join("\n");
+        assert!(follow_ups.contains("<http://ex/bob>"), "bob degree probed");
+        assert!(follow_ups.contains("<http://ex/carol>"), "carol degree probed");
+        assert!(
+            !follow_ups.contains("\"Alice\"") && !follow_ups.contains("\"165\""),
+            "literal-shaped bindings must NOT trigger degree probes"
+        );
+    }
+
+    /// v0.3.1 sanity — the graphblas-sparse-backed mean-pool must
+    /// land the same summation tree as the pre-v0.3.1 sequential
+    /// Rust accumulator on the same input order. Any drift here
+    /// would break byte-identical cross-engine parity on the
+    /// existing sagegraph cases. Pin the aggregation as a pure
+    /// function of the neighbor feature vectors.
+    #[test]
+    fn graphblas_mean_pool_matches_sequential_sum() {
+        let feats: Vec<[f32; STRUCT_FEATURES]> = vec![
+            [1.0, 2.0, 3.0, 4.0],
+            [0.5, 1.5, 2.5, 3.5],
+            [10.0, 0.0, -1.0, 0.25],
+        ];
+        let pooled = aggregate_neighbor_features_via_graphblas(&feats, "mean");
+        // Reference: sequential accumulate then divide by n. Same
+        // order = same summation tree = byte-identical result.
+        let n = feats.len() as f32;
+        let mut expected = [0.0f32; STRUCT_FEATURES];
+        for row in &feats {
+            for i in 0..STRUCT_FEATURES {
+                expected[i] += row[i];
+            }
+        }
+        for x in expected.iter_mut() {
+            *x /= n;
+        }
+        assert_eq!(pooled, expected, "graphblas mean must byte-equal sequential mean");
+    }
+
+    /// v0.3.1 — `max` was a `sum` stub in v0.3. The graphblas MaxNegInf
+    /// monoid gives us a real per-feature max. Pin that behavior.
+    #[test]
+    fn graphblas_max_pool_returns_true_maximum() {
+        let feats: Vec<[f32; STRUCT_FEATURES]> = vec![
+            [1.0, 5.0, -3.0, 0.0],
+            [4.0, 2.0, -1.0, 7.0],
+            [2.0, 3.0, -10.0, 6.5],
+        ];
+        let pooled = aggregate_neighbor_features_via_graphblas(&feats, "max");
+        assert_eq!(pooled, [4.0, 5.0, -1.0, 7.0]);
+    }
+
+    /// v0.3.1 — sum pool skips the divide step and matches a plain
+    /// sequential accumulator.
+    #[test]
+    fn graphblas_sum_pool_matches_sequential_sum() {
+        let feats: Vec<[f32; STRUCT_FEATURES]> = vec![
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+        ];
+        let pooled = aggregate_neighbor_features_via_graphblas(&feats, "sum");
+        assert_eq!(pooled, [6.0, 8.0, 10.0, 12.0]);
+    }
+
+    /// v0.3.1 — empty neighbor input must return all zeros regardless
+    /// of pool, so `max` on empty doesn't leak `f32::NEG_INFINITY` into
+    /// the downstream ONNX input.
+    #[test]
+    fn graphblas_empty_input_returns_zeros_all_pools() {
+        for pool in ["mean", "sum", "max", "weird-unknown-pool"] {
+            let out = aggregate_neighbor_features_via_graphblas(&[], pool);
+            assert_eq!(
+                out,
+                [0.0; STRUCT_FEATURES],
+                "pool {pool:?} on empty must be zeros"
+            );
+        }
     }
 }
