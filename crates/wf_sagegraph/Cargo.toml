@@ -1,0 +1,26 @@
+[package]
+name = "wf_sagegraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Guest wasm component. v0.1 ships the *stub* — the substrate's
+# v0.1-minimal dispatch path folds the `wf-sagegraph:` SERVICE sugar at
+# rewrite time inside oxigraph-wf via `wf_sagegraph_rewrite`, so no
+# component invocation reaches this crate yet. The WIT world under
+# `wit/wf-sagegraph.wit` mirrors the memo §04 shape so the v0.2 landing
+# doesn't have to churn the ABI.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.component]
+package = "wf:sagegraph"
+
+[package.metadata.component.target]
+path = "wit"
+world = "wf-sagegraph"

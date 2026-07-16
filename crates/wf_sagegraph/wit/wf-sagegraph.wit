@@ -1,0 +1,158 @@
+// wf_sagegraph WIT world — v0.1.0.
+//
+// GraphSAGE-family node embeddings as a substrate function. Three
+// exports (`embed` / `sweep` / `search`) sitting on top of ONNX
+// (via `onnxruntime-wasm` or `wonnx-wasm`), GraphBLAS (via
+// `graphblas-wasm`), and LAPACK (via `lapack-wasm`). Text-attributed
+// feature extraction rides `fastembed-wasm`. Host `execute-query`
+// callback (memo §03) fetches the k-hop neighborhood on demand.
+//
+// Design memo: docs/design/wf-sagegraph.md in the wf-conformance repo.
+//
+// # v0.1 status
+//
+// The WIT world declared here mirrors the memo §04 shape byte-for-byte
+// so the v0.2 landing doesn't have to churn the ABI. **The Rust guest
+// under `src/lib.rs` is a stub** — the memo's ONNX / GraphBLAS / LAPACK
+// / fastembed composition + `wf:sagegraph/host@0.1.0` callback wiring
+// is v0.2 (see the crate-level `src/lib.rs` module doc and the
+// wf-sagegraph task brief's honest-failure escape).
+//
+// v0.1's actual end-to-end path skips this guest entirely: Oxigraph's
+// `wf_sagegraph_rewrite` folds `SERVICE <wf-sagegraph:<name>?…>` into
+// a VALUES block by computing a degree-based structural embedding at
+// plan time against the store's own topology — the reads-direct
+// pattern `wf_vector_rewrite` established (memo §11 of `wf-vector.md`,
+// referenced from `wf-sagegraph.md` §11 as the composition case).
+
+package wf:sagegraph@0.1.0;
+
+interface types {
+    /// Feature-extraction source for a node. Selected per registered
+    /// model via `embed-opts.features` / `sweep-opts.features`.
+    variant node-features {
+        /// Degree / clustering coefficient / PageRank score computed
+        /// over the k-hop subgraph via GraphBLAS. Cheap; the honest
+        /// fallback when nodes carry no explicit features. (Memo §06)
+        structural(structural-opts),
+        /// SPARQL-extracted structured properties. The registry entry
+        /// names a query template the guest issues via the host
+        /// `execute-query` callback; results become the input feature
+        /// vector.
+        attribute(attribute-opts),
+        /// Sentence-embedding of one or more literals (rdfs:label,
+        /// rdfs:comment, skos:definition, …). Uses `fastembed-wasm`
+        /// (default: all-MiniLM-L6-v2, 384-dim). Recommended default
+        /// per memo §06.
+        text-attributed(text-opts),
+    }
+
+    /// Structural feature descriptor. Empty in v0.1 — the guest
+    /// computes the fixed [degree, clustering, PageRank] triple. v0.2
+    /// admits per-model toggles.
+    record structural-opts {
+        // Placeholder — see comment above. Present as a record so the
+        // WIT variant can be extended without a breaking change.
+        placeholder: option<string>,
+    }
+
+    record attribute-opts {
+        /// SPARQL template the guest issues via the host callback to
+        /// extract per-node structured features. `{{node}}` is
+        /// substituted for the target subject IRI at dispatch time.
+        query-template: string,
+        /// XSD-typed columns the query is expected to return.
+        columns: list<attribute-column>,
+    }
+
+    record attribute-column {
+        variable: string,
+        xsd-type: string,
+    }
+
+    record text-opts {
+        /// Predicates whose literal objects supply the text signal.
+        /// Fetched via the host callback and passed to
+        /// `fastembed-wasm` in registered order.
+        predicates: list<string>,
+        /// Sentence-embedding model URL. Defaults to
+        /// `all-MiniLM-L6-v2` (384-dim) when absent.
+        model-url: option<string>,
+    }
+
+    /// One returned KNN hit — mirror of `wf-vector`'s `hit`. Score
+    /// contract is `xsd:double` on the wire so the `wf_pyreason_bridge`
+    /// (memo §10) sees the same shape regardless of upstream primitive.
+    record hit {
+        node: string,
+        score: f64,
+    }
+
+    record embed-opts {
+        features: node-features,
+        /// Neighbor-aggregation pool. `"mean"` (default) | `"max"` |
+        /// `"sum"`. Backed by a GraphBLAS semiring; see memo §07 for
+        /// the mapping.
+        pool: string,
+        /// ONNX runtime — `"onnxruntime"` (default) | `"wonnx"`. Both
+        /// consume the same ONNX file (memo §08).
+        runtime: option<string>,
+        /// Per-call fuel budget. Enforced by the substrate wasm
+        /// envelope; a k-hop expansion that exceeds this is a hard
+        /// error unless SERVICE SILENT.
+        fuel-limit: option<u64>,
+    }
+
+    record sweep-opts {
+        features: node-features,
+        pool: string,
+        /// Nodes-per-batch across the SPARQL sweep. Tuning knob;
+        /// operator's problem to set for their corpus size.
+        batch-size: u32,
+        /// Concurrent inference jobs.
+        concurrency: u32,
+    }
+
+    record search-opts {
+        /// Distance metric. `"cosine"` (default) | `"l2"`. Mirrors
+        /// `wf-vector`'s registry (memo §04).
+        metric: option<string>,
+        /// KNN oversample factor before re-ranking. Same knob as
+        /// `wf-vector`'s (memo §09 there).
+        oversample: option<u32>,
+    }
+}
+
+world wf-sagegraph {
+    use types.{node-features, embed-opts, sweep-opts, search-opts, hit};
+
+    // ------------------------------------------------------------------
+    // Exports — see memo §04.
+    // ------------------------------------------------------------------
+
+    /// On-the-fly inference. Guest fetches `node-iri`'s k-hop
+    /// neighborhood via the host callback, aggregates via GraphBLAS,
+    /// applies the ONNX model, returns a K-dim vector. Slow per query
+    /// (bounded by neighborhood size × ONNX forward); fine for
+    /// interactive "embed this one node" use, tier-2 (sweep +
+    /// wf-vector cache) for scan-heavy queries.
+    export embed: func(node-iri: string, model-url: string,
+                       k-hops: u32, opts: embed-opts)
+                       -> result<list<f32>, string>;
+
+    /// Precompute path. Iterates every node matching
+    /// `subject-pattern`, runs inference, writes each vector to the
+    /// `wf-vector:` sink at `target-sink-url`. Returns the number of
+    /// rows written.
+    export sweep: func(model-url: string, subject-pattern: string,
+                       target-sink-url: string, opts: sweep-opts)
+                       -> result<u32, string>;
+
+    /// KNN over the cached embeddings. Sugar over `wf-vector:search`
+    /// internally; kept as a first-class export so downstream queries
+    /// can talk to one URL scheme (`wf-sagegraph:`) regardless of
+    /// which tier answered.
+    export search: func(model-url: string, query-vec: list<f32>,
+                        k: u32, opts: search-opts)
+                        -> result<list<hit>, string>;
+}

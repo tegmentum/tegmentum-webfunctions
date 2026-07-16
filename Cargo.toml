@@ -156,6 +156,7 @@ members = [
     "crates/wf_fetch",
     "crates/wf_fulltext",
     "crates/wf_document",
+    "crates/wf_sagegraph",
     "crates/wf_infer",
     "crates/wf_map",
     "crates/wf_materialize",
