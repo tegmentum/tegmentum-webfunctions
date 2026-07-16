@@ -106,6 +106,9 @@ mod tests {
             self.posts.borrow_mut().push((url.to_string(), body.to_string()));
             Ok(self.response.borrow().clone())
         }
+        fn embed_text(&self, _text: &str, _model: &str) -> Result<Vec<f32>, String> {
+            unreachable!("search does not dispatch through wf:embed")
+        }
     }
 
     fn opts() -> SearchOpts {

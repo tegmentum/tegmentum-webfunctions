@@ -70,6 +70,29 @@ interface types {
         pool: string,
         runtime: option<string>,
         fuel-limit: option<u64>,
+        /// Feature-extraction mode selector. Set by the substrate's
+        /// wf_sagegraph_rewrite when the URL sugar carries
+        /// `?features=text` (or the sagegraph index registration
+        /// declares text-attributed features per memo §06). Absent /
+        /// `none` / any unknown value → structural features (the
+        /// v0.4 default path — degree + BFS closure + ONNX). When
+        /// set to `"text"`, the guest routes through the
+        /// `wf:embed/host@0.1.0::embed-text` host import instead of
+        /// the wasi:nn ONNX forward pass.
+        features: option<string>,
+        /// Sentence-embedding model name for text-mode. Passed
+        /// verbatim to `wf:embed/host@0.1.0::embed-text`; must
+        /// match one of the substrate's registered catalog entries
+        /// (`bge-small-en`, `all-MiniLM-L6-v2`, `bge-base-en`,
+        /// `nomic-embed-text`, `bge-large-en`). Absent → guest
+        /// defaults to `bge-small-en` (384-dim, matches the
+        /// wf:embed v0.1 default). Ignored in structural mode.
+        text-model: option<string>,
+        /// Predicate IRI to source the text signal from in text
+        /// mode. Absent → guest defaults to `rdfs:label`
+        /// (`http://www.w3.org/2000/01/rdf-schema#label`). Ignored
+        /// in structural mode.
+        text-predicate: option<string>,
     }
 
     record sweep-opts {
@@ -101,6 +124,23 @@ world wf-sagegraph-nn {
     // guests land the exact same `wasm_import_module = "wf:sagegraph
     // /host@0.2.0"` binding at codegen time.
     import wf:sagegraph/host@0.2.0;
+
+    // wf:embed text-embedding host import — text-attributed
+    // feature mode (memo §06). Substrate-side registration lives
+    // in `oxigraph-wf::host::add_embed_to_linker` and
+    // `qlever-wf-runtime::register_wf_embed_host_import` (parallel
+    // agent commits d07c2d6 + 853ce98 + 4005551). The interface
+    // WIT is vendored under wit/deps/wf-embed/ so wit-bindgen
+    // emits `wasm_import_module = "wf:embed/host@0.1.0"` verbatim.
+    //
+    // Adding this import means wf_sagegraph_nn.wasm now REQUIRES
+    // wf:embed to be registered on the substrate linker; it will
+    // fail to instantiate on engines that don't. As of this
+    // landing that's OK — the JVM engines (Jena / RDF4J) already
+    // can't instantiate this variant because they lack wasi:nn.
+    // Adding wf:embed does not make the reachable-engine set
+    // narrower than the existing wasi:nn gate already made it.
+    import wf:embed/host@0.1.0;
 
     // wasi:nn imports — where this crate diverges from wf-sagegraph.
     // The version tag matches wasmtime-wasi-nn 46.0.1's

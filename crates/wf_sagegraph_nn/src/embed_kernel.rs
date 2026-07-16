@@ -68,6 +68,24 @@ pub fn embed(
         return Err("wf_sagegraph_nn: embed-opts.dimensions must be >= 1".to_string());
     }
 
+    // Text-attributed feature mode (memo §06). When the substrate
+    // signals `opts.features == "text"`, bypass the structural +
+    // wasi:nn ONNX pipeline entirely: look up the node's text
+    // literal via the host `execute-query` callback, then call
+    // `wf:embed/host.embed-text` for the dense sentence embedding.
+    //
+    // This is the "text-encoder-only" shape from the task brief —
+    // no downstream GraphSAGE ONNX composition. The returned vector
+    // is what the SERVICE `?embedding` binding surfaces. Rationale:
+    // the demo ONNX model bundled with this crate expects an 8-dim
+    // structural input; composing a 384-dim BGE output into that is
+    // a model-topology change that lives in a follow-up landing.
+    // Until then, text-mode surfaces the raw embedding — the same
+    // pattern the memo §06 §"text-only" branch describes.
+    if opts.features.as_deref().map_or(false, is_text_mode) {
+        return embed_text_mode(node_iri, opts, host);
+    }
+
     // Step 1: fetch 1-hop neighbors via host callback.
     let one_hop = fetch_one_hop(node_iri, host)?;
     let degree = one_hop.len() as f32;
@@ -162,6 +180,93 @@ pub fn embed(
         model_url,
         dimensions,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Text-attributed feature mode (memo §06).
+// ---------------------------------------------------------------------------
+
+/// Default text predicate — `rdfs:label`. Matches the memo §06
+/// canonical example and the wf-conformance
+/// `sagegraph_text_features` fixture (which stores the text signal
+/// on `:name`, but the case will override via
+/// `opts.text_predicate` once the substrate forwards it).
+pub(crate) const DEFAULT_TEXT_PREDICATE: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+
+/// Default text-embedding model — matches the memo §06 declared
+/// default AND the wf:embed v0.1 unknown-model fallback dim (384),
+/// so a substrate that hands us an unrecognised model name still
+/// yields a byte-stable vector under either engine's SHA-256 stub.
+pub(crate) const DEFAULT_TEXT_MODEL: &str = "bge-small-en";
+
+/// Case-insensitive match of the `features` opt against the memo
+/// §06 text-mode marker. Kept as a helper so future modes (memo
+/// §06 also mentions `structural` and `attribute` variants) can
+/// route through the same dispatch shape.
+fn is_text_mode(features: &str) -> bool {
+    features.eq_ignore_ascii_case("text")
+        || features.eq_ignore_ascii_case("text-attributed")
+}
+
+/// Text-attributed embedding path — memo §06. Two host round-trips:
+///   1. `execute-query` for `<node> <text_predicate> ?t` — pick
+///      the first literal binding as the text signal. Absent
+///      binding is a soft failure: return
+///      `Err("wf_sagegraph_nn: no text at <predicate> for <node>")`
+///      so the substrate can surface the diagnosis (rather than
+///      silently returning a zero vector — the memo §06 stance).
+///   2. `wf:embed/host.embed-text(text, model)` — dense sentence
+///      embedding. Returned verbatim as `?embedding`.
+///
+/// Determinism: byte-identical across engines whose wf:embed
+/// registration shares the same implementation (both Rust engines
+/// as of commit d07c2d6 + 853ce98 — see the case-level xfail_reason
+/// on `sagegraph_text_features.toml` for the current registration
+/// state).
+pub(crate) fn embed_text_mode(
+    node_iri: &str,
+    opts: &EmbedOpts,
+    host: &dyn HostBridge,
+) -> Result<Vec<f32>, String> {
+    let predicate = opts
+        .text_predicate
+        .as_deref()
+        .unwrap_or(DEFAULT_TEXT_PREDICATE);
+    let model = opts
+        .text_model
+        .as_deref()
+        .unwrap_or(DEFAULT_TEXT_MODEL);
+
+    let text = fetch_text_literal(node_iri, predicate, host)?;
+    if text.is_empty() {
+        return Err(format!(
+            "wf_sagegraph_nn: no text at <{predicate}> for <{node_iri}>"
+        ));
+    }
+    host.embed_text(&text, model)
+}
+
+/// One-shot `SELECT ?t WHERE { <node> <predicate> ?t }`. Returns
+/// the first literal binding's lexical form; empty string when
+/// there is no binding. Errors on host-side failure.
+fn fetch_text_literal(
+    node: &str,
+    predicate: &str,
+    host: &dyn HostBridge,
+) -> Result<String, String> {
+    let query = format!(
+        "SELECT ?t WHERE {{ <{node}> <{predicate}> ?t . FILTER(isLiteral(?t)) }} LIMIT 1"
+    );
+    let json = host.execute_query(&query)?;
+    let parsed: SparqlResults = serde_json::from_str(&json)
+        .map_err(|e| format!("wf_sagegraph_nn: parse SPARQL Results (text mode): {e}"))?;
+    Ok(parsed
+        .results
+        .bindings
+        .into_iter()
+        .find_map(|row| row.get("t").cloned())
+        .map(|b| b.value)
+        .unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +601,40 @@ mod tests {
         fn http_post_json(&self, _u: &str, _b: &str) -> Result<String, String> {
             unreachable!("embed does not POST")
         }
+        fn embed_text(&self, _text: &str, _model: &str) -> Result<Vec<f32>, String> {
+            // Structural mode never touches embed_text; text-mode
+            // tests use `MockHostWithEmbed` below.
+            unreachable!("structural embed does not call embed_text")
+        }
+    }
+
+    /// Text-mode-aware mock. `execute_query` returns the canned
+    /// SPARQL Results JSON (a single-row `?t` literal binding),
+    /// `embed_text` returns the canned vector paired with the
+    /// input `(text, model)`. Lets us exercise the text-mode
+    /// dispatch off-wasm without touching the substrate.
+    struct MockHostWithEmbed {
+        text_binding: String,
+        embed_vec: Vec<f32>,
+        seen: RefCell<Vec<(String, String)>>,
+    }
+
+    impl HostBridge for MockHostWithEmbed {
+        fn execute_query(&self, _query: &str) -> Result<String, String> {
+            Ok(format!(
+                r#"{{"head":{{"vars":["t"]}},"results":{{"bindings":[{{"t":{{"type":"literal","value":"{}"}}}}]}}}}"#,
+                self.text_binding
+            ))
+        }
+        fn http_post_json(&self, _u: &str, _b: &str) -> Result<String, String> {
+            unreachable!("embed does not POST")
+        }
+        fn embed_text(&self, text: &str, model: &str) -> Result<Vec<f32>, String> {
+            self.seen
+                .borrow_mut()
+                .push((text.to_string(), model.to_string()));
+            Ok(self.embed_vec.clone())
+        }
     }
 
     fn empty_bindings() -> String {
@@ -508,6 +647,9 @@ mod tests {
             pool: "mean".into(),
             runtime: None,
             fuel_limit: None,
+            features: None,
+            text_model: None,
+            text_predicate: None,
         }
     }
 
@@ -536,6 +678,80 @@ mod tests {
         for x in &v {
             assert!(x.is_finite());
         }
+    }
+
+    #[test]
+    fn text_mode_dispatches_to_embed_text_with_defaults() {
+        // Substrate signals text mode via `opts.features = "text"`.
+        // No model / predicate → guest picks bge-small-en +
+        // rdfs:label defaults (memo §06). The mock returns the
+        // canned "Alice" literal on execute_query and a canned
+        // 4-lane vector on embed_text; we assert the guest hands
+        // both back unchanged.
+        let host = MockHostWithEmbed {
+            text_binding: "Alice".to_string(),
+            embed_vec: vec![0.1, 0.2, 0.3, 0.4],
+            seen: RefCell::new(Vec::new()),
+        };
+        let mut o = opts(4);
+        o.features = Some("text".to_string());
+        let v = embed("http://ex/alice", "file:///m.onnx", 1, &o, &host).unwrap();
+        assert_eq!(v, vec![0.1, 0.2, 0.3, 0.4]);
+        let seen = host.seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "Alice", "text signal forwarded verbatim");
+        assert_eq!(
+            seen[0].1, "bge-small-en",
+            "default text_model when opts omits it"
+        );
+    }
+
+    #[test]
+    fn text_mode_honours_explicit_model_override() {
+        let host = MockHostWithEmbed {
+            text_binding: "Bob".to_string(),
+            embed_vec: vec![0.0; 768],
+            seen: RefCell::new(Vec::new()),
+        };
+        let mut o = opts(768);
+        o.features = Some("TEXT".to_string()); // case-insensitive
+        o.text_model = Some("bge-base-en".to_string());
+        let v = embed("http://ex/bob", "file:///m.onnx", 1, &o, &host).unwrap();
+        assert_eq!(v.len(), 768);
+        let seen = host.seen.borrow();
+        assert_eq!(seen[0].1, "bge-base-en");
+    }
+
+    #[test]
+    fn text_mode_errors_on_missing_text_binding() {
+        // execute_query returns an empty binding row → guest
+        // surfaces the "no text at <predicate>" diagnosis rather
+        // than silently returning a zero vector.
+        let host = MockHost::new(vec![
+            r#"{"head":{"vars":["t"]},"results":{"bindings":[]}}"#.to_string(),
+        ]);
+        // Wrap in a HostBridge that also implements a permissive
+        // embed_text — but we won't get there because the empty
+        // binding short-circuits.
+        struct WrapEmpty(MockHost);
+        impl HostBridge for WrapEmpty {
+            fn execute_query(&self, q: &str) -> Result<String, String> {
+                self.0.execute_query(q)
+            }
+            fn http_post_json(&self, u: &str, b: &str) -> Result<String, String> {
+                self.0.http_post_json(u, b)
+            }
+            fn embed_text(&self, _t: &str, _m: &str) -> Result<Vec<f32>, String> {
+                unreachable!("empty text short-circuits before embed_text")
+            }
+        }
+        let mut o = opts(4);
+        o.features = Some("text".to_string());
+        let err = embed("http://ex/x", "file:///m.onnx", 1, &o, &WrapEmpty(host)).unwrap_err();
+        assert!(
+            err.contains("no text at"),
+            "expected diagnostic on missing text, got {err}"
+        );
     }
 
     #[test]

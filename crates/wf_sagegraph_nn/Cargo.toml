@@ -72,3 +72,12 @@ world = "wf-sagegraph-nn"
 [package.metadata.component.target.dependencies]
 "wasi:nn" = { path = "wit/deps/wasi-nn" }
 "wf:sagegraph" = { path = "wit/deps/wf-sagegraph-host" }
+# wf:embed@0.1.0 — text-attributed feature mode (memo §06). Vendored
+# from `crates/wf_embed/wit/wf-embed.wit` (the WIT-only crate that
+# also seeds the substrate-side registrations on oxigraph-wf and
+# qlever-wf-runtime). Keeping the dep-tree copy byte-identical to
+# the source of truth guarantees the wit-bindgen emits the same
+# `wasm_import_module = "wf:embed/host@0.1.0"` descriptor the
+# substrate's Linker::instance("wf:embed/host@0.1.0") resolves
+# against.
+"wf:embed" = { path = "wit/deps/wf-embed" }

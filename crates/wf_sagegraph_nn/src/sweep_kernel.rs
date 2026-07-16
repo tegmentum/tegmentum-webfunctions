@@ -39,6 +39,14 @@ pub fn sweep(
         pool: opts.pool.clone(),
         runtime: None,
         fuel_limit: None,
+        // Sweep tier stays on the structural path today — memo §06
+        // reserves the text-attributed sweep for the follow-up
+        // landing. Explicit `None`s keep the field expansion honest
+        // (a `..Default::default()` would silently mask future
+        // schema changes here).
+        features: None,
+        text_model: None,
+        text_predicate: None,
     };
 
     let mut written: u32 = 0;
@@ -121,6 +129,9 @@ mod tests {
                 .borrow_mut()
                 .push((url.to_string(), body.to_string()));
             Ok("{\"ok\": true}".into())
+        }
+        fn embed_text(&self, _text: &str, _model: &str) -> Result<Vec<f32>, String> {
+            unreachable!("sweep does not dispatch through wf:embed today")
         }
     }
 

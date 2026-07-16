@@ -51,6 +51,16 @@ mod wasm_glue {
                 pool: opts.pool,
                 runtime: opts.runtime,
                 fuel_limit: opts.fuel_limit,
+                // Text-mode fields — added in this landing so the
+                // substrate can route the guest through the
+                // `wf:embed/host@0.1.0::embed-text` host import
+                // when the URL sugar carries `?features=text` /
+                // registry declares text-attributed features
+                // (memo §06). Absent on the wire → the guest
+                // stays on the structural + wasi:nn ONNX path.
+                features: opts.features,
+                text_model: opts.text_model,
+                text_predicate: opts.text_predicate,
             };
             crate::embed_kernel::embed(&node_iri, &model_url, k_hops, &opts, &HostCallbacks)
         }
@@ -109,6 +119,14 @@ mod wasm_glue {
         fn http_post_json(&self, url: &str, body: &str) -> Result<String, String> {
             wf::sagegraph::host::http_post_json(url, body)
         }
+        fn embed_text(&self, text: &str, model: &str) -> Result<Vec<f32>, String> {
+            // `wf:embed/host@0.1.0::embed-text(text, model) ->
+            // result<list<f32>, string>` — imported from the vendored
+            // WIT at `wit/deps/wf-embed/wf-embed.wit`. wit-bindgen
+            // generates the module path `wf::embed::host::embed_text`
+            // from the WIT package name.
+            wf::embed::host::embed_text(text, model)
+        }
     }
 
     export!(Component);
@@ -131,6 +149,18 @@ pub struct EmbedOpts {
     pub pool: String,
     pub runtime: Option<String>,
     pub fuel_limit: Option<u64>,
+    /// Text-mode selector. `Some("text")` (case-insensitive) →
+    /// text-attributed features path (memo §06). Absent / any
+    /// other value → structural + wasi:nn ONNX path (v0.4 default).
+    pub features: Option<String>,
+    /// Model name for text-mode `wf:embed/host.embed-text`. `None`
+    /// → guest defaults to `"bge-small-en"` (matches the wf:embed
+    /// v0.1 unknown-model fallback dim of 384 and the memo §06
+    /// declared default).
+    pub text_model: Option<String>,
+    /// Predicate IRI to source the text signal from. `None` →
+    /// guest defaults to `rdfs:label`.
+    pub text_predicate: Option<String>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -165,6 +195,14 @@ pub struct Hit {
 pub trait HostBridge {
     fn execute_query(&self, query: &str) -> Result<String, String>;
     fn http_post_json(&self, url: &str, body: &str) -> Result<String, String>;
+    /// Text-mode dispatch (memo §06). Mirrors the
+    /// `wf:embed/host@0.1.0::embed-text(text, model) ->
+    /// result<list<f32>, string>` signature. The wasm build wires
+    /// this to the wit-bindgen-generated `wf::embed::host::embed_text`
+    /// import; unit-test mock hosts implement it against a canned
+    /// vector table so the guest text-mode branch is exercisable
+    /// off-wasm.
+    fn embed_text(&self, text: &str, model: &str) -> Result<Vec<f32>, String>;
 }
 
 /// Version marker for auditability — this is the wasi:nn landing.

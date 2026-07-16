@@ -1,0 +1,59 @@
+// wf_embed WIT world — v0.1.0.
+//
+// Byte-identical copy of ~/git/tegmentum-webfunctions/crates/wf_embed/
+// wit/wf-embed.wit; vendored under this crate's wit/deps/ tree so
+// cargo-component's WIT resolver picks the same package + interface
+// path (`wf:embed/host@0.1.0`) at bindings-generation time. The
+// substrate registers the interface under exactly that path
+// (oxigraph-wf::host::add_embed_to_linker,
+// qlever-wf-runtime::register_wf_embed_host_import), so the guest
+// import must resolve verbatim.
+//
+// Keep this file in lockstep with the source of truth in
+// crates/wf_embed/wit/wf-embed.wit. Any drift here surfaces as an
+// unresolved-import instantiation failure on the substrate side —
+// wit-bindgen would encode the drifted signature into the guest's
+// wasm_import_module = "wf:embed/host@0.1.0" import descriptor.
+
+package wf:embed@0.1.0;
+
+/// The single interface substrate engines register. Kept package-
+/// scoped so guest-side imports resolve as
+/// `wf:embed/host@0.1.0` verbatim.
+interface host {
+    /// Encode `text` under the sentence-embedding model named
+    /// `model` and return the dense vector. Byte-stable per
+    /// (text, model, substrate version): every substrate engine
+    /// that registers this interface uses the same deterministic
+    /// implementation, so cross-engine parity holds for text-
+    /// attributed features (memo §06).
+    ///
+    /// Recognised model names (v0.1):
+    ///   * `bge-small-en`         — 384-dim (default when unknown)
+    ///   * `all-MiniLM-L6-v2`     — 384-dim
+    ///   * `bge-base-en`          — 768-dim
+    ///   * `nomic-embed-text`     — 768-dim
+    ///   * `bge-large-en`         — 1024-dim
+    ///
+    /// Unknown model names default to 384-dim and are surfaced as
+    /// `Ok(_)` (the guest can still get a byte-stable vector for
+    /// its own use — the substrate doesn't gate on the model
+    /// catalog). Empty `text` returns
+    /// `Err("embed-text: text is empty")`.
+    embed-text: func(text: string, model: string) -> result<list<f32>, string>;
+
+    /// List the model names the substrate registration recognises.
+    /// Guests that want to negotiate can call this before
+    /// `embed-text`; guests that hardcode a model name don't need
+    /// it. Same list across every substrate engine.
+    list-models: func() -> list<string>;
+}
+
+/// Placeholder world for the guest side. Consumers (wf_sagegraph in
+/// text mode, future text-retrieval guests) import `host` from this
+/// package. The guest world is not exported here — this crate's role
+/// is only to own the shared WIT so both substrate engines and future
+/// guests reference identical bytes.
+world wf-embed {
+    import host;
+}
