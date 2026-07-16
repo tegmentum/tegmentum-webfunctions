@@ -7,18 +7,45 @@
 //!      closure-size) for the node.
 //!   3. Aggregate neighbor features via mean-pool (memo §07: real
 //!      plus-times semiring, row-normalized).
-//!   4. Concatenate [self, aggregated] and run through the stubbed
-//!      linear projection standing in for the ONNX forward pass.
-//!   5. Return a `list<f32>` of length `opts.dimensions`.
+//!   4. Concatenate `[self, aggregated]` into the 8-dim input the demo
+//!      ONNX model expects.
+//!   5. Run the model via `tract-onnx` (`Gemm -> Relu -> Gemm -> Tanh`)
+//!      and return the output as `list<f32>`.
+//!
+//! v0.3 replaces the v0.2 "hash-of-model_url weight synth + tanh"
+//! placeholder with real ONNX inference using a small bundled demo
+//! model (`models/graphsage_demo.onnx`). When `model_url` is empty
+//! OR the guest cannot load a model OR the model's output dimension
+//! doesn't match `opts.dimensions`, the guest falls back to the v0.2
+//! deterministic hash-seeded projection so cases without a real model
+//! still get byte-stable output. Which branch fires is logged via
+//! `eprintln!` (surfaces on stderr in the wasi-p1 substrate).
 
 use serde::Deserialize;
 
 use crate::{EmbedOpts, HostBridge};
 
-/// Structural feature vector per node — the input the (stubbed) ONNX
-/// model consumes. Kept at fixed length 4 to keep the projection
-/// deterministic; grows in v0.3 when real ONNX takes over.
+/// Structural feature vector per node — the input the ONNX model
+/// consumes. Kept at length 4 so the concat `[self, neighbor_pool]`
+/// lands at length 8, which is the input shape of `graphsage_demo.onnx`.
 const STRUCT_FEATURES: usize = 4;
+
+/// Bundled demo ONNX model. Two-layer MLP:
+///   input(1,8) -> Gemm(W1,b1) -> Relu -> Gemm(W2,b2) -> Tanh -> output(1,8)
+/// Weights are hand-crafted, integer-friendly, deterministic. See
+/// `scripts/build_demo_onnx.py` in the v0.3 landing PR for the recipe.
+///
+/// Committing the .onnx bytes into the guest wasm keeps the
+/// end-to-end path hermetic: no HTTP fetch, no host-side model
+/// registry, no wasi:nn hookup. The model URL is still routed through
+/// the guest so a future v0.4 can dispatch on it (bundled vs. fetched
+/// vs. wasi:nn-supplied) without a WIT change.
+const DEMO_MODEL_ONNX: &[u8] = include_bytes!("../models/graphsage_demo.onnx");
+
+/// Output dimension of `DEMO_MODEL_ONNX`. The demo model is fixed at
+/// 8; when `opts.dimensions` doesn't match, the guest falls back to
+/// the deterministic hash-seeded stub which honors any dimension.
+const DEMO_MODEL_OUTPUT_DIM: usize = 8;
 
 pub fn embed(
     node_iri: &str,
@@ -94,21 +121,56 @@ pub fn embed(
     // Step 4: self features.
     let self_feats = struct_features_for(degree, closure.len() as f32);
     let count = closure.len() as f32;
-    // Cheap scalar summary used to seed the concat vector's tail
-    // slot (keeps `[degree, mean_neighbor_degree, count, ...]`
-    // observable in the raw pre-projection vector so operators can
-    // diff v0.2 against v0.1 arithmetic if they need to).
+    // Cheap scalar summary retained so operators can diff the raw
+    // pre-projection vector against the v0.1 arithmetic if they need
+    // to; unused by the ONNX path, only feeds the fallback stub.
     let raw_summary: [f32; STRUCT_FEATURES] =
         [degree, mean_neighbor_degree, count, self_feats[3]];
 
-    // Step 5: stubbed ONNX forward pass.
-    let out = stubbed_onnx_project(
+    // Step 5: forward pass. Prefer real ONNX inference on the bundled
+    // demo model when the caller's opts.dimensions matches the model's
+    // output shape AND a model_url was supplied. Fall back to the v0.2
+    // deterministic hash-seeded stub otherwise.
+    let input8: [f32; 8] = [
+        self_feats[0],
+        self_feats[1],
+        self_feats[2],
+        self_feats[3],
+        neighbor_pool[0],
+        neighbor_pool[1],
+        neighbor_pool[2],
+        neighbor_pool[3],
+    ];
+
+    if !model_url.is_empty() && dimensions == DEMO_MODEL_OUTPUT_DIM {
+        match run_demo_onnx(&input8) {
+            Ok(v) => {
+                eprintln!(
+                    "wf_sagegraph: embed via tract-onnx demo model (model_url={model_url}, dim={dimensions})"
+                );
+                return Ok(v);
+            }
+            Err(e) => {
+                // Honest failure: emit the reason and drop to the stub
+                // so the call still returns SOMETHING deterministic.
+                eprintln!(
+                    "wf_sagegraph: tract-onnx inference failed ({e}); falling back to hash-seeded stub"
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "wf_sagegraph: embed via hash-seeded stub (model_url={:?}, dim={dimensions})",
+            model_url
+        );
+    }
+
+    Ok(stubbed_onnx_project(
         &raw_summary,
         &neighbor_pool,
         model_url,
         dimensions,
-    );
-    Ok(out)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -186,24 +248,60 @@ fn struct_features_for(degree: f32, closure_size: f32) -> [f32; STRUCT_FEATURES]
 }
 
 // ---------------------------------------------------------------------------
-// Stubbed ONNX projection.
+// Real ONNX inference — v0.3 landing.
 // ---------------------------------------------------------------------------
 
-/// Placeholder standing in for the ONNX forward pass. Deterministic
-/// per `model_url` (weights derived from a stable FNV-1a hash), so
-/// operators can swap "models" and observe vector changes without a
-/// real ML runtime. Structure:
+/// Run the bundled demo ONNX model against `input`. Returns the
+/// flattened output tensor as a Vec<f32>. Errors surface as
+/// human-readable strings for the caller to log-and-fall-back.
 ///
-///   1. Concatenate [self_feats (4), neighbor_pool (4)] → 8-dim
+/// tract-onnx is pure Rust, no wgpu, no wasi-nn, no libonnxruntime;
+/// it compiles cleanly to `wasm32-wasip1`. Every engine that
+/// instantiates this guest sees byte-identical output for the same
+/// `input`, because IEEE-754 f32 arithmetic is deterministic and the
+/// model bytes + tract runtime version are pinned.
+fn run_demo_onnx(input: &[f32; 8]) -> Result<Vec<f32>, String> {
+    use tract_onnx::prelude::*;
+    let mut cur = std::io::Cursor::new(DEMO_MODEL_ONNX);
+    let model = tract_onnx::onnx()
+        .model_for_read(&mut cur)
+        .map_err(|e| format!("model_for_read: {e}"))?
+        .into_optimized()
+        .map_err(|e| format!("into_optimized: {e}"))?
+        .into_runnable()
+        .map_err(|e| format!("into_runnable: {e}"))?;
+    let tensor = tract_ndarray::Array2::from_shape_vec((1, 8), input.to_vec())
+        .map_err(|e| format!("shape_vec: {e}"))?
+        .into_tensor();
+    let outputs = model
+        .run(tvec![tensor.into()])
+        .map_err(|e| format!("run: {e}"))?;
+    let view = outputs[0]
+        .to_array_view::<f32>()
+        .map_err(|e| format!("to_array_view: {e}"))?;
+    Ok(view.iter().copied().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic hash-seeded projection — the honest fallback.
+// ---------------------------------------------------------------------------
+
+/// Placeholder standing in for the ONNX forward pass when the demo
+/// model can't service the request (empty model_url, mismatched
+/// output dim, tract failure). Deterministic per `model_url` (weights
+/// derived from a stable FNV-1a hash), so operators can swap
+/// "models" and observe vector changes even without a real ONNX file.
+///
+/// Structure:
+///   1. Concatenate `[self_feats (4), neighbor_pool (4)]` -> 8-dim
 ///      input vector.
 ///   2. Apply `W · x + b` where `W` is a `dimensions × 8` weight
 ///      matrix synthesized from the model-url hash and `b` a
 ///      `dimensions`-length bias vector likewise.
 ///   3. Apply tanh activation.
 ///
-/// v0.3 replaces this whole function with a call into
-/// `onnxruntime-wasm` / `wonnx-wasm`. The signature stays constant;
-/// callers see byte-stable vectors per (model_url, input).
+/// Kept as a first-class path so cases without a real model URL still
+/// exercise the substrate ABI end-to-end.
 fn stubbed_onnx_project(
     self_feats: &[f32; STRUCT_FEATURES],
     neighbor_pool: &[f32; STRUCT_FEATURES],
@@ -338,9 +436,9 @@ mod tests {
     }
 
     #[test]
-    fn isolated_node_yields_deterministic_vector() {
-        // No neighbors — pure self projection. Vector length matches
-        // opts.dimensions and every component is finite.
+    fn isolated_node_yields_finite_vector() {
+        // No neighbors. dim=8 hits the ONNX path (matches DEMO model
+        // output dim); every component must be finite regardless.
         let host = MockHost::new(vec![empty_bindings()]);
         let v = embed("http://ex/alice", "file:///m.onnx", 1, &opts(8), &host).unwrap();
         assert_eq!(v.len(), 8);
@@ -350,21 +448,55 @@ mod tests {
     }
 
     #[test]
-    fn different_model_urls_produce_different_vectors() {
-        let host_a = MockHost::new(vec![empty_bindings()]);
-        let host_b = MockHost::new(vec![empty_bindings()]);
-        let a = embed("http://ex/x", "file:///a.onnx", 1, &opts(4), &host_a).unwrap();
-        let b = embed("http://ex/x", "file:///b.onnx", 1, &opts(4), &host_b).unwrap();
-        assert_ne!(a, b, "different model URLs must produce different vectors");
+    fn onnx_path_deterministic_same_input() {
+        // Same input, same output — real inference must be
+        // byte-identical across calls.
+        let ha = MockHost::new(vec![empty_bindings()]);
+        let hb = MockHost::new(vec![empty_bindings()]);
+        let a = embed("http://ex/x", "file:///m.onnx", 1, &opts(8), &ha).unwrap();
+        let b = embed("http://ex/x", "file:///m.onnx", 1, &opts(8), &hb).unwrap();
+        assert_eq!(a, b, "same inputs must produce same ONNX output");
     }
 
     #[test]
-    fn same_model_url_produces_same_vector() {
+    fn onnx_path_independent_of_model_url() {
+        // Because the demo model is bundled and dispatched on
+        // dimension match, model_url doesn't tint the output for the
+        // ONNX path. Different model_urls yield the SAME vector at
+        // dim=8. (v0.4 will honor model_url for real per-URL model
+        // fetch.)
         let ha = MockHost::new(vec![empty_bindings()]);
         let hb = MockHost::new(vec![empty_bindings()]);
-        let a = embed("http://ex/x", "file:///m.onnx", 1, &opts(4), &ha).unwrap();
-        let b = embed("http://ex/x", "file:///m.onnx", 1, &opts(4), &hb).unwrap();
-        assert_eq!(a, b, "same inputs must produce same output");
+        let a = embed("http://ex/x", "file:///a.onnx", 1, &opts(8), &ha).unwrap();
+        let b = embed("http://ex/x", "file:///b.onnx", 1, &opts(8), &hb).unwrap();
+        assert_eq!(a, b, "demo model ignores model_url in v0.3 minimal");
+    }
+
+    #[test]
+    fn stub_path_different_urls_different_vectors() {
+        // Dim=4 skips the demo model (mismatched output dim) and
+        // falls back to the hash-seeded stub — where model_url DOES
+        // tint the output.
+        let ha = MockHost::new(vec![empty_bindings()]);
+        let hb = MockHost::new(vec![empty_bindings()]);
+        let a = embed("http://ex/x", "file:///a.onnx", 1, &opts(4), &ha).unwrap();
+        let b = embed("http://ex/x", "file:///b.onnx", 1, &opts(4), &hb).unwrap();
+        assert_ne!(a, b, "stub path must remain model_url-sensitive");
+    }
+
+    #[test]
+    fn empty_model_url_uses_stub_path() {
+        // Empty model_url short-circuits to the stub even at dim=8,
+        // so the caller retains a way to force the deterministic
+        // hash-seeded output for regression testing.
+        let host = MockHost::new(vec![empty_bindings()]);
+        let v = embed("http://ex/x", "", 1, &opts(8), &host).unwrap();
+        assert_eq!(v.len(), 8);
+        // The all-zero-features stub vector for the empty-url seed is
+        // the bias tanh; every component finite and non-NaN.
+        for x in &v {
+            assert!(x.is_finite());
+        }
     }
 
     #[test]

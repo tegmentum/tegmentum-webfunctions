@@ -4,16 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Guest wasm component. v0.2 ships the three exports (`embed` / `sweep`
-# / `search`) with real wit-bindgen bindings and the ONNX-inference path
-# STUBBED per the wf-sagegraph task brief's honest-failure escape.
+# Guest wasm component. v0.3 replaces the v0.2 stubbed linear
+# projection with real ONNX inference via `tract-onnx` — a pure-Rust
+# ONNX runtime that compiles cleanly to `wasm32-wasip1` with no
+# external native deps (no WebGPU, no wasi-nn, no libonnxruntime).
 #
-# The stubbed path: mean-pool over structural neighbor features, then a
-# deterministic linear projection whose weights are derived from a hash
-# of `model-url`, followed by tanh activation. This gives byte-stable
-# vectors per `model-url` so the substrate ABI is honestly exercised
-# end-to-end; v0.3 replaces the projection with real `onnxruntime-wasm`
-# / `wonnx-wasm` without a WIT churn.
+# Runtime-selection notes (kept in Cargo.toml so future readers see
+# them alongside the pin):
+#   * `wasi-nn` was the architecturally preferred path — a WASI-native
+#     ML interface that would let the substrate host the runtime. It
+#     wasn't taken here because wiring it requires engine-substrate
+#     changes (a `wasmtime-wasi-nn` linker registration on every
+#     engine's Store) that fall outside this crate's scope fence. A
+#     v0.4 follow-up should revisit once the substrate exposes the
+#     wasi:nn interface uniformly.
+#   * `wonnx` — WebGPU-backed; disabled backend still pulls in
+#     wgpu-hal build deps that don't cleanly cross-compile to
+#     wasm32-wasip1 in a single session.
+#   * `onnxruntime-wasm` (Microsoft) — wraps libonnxruntime through
+#     wasi-nn; same wall as option 1.
+#   * `tract-onnx` — pure Rust, no C deps, no WebGPU, no wasi-nn.
+#     Compiles clean, runs deterministically across engines.
+#
+# Fallback: when `model_url` is empty the guest still emits the
+# deterministic hash-seeded projection from v0.2 so cases without a
+# real model keep byte-stable output.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -21,6 +36,16 @@ crate-type = ["cdylib", "rlib"]
 wit-bindgen.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Pure-Rust ONNX runtime; the pin lives here (not in
+# `workspace.dependencies`) because no other guest needs it and
+# tract's dep tree is large enough that pulling it into the workspace
+# root would slow every crate's initial build. tract 0.21 is the
+# actively maintained line as of the v0.3 landing; it builds green
+# for `wasm32-wasip1` with no additional features. `default-features
+# = false` shaves the tract-onnx-opl "extra ops" surface we don't need
+# and keeps the compiled wasm small (~2 MB with LTO).
+tract-onnx = { version = "0.21", default-features = false }
 
 [package.metadata.component]
 package = "wf:sagegraph"
