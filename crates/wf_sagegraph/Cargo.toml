@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Guest wasm component. v0.1 ships the *stub* — the substrate's
-# v0.1-minimal dispatch path folds the `wf-sagegraph:` SERVICE sugar at
-# rewrite time inside oxigraph-wf via `wf_sagegraph_rewrite`, so no
-# component invocation reaches this crate yet. The WIT world under
-# `wit/wf-sagegraph.wit` mirrors the memo §04 shape so the v0.2 landing
-# doesn't have to churn the ABI.
+# Guest wasm component. v0.2 ships the three exports (`embed` / `sweep`
+# / `search`) with real wit-bindgen bindings and the ONNX-inference path
+# STUBBED per the wf-sagegraph task brief's honest-failure escape.
+#
+# The stubbed path: mean-pool over structural neighbor features, then a
+# deterministic linear projection whose weights are derived from a hash
+# of `model-url`, followed by tanh activation. This gives byte-stable
+# vectors per `model-url` so the substrate ABI is honestly exercised
+# end-to-end; v0.3 replaces the projection with real `onnxruntime-wasm`
+# / `wonnx-wasm` without a WIT churn.
 [lib]
 crate-type = ["cdylib", "rlib"]
 

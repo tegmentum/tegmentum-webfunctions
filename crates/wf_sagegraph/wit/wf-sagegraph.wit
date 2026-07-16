@@ -1,4 +1,4 @@
-// wf_sagegraph WIT world — v0.1.0.
+// wf_sagegraph WIT world — v0.2.0.
 //
 // GraphSAGE-family node embeddings as a substrate function. Three
 // exports (`embed` / `sweep` / `search`) sitting on top of ONNX
@@ -9,23 +9,38 @@
 //
 // Design memo: docs/design/wf-sagegraph.md in the wf-conformance repo.
 //
-// # v0.1 status
+// # v0.2 status — guest body landed, ONNX path stubbed.
 //
-// The WIT world declared here mirrors the memo §04 shape byte-for-byte
-// so the v0.2 landing doesn't have to churn the ABI. **The Rust guest
-// under `src/lib.rs` is a stub** — the memo's ONNX / GraphBLAS / LAPACK
-// / fastembed composition + `wf:sagegraph/host@0.1.0` callback wiring
-// is v0.2 (see the crate-level `src/lib.rs` module doc and the
-// wf-sagegraph task brief's honest-failure escape).
+// The WIT world declared here matches the memo §04 shape. The Rust
+// guest under `src/lib.rs` implements the three exports end-to-end:
 //
-// v0.1's actual end-to-end path skips this guest entirely: Oxigraph's
-// `wf_sagegraph_rewrite` folds `SERVICE <wf-sagegraph:<name>?…>` into
-// a VALUES block by computing a degree-based structural embedding at
-// plan time against the store's own topology — the reads-direct
-// pattern `wf_vector_rewrite` established (memo §11 of `wf-vector.md`,
-// referenced from `wf-sagegraph.md` §11 as the composition case).
+//   * `embed` — issues `host::execute-query` for the node's k-hop
+//     neighborhood, extracts structural degree features, aggregates via
+//     mean-pool over neighbor features, applies a deterministic
+//     "linear projection + activation" placeholder standing in for the
+//     ONNX forward pass. The placeholder is byte-stable per
+//     `model_url` so downstream consumers get deterministic vectors;
+//     swap in real `onnxruntime-wasm` / `wonnx-wasm` in v0.3 without a
+//     WIT churn.
+//   * `sweep` — iterates every subject via `host::execute-query`,
+//     embeds each, writes rows to `target-sink-url` via
+//     `host::http-post-json`. Returns the count of rows written.
+//   * `search` — POSTs a JSON body to the substrate's vector-search
+//     endpoint (derived from `model-url`'s registered wf-vector sink)
+//     via `host::http-post-json`, parses the returned hits.
+//
+// # ONNX honesty note
+//
+// v0.2 does NOT actually load an ONNX file. Composing `wonnx` or
+// `onnxruntime-wasm` into a cargo-component `cdylib` in one session
+// hits real toolchain walls (component-model target, WebGPU backend,
+// wasi-nn abi). The `model-url` is fed into a deterministic hash used
+// to seed the placeholder projection so operators can swap between
+// "models" and observe the vector change — the ABI is honest, the
+// numerics are placeholders. v0.3 replaces the projection with real
+// ONNX behind the same `embed` signature.
 
-package wf:sagegraph@0.1.0;
+package wf:sagegraph@0.2.0;
 
 interface types {
     /// Feature-extraction source for a node. Selected per registered
@@ -89,7 +104,12 @@ interface types {
     }
 
     record embed-opts {
-        features: node-features,
+        /// Output embedding dimension. The stubbed ONNX projection
+        /// always emits a vector of length `dimensions`. When a real
+        /// ONNX model lands in v0.3 the dimension will come from the
+        /// model file's output-shape metadata and this field becomes a
+        /// consistency check.
+        dimensions: u32,
         /// Neighbor-aggregation pool. `"mean"` (default) | `"max"` |
         /// `"sum"`. Backed by a GraphBLAS semiring; see memo §07 for
         /// the mapping.
@@ -104,7 +124,7 @@ interface types {
     }
 
     record sweep-opts {
-        features: node-features,
+        dimensions: u32,
         pool: string,
         /// Nodes-per-batch across the SPARQL sweep. Tuning knob;
         /// operator's problem to set for their corpus size.
@@ -123,8 +143,34 @@ interface types {
     }
 }
 
+/// Host callbacks. Provided by the plugin; consumed by the wasm
+/// component. Package-scoped so the host-side registration
+/// (`wf:sagegraph/host@0.2.0`) matches the guest-side import verbatim
+/// and cargo-component's linker can hook them up.
+interface host {
+    /// Issue a SPARQL query against the surrounding substrate. Returns
+    /// SPARQL Results JSON verbatim so the guest can parse with its
+    /// own serde_json. Any network error, parse failure, or
+    /// non-successful evaluation surfaces as `Err(<message>)`. This is
+    /// the load-bearing v0.2 primitive: without it the guest cannot
+    /// fetch its own k-hop neighborhood.
+    execute-query: func(query: string) -> result<string, string>;
+
+    /// POST a JSON `body` to `url` and return the response body as a
+    /// string. Success = HTTP 2xx; non-2xx / transport / URL errors
+    /// surface as `Err(<message>)`. Used for sweep-side sink writes
+    /// and search-side vector-index lookups. Same shape wf_fulltext /
+    /// wf_document already ship.
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}
+
 world wf-sagegraph {
-    use types.{node-features, embed-opts, sweep-opts, search-opts, hit};
+    use types.{
+        node-features, embed-opts, sweep-opts, search-opts, hit,
+        structural-opts, attribute-opts, attribute-column, text-opts,
+    };
+
+    import host;
 
     // ------------------------------------------------------------------
     // Exports — see memo §04.
@@ -144,15 +190,27 @@ world wf-sagegraph {
     /// `subject-pattern`, runs inference, writes each vector to the
     /// `wf-vector:` sink at `target-sink-url`. Returns the number of
     /// rows written.
+    ///
+    /// `subject-pattern` is a SPARQL `SELECT ?s WHERE { … }` fragment;
+    /// the guest issues it verbatim through `host::execute-query`.
+    /// `target-sink-url` is any URL the substrate's sink layer accepts
+    /// (`postgres://`, `jsonl:///…`, or the substrate's vector-index
+    /// admin endpoint) — the guest POSTs one JSON row per subject
+    /// via `host::http-post-json`.
     export sweep: func(model-url: string, subject-pattern: string,
-                       target-sink-url: string, opts: sweep-opts)
+                       target-sink-url: string, k-hops: u32,
+                       opts: sweep-opts)
                        -> result<u32, string>;
 
     /// KNN over the cached embeddings. Sugar over `wf-vector:search`
     /// internally; kept as a first-class export so downstream queries
     /// can talk to one URL scheme (`wf-sagegraph:`) regardless of
     /// which tier answered.
-    export search: func(model-url: string, query-vec: list<f32>,
+    ///
+    /// `index-url` names the wf-vector sink where the sweep wrote
+    /// embeddings — the guest POSTs a `{"query": [...], "k": N}` body
+    /// to that endpoint and parses the returned hit list.
+    export search: func(index-url: string, query-vec: list<f32>,
                         k: u32, opts: search-opts)
                         -> result<list<hit>, string>;
 }
