@@ -1,0 +1,130 @@
+// wf_sagegraph_nn WIT world — v0.4.0.
+//
+// wasi:nn variant of the wf_sagegraph guest. Same exports (embed /
+// sweep / search) and same package-scoped host callbacks
+// (`wf:sagegraph/host@0.2.0`) so the substrate side needs no
+// changes — the wf-invoke envelope decodes the bare `list<f32>`
+// return exactly as it does for the tract-onnx wf_sagegraph guest.
+//
+// The one shape difference from `wf-sagegraph.wit`: this world
+// additionally imports `wasi:nn/{tensor,graph,inference,errors}
+// @0.2.0-rc-2024-10-28`. The ONNX forward pass in `embed_kernel`
+// calls out to the host-provided ORT backend via those imports
+// instead of statically linking `tract-onnx`. Two consequences:
+//
+//   * The compiled wasm is small (kilobytes, not ~13 MB) — no ONNX
+//     runtime is bundled in the guest.
+//   * Instantiation FAILS on any engine whose linker doesn't
+//     register `wasi:nn`. As of v0.4 substrate landing, that's
+//     wasmtime-wasi-nn on `oxigraph-wf` and `qlever-wf-runtime`
+//     only; wasmtime4j (used by Jena and RDF4J) doesn't expose
+//     wasi:nn (yet — a parallel agent is working on it).
+//
+// Two-wasm-split rollout: `wf_sagegraph.wasm` (this crate's sibling
+// under ../wf_sagegraph, bundling tract-onnx) remains the default
+// on every engine. `wf_sagegraph_nn.wasm` is opt-in per-engine via
+// the conformance adapter's `locate_wf_sagegraph_nn_wasm_url`
+// selector, which picks the `_nn` variant for wasi:nn-capable
+// engines and the tract variant elsewhere.
+
+package wf:sagegraph-nn@0.4.0;
+
+interface types {
+    /// Feature-extraction source for a node. Selected per registered
+    /// model via `embed-opts.features` / `sweep-opts.features`.
+    variant node-features {
+        structural(structural-opts),
+        attribute(attribute-opts),
+        text-attributed(text-opts),
+    }
+
+    record structural-opts {
+        placeholder: option<string>,
+    }
+
+    record attribute-opts {
+        query-template: string,
+        columns: list<attribute-column>,
+    }
+
+    record attribute-column {
+        variable: string,
+        xsd-type: string,
+    }
+
+    record text-opts {
+        predicates: list<string>,
+        model-url: option<string>,
+    }
+
+    /// One returned KNN hit — mirror of the wf-sagegraph `hit` shape
+    /// so the substrate decoder's `list<hit>` codepath treats both
+    /// variants identically.
+    record hit {
+        node: string,
+        score: f64,
+    }
+
+    record embed-opts {
+        dimensions: u32,
+        pool: string,
+        runtime: option<string>,
+        fuel-limit: option<u64>,
+    }
+
+    record sweep-opts {
+        dimensions: u32,
+        pool: string,
+        batch-size: u32,
+        concurrency: u32,
+    }
+
+    record search-opts {
+        metric: option<string>,
+        oversample: option<u32>,
+    }
+}
+
+world wf-sagegraph-nn {
+    use types.{
+        node-features, embed-opts, sweep-opts, search-opts, hit,
+        structural-opts, attribute-opts, attribute-column, text-opts,
+    };
+
+    // Host callbacks — imported by fully-qualified path so wit-
+    // bindgen emits a `wf:sagegraph/host@0.2.0` wasm import that
+    // resolves against the substrate's existing linker binding
+    // (`oxigraph-wf::host::add_sagegraph_to_linker` / equivalent
+    // on qlever-wf-runtime). Sibling `wf_sagegraph` declares the
+    // same interface inline under its own package; we point at the
+    // dep-tree copy under `wit/deps/wf-sagegraph-host/` so both
+    // guests land the exact same `wasm_import_module = "wf:sagegraph
+    // /host@0.2.0"` binding at codegen time.
+    import wf:sagegraph/host@0.2.0;
+
+    // wasi:nn imports — where this crate diverges from wf-sagegraph.
+    // The version tag matches wasmtime-wasi-nn 46.0.1's
+    // `wit/wasi-nn.wit` (pinned to `0.2.0-rc-2024-10-28`); a drift
+    // between guest and host wit versions surfaces as a linker error
+    // at wasm instantiation time, not a silent misdispatch.
+    import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+    import wasi:nn/graph@0.2.0-rc-2024-10-28;
+    import wasi:nn/inference@0.2.0-rc-2024-10-28;
+    import wasi:nn/errors@0.2.0-rc-2024-10-28;
+
+    // Exports — same signatures as wf-sagegraph so the substrate's
+    // `wf_sagegraph_rewrite` and wf-invoke decoder don't need a
+    // second dispatch path.
+    export embed: func(node-iri: string, model-url: string,
+                       k-hops: u32, opts: embed-opts)
+                       -> result<list<f32>, string>;
+
+    export sweep: func(model-url: string, subject-pattern: string,
+                       target-sink-url: string, k-hops: u32,
+                       opts: sweep-opts)
+                       -> result<u32, string>;
+
+    export search: func(index-url: string, query-vec: list<f32>,
+                        k: u32, opts: search-opts)
+                        -> result<list<hit>, string>;
+}

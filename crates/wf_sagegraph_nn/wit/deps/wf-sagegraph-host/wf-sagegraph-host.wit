@@ -1,0 +1,23 @@
+// Shared host-callback interface for wf_sagegraph guests.
+//
+// This file exists so the wasi:nn variant (wf_sagegraph_nn) imports
+// the exact same package/interface path the substrate registers on
+// its wasm linker: `wf:sagegraph/host@0.2.0`. Without a
+// package-scoped host dep, wit-bindgen would generate an import
+// under our own package name (`wf:sagegraph-nn/host@0.4.0`), which
+// the substrate does not register — instantiation would then fail
+// with an unresolved import.
+//
+// Sibling `wf_sagegraph` declares the interface inline under its
+// own `package wf:sagegraph@0.2.0`; we mirror the declaration here
+// so both guests see the identical import path. Keep this file
+// byte-for-byte compatible with the sibling's `interface host`
+// definition — any drift would surface as an ABI mismatch when the
+// substrate calls one of the two callbacks.
+
+package wf:sagegraph@0.2.0;
+
+interface host {
+    execute-query: func(query: string) -> result<string, string>;
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}

@@ -1,0 +1,74 @@
+[package]
+name = "wf_sagegraph_nn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# wasi:nn variant of wf_sagegraph. The tract-onnx sibling in
+# `../wf_sagegraph` bundles a pure-Rust ONNX runtime and compiles
+# against any engine that exposes the substrate ABI (Oxigraph,
+# QLever, Jena, RDF4J). This crate replaces that bundled runtime
+# with wasi:nn host imports — the substrate side supplies the ONNX
+# Runtime session, the guest just shovels tensors across the ABI.
+#
+# Consequences vs. the tract variant:
+#
+#   * Compiled wasm is small — the ONNX Runtime is host-side (not
+#     bundled in the wasm), so this variant drops from ~12.8 MB to
+#     what's essentially the guest logic + serde + graphblas-sparse.
+#     Expected footprint: kilobytes-to-low-hundreds-of-KB.
+#
+#   * Instantiation FAILS on engines whose wasm linker doesn't
+#     register `wasi:nn/{tensor,graph,inference,errors}
+#     @0.2.0-rc-2024-10-28`. v0.4 substrate landing covered the
+#     two Rust engines (oxigraph-wf + qlever-wf-runtime, both
+#     against `wasmtime-wasi-nn = 46`). Jena / RDF4J will not
+#     instantiate this variant until wasmtime4j gains a wasi:nn
+#     registration surface (parallel agent). Until then, JVM
+#     engines keep the tract-onnx `wf_sagegraph.wasm`.
+#
+# Selection is at the conformance adapter layer:
+# `locate_wf_sagegraph_nn_wasm_url` in `wf-conformance/src/adapter/
+# mod.rs` — Oxigraph and QLever adapters ask for the `_nn` variant,
+# Jena and RDF4J adapters keep asking for the base variant.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pin to the same wit-bindgen line as the workspace-shared value —
+# the wasi:nn 0.2.0-rc-2024-10-28 WIT uses `resource tensor` /
+# `resource graph` / `resource graph-execution-context` /
+# `resource error`, all of which wit-bindgen 0.36 supports as its
+# `resource` primitive. Any drift between this crate's wit-bindgen
+# and the workspace's (currently 0.36) risks the generated ABI
+# skewing from the sibling wf_sagegraph guest's on shared record
+# shapes; we deliberately do NOT pin a newer wit-bindgen here to
+# keep the two guests wire-compatible on shared types.
+wit-bindgen.workspace = true
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Pure-Rust GraphBLAS sparse-matrix core from ~/git/graphblas-wasm.
+# Same reasoning as the sibling wf_sagegraph crate — see that
+# Cargo.toml for the composition-vs-cargo-dep rationale.
+graphblas-sparse = { path = "../../../graphblas-wasm/crates/sparse" }
+
+# NOTE (v0.4 intentional): NO `tract-onnx` here. The ONNX forward
+# pass lives on the host side of the wasi:nn ABI. The guest sends
+# the graph bytes over `graph::load(...)`, sets input tensors via
+# `graph-execution-context::compute(...)`, and reads outputs back
+# — the ONNX Runtime session (Homebrew's libonnxruntime 1.25.0 on
+# macOS) never crosses the wasm boundary.
+
+[package.metadata.component]
+package = "wf:sagegraph-nn"
+
+[package.metadata.component.target]
+path = "wit"
+world = "wf-sagegraph-nn"
+
+[package.metadata.component.target.dependencies]
+"wasi:nn" = { path = "wit/deps/wasi-nn" }
+"wf:sagegraph" = { path = "wit/deps/wf-sagegraph-host" }
