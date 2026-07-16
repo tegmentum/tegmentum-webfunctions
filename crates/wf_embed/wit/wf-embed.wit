@@ -1,0 +1,87 @@
+// wf_embed WIT world — v0.1.0.
+//
+// Substrate-side text-embedding capability. Provides a single host
+// callback that maps `(text, model)` to a dense f32 sentence
+// embedding. The wf_sagegraph guest (memo §06 text-attributed feature
+// mode) is the first planned consumer; future guests that need
+// sentence embeddings for retrieval, clustering, or attribute
+// vectorization can import the same interface without waiting for
+// a per-model wasi:nn composition.
+//
+// # Why a host callback, not a wasm-composed fastembed?
+//
+// `~/git/fastembed-wasm/fastembed-component` builds a cdylib that
+// imports `wasi:nn/{tensor,graph,inference,errors}@0.2.0-rc-2024-10-28`
+// and depends on a caller-supplied ONNX file + tokenizer state on the
+// component's filesystem. Composing it into `wf_sagegraph_nn` via
+// `wasm-tools compose` is the "purer" WIT path but hits three real
+// walls in one session:
+//
+//   * cargo-component + wasm-tools compose build-graph plumbing to
+//     link two cdylibs (guest + fastembed) into one deployable
+//     component,
+//   * bundling the tokenizer.json + ONNX file into the composed
+//     component's WASI filesystem preopens on every substrate
+//     engine, and
+//   * making the model-download story reproducible across CI hosts.
+//
+// The host-callback path (this WIT) is the substrate's already-
+// established pattern for expensive native capabilities — see
+// `wf:fulltext/host@0.1.0` (Manticore HTTP), `wf:document/host@1.3.0`
+// (Sirix HTTP), `wf:sagegraph/host@0.2.0` (execute-query +
+// http-post-json). One WIT interface, N engine registrations, one
+// implementation per engine. The `wf_sagegraph` guest imports it in
+// its text-attributed feature mode; every other guest that never
+// touches it sees no change.
+//
+// # Determinism
+//
+// The interface is model-parameterised so the same input text +
+// model name yields the same vector across substrate engines. The
+// v0.1 substrate landing uses a deterministic SHA-256-derived stub
+// projection (byte-stable, no model download, matches the wf_sagegraph
+// v0.2 hash-of-model_url pattern); the follow-up production landing
+// swaps in `fastembed-rs` behind the same signature.
+
+package wf:embed@0.1.0;
+
+/// The single interface substrate engines register. Kept package-
+/// scoped so guest-side imports resolve as
+/// `wf:embed/host@0.1.0` verbatim.
+interface host {
+    /// Encode `text` under the sentence-embedding model named
+    /// `model` and return the dense vector. Byte-stable per
+    /// (text, model, substrate version): every substrate engine
+    /// that registers this interface uses the same deterministic
+    /// implementation, so cross-engine parity holds for text-
+    /// attributed features (memo §06).
+    ///
+    /// Recognised model names (v0.1):
+    ///   * `bge-small-en`         — 384-dim (default when unknown)
+    ///   * `all-MiniLM-L6-v2`     — 384-dim
+    ///   * `bge-base-en`          — 768-dim
+    ///   * `nomic-embed-text`     — 768-dim
+    ///   * `bge-large-en`         — 1024-dim
+    ///
+    /// Unknown model names default to 384-dim and are surfaced as
+    /// `Ok(_)` (the guest can still get a byte-stable vector for
+    /// its own use — the substrate doesn't gate on the model
+    /// catalog). Empty `text` returns
+    /// `Err("embed-text: text is empty")`.
+    embed-text: func(text: string, model: string) -> result<list<f32>, string>;
+
+    /// List the model names the substrate registration recognises.
+    /// Guests that want to negotiate can call this before
+    /// `embed-text`; guests that hardcode a model name don't need
+    /// it. Same list across every substrate engine.
+    list-models: func() -> list<string>;
+}
+
+/// Placeholder world for the guest side. Consumers (wf_sagegraph in
+/// text mode, future text-retrieval guests) import `host` from this
+/// package. The guest world is not exported here — this crate's role
+/// is only to own the shared WIT so both substrate engines and future
+/// guests reference identical bytes.
+world wf-embed {
+    import host;
+}
