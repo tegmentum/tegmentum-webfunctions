@@ -158,6 +158,7 @@ members = [
     "crates/wf_document",
     "crates/wf_sagegraph",
     "crates/wf_sagegraph_nn",
+    "crates/wf_embed_sidecar",
     "crates/wf_infer",
     "crates/wf_map",
     "crates/wf_materialize",

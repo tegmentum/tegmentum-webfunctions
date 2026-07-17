@@ -1,0 +1,60 @@
+[package]
+name = "wf_embed_sidecar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# HTTP sidecar binary that answers `POST /embed` with a real
+# fastembed-rs sentence embedding. The wave-18 embed-sidecar landing on
+# the JVM plugins (Jena / RDF4J) reads `WF_EMBED_SIDECAR_URL` from env
+# and forwards `wf:embed/host@0.1.0::embed-text` calls to this process.
+# When the env var is unset, the plugins fall back to a SHA-256 stub
+# with a one-shot warning; when it IS set, the plugins post
+# `{"text":"...","model":"..."}` and get `{"embedding":[...]}` back
+# verbatim.
+#
+# Cross-engine byte parity is the whole point: this crate uses the
+# same fastembed pin (=5.2.0) and the same TextEmbedding config as
+# oxigraph-wf and qlever-wf-runtime, so `embed-text(text, "bge-small-
+# en")` returns byte-identical f32 lanes on every engine — the JVM
+# engines via HTTP through here, the Rust engines via their embedded
+# fastembed crate. That is what un-xfails
+# `sagegraph_text_features.toml` on Jena / RDF4J.
+
+[[bin]]
+name = "wf_embed_sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# fastembed-rs — same version pin as oxigraph-wf and qlever-wf-runtime
+# so cross-engine parity holds (same fastembed release + same model
+# bytes = byte-identical output). We enable the default feature set
+# here (which includes `ort-download-binaries` + `hf-hub-native-tls`)
+# so the sidecar binary is self-contained: ort-sys auto-fetches a
+# matching libonnxruntime at build time, and the HuggingFace Hub
+# client downloads model bytes into `~/.cache/fastembed/` on first
+# use. Unlike oxigraph-wf we do NOT need `default-features = false` +
+# system ORT — this sidecar shares no build graph with wasmtime-wasi-
+# nn, so the ort pin conflict that forced oxigraph-wf onto system ORT
+# doesn't apply here.
+#
+# NOTE: enabling `ort-download-binaries` inside a workspace member is
+# safe here because no other tegmentum-webfunctions workspace crate
+# depends on `ort` or `fastembed` (the guest wasms target
+# wasm32-wasip1 and neither transitively pulls fastembed in).
+fastembed = "=5.2.0"
+
+# Minimal HTTP surface — synchronous, no async runtime, one thread per
+# request. Matches the `mock_sparql.rs` model in wf-conformance
+# philosophically (hand-rolled HTTP there, tiny_http here); tiny_http
+# keeps request parsing / response formatting out of the sidecar
+# source so we can concentrate on the fastembed dispatch path.
+tiny_http = "0.12"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Lazy statics for the per-model TextEmbedding cache. Mirrors the
+# `once_cell::sync::Lazy<Mutex<HashMap<...>>>` shape oxigraph-wf and
+# qlever-wf-runtime use for the same purpose.
+once_cell = "1"
