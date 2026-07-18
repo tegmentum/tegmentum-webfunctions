@@ -2,7 +2,7 @@
 # probe the surrounding graph and return a shape classification" logic
 # from the Stardog-era `host::execute-query` callback surface onto the
 # standardized `tegmentum:webfunction/graph-callbacks@0.1.0` interface
-# declared in `~/git/oxigraph-extension/wit/host-callbacks.wit`.
+# declared in `~/git/oxigraph-webfunction-plugin/wit/host-callbacks.wit`.
 #
 # Design memo: `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
 # (§7 migration path). This is the first Phase-2 migration lifting a
@@ -10,7 +10,7 @@
 # and onto the shared package.
 #
 # Layout mirrors `wf_skolemize-extension` (Arc 3 of custom-function-
-# registry) plus a fresh copy of the oxigraph-extension WIT
+# registry) plus a fresh copy of the oxigraph-webfunction-plugin WIT
 # (`wit/extension.wit` + `wit/host-callbacks.wit`) so cargo-component
 # resolves the world locally without a cross-repo target-path.
 #
@@ -19,7 +19,7 @@
 # wf:call on the Stardog plugin path. This sibling exposes the same
 # probes at scalar filter scope so any host implementing the shared
 # extension world (starting with the reference `host-callbacks-impl`
-# in `~/git/oxigraph-extension/`) can dispatch them.
+# in `~/git/oxigraph-webfunction-plugin/`) can dispatch them.
 #
 # The classification algorithm is duplicated with attribution rather
 # than imported cross-crate (same discipline wf_skolemize-extension
@@ -59,7 +59,7 @@ world = "extension-with-host-callbacks"
 # ---------------------------------------------------------------------
 #
 # `host-callbacks-impl` is a native Rust library crate in a sibling
-# workspace (`~/git/oxigraph-extension/`). Consuming it as a
+# workspace (`~/git/oxigraph-webfunction-plugin/`). Consuming it as a
 # `path = "../../.../"` dev-dep drags its whole workspace (wasmtime,
 # oxigraph with rocksdb, ureq, tokio-free but heavy nonetheless) into
 # THIS workspace's target dir, which is a very large dependency graph
@@ -79,5 +79,5 @@ world = "extension-with-host-callbacks"
 # that a real host loads this component. A dev-dep path is scoped to
 # the test binary and does not pollute the cdylib artifact.
 [dev-dependencies]
-host-callbacks-impl = { path = "../../../oxigraph-extension/crates/host-callbacks-impl" }
+host-callbacks-impl = { path = "../../../oxigraph-webfunction-plugin/crates/host-callbacks-impl" }
 wasmtime = { version = "46.0.1", features = ["component-model"] }

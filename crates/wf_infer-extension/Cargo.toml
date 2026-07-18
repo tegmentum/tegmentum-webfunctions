@@ -2,7 +2,7 @@
 # insert its derivations into a target graph" logic from the Stardog-
 # era `host::execute-query` / `host::execute-update` callback surface
 # onto the standardized `tegmentum:webfunction/graph-callbacks@0.1.0`
-# interface declared in `~/git/oxigraph-extension/wit/host-callbacks.wit`.
+# interface declared in `~/git/oxigraph-webfunction-plugin/wit/host-callbacks.wit`.
 #
 # Design memo: `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
 # (§7 migration path). This is the second Phase-2 migration lifting a
@@ -22,7 +22,7 @@
 #     discipline / reentrancy against the reference host impl.
 #
 # Layout mirrors `wf_profile-extension` (Arc 5 of custom-function-
-# registry) plus a fresh copy of the oxigraph-extension WIT
+# registry) plus a fresh copy of the oxigraph-webfunction-plugin WIT
 # (`wit/extension.wit` + `wit/host-callbacks.wit`) so cargo-component
 # resolves the world locally without a cross-repo target-path.
 #
@@ -31,7 +31,7 @@
 # wf:call on the Stardog plugin path. This sibling exposes the same
 # rule engine at scalar filter scope so any host implementing the
 # shared extension world (starting with the reference
-# `host-callbacks-impl` in `~/git/oxigraph-extension/`) can dispatch
+# `host-callbacks-impl` in `~/git/oxigraph-webfunction-plugin/`) can dispatch
 # it.
 #
 # The rule parser and CONSTRUCT-text synthesis are duplicated with
@@ -73,12 +73,12 @@ world = "extension-with-host-callbacks"
 # ---------------------------------------------------------------------
 #
 # Same rationale as `wf_profile-extension/Cargo.toml`: consume the
-# reference `host-callbacks-impl` from `~/git/oxigraph-extension/` as
+# reference `host-callbacks-impl` from `~/git/oxigraph-webfunction-plugin/` as
 # a cross-repo dev-dep so the smoke test validates the migration
 # against the actual reference host, not a hand-rolled trait impl.
 # Dev-dep only — does not pollute the cdylib artifact.
 [dev-dependencies]
-host-callbacks-impl = { path = "../../../oxigraph-extension/crates/host-callbacks-impl" }
+host-callbacks-impl = { path = "../../../oxigraph-webfunction-plugin/crates/host-callbacks-impl" }
 wasmtime = { version = "46.0.1", features = ["component-model"] }
 serde_json = "1"
 # Direct oxigraph handle so the smoke test can inspect the underlying

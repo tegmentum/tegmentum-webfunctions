@@ -7,7 +7,7 @@
 //!      (imports `tegmentum:webfunction/graph-callbacks@0.1.0`,
 //!      exports `extension`), instantiates cleanly under the reference
 //!      native host (`host-callbacks-impl` from
-//!      `~/git/oxigraph-extension/`).
+//!      `~/git/oxigraph-webfunction-plugin/`).
 //!   2. The extension's `predicate-triple-count` filter function
 //!      dispatches back through the standardized callback into the
 //!      reference oxigraph store and returns the correct COUNT.
@@ -63,7 +63,7 @@ fn workspace_root() -> PathBuf {
 
 /// Build the cdylib under `cargo component`. Same recipe the
 /// reference host-callbacks-impl smoke test uses — see
-/// `~/git/oxigraph-extension/crates/host-callbacks-impl/tests/smoke.rs`.
+/// `~/git/oxigraph-webfunction-plugin/crates/host-callbacks-impl/tests/smoke.rs`.
 fn build_extension_component(root: &Path) {
     let status = Command::new("cargo")
         .current_dir(root)

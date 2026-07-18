@@ -4,7 +4,7 @@
 # `tegmentum:webfunction/extension@0.1.0` world.
 #
 # Layout mirrors `example-uppercase-extension` in
-# `~/git/oxigraph-extension/crates/example-uppercase-extension/` so
+# `~/git/oxigraph-webfunction-plugin/crates/example-uppercase-extension/` so
 # any host implementing the extension surface loads this component
 # with no additional wiring.
 #
@@ -27,7 +27,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Runtime for cargo-component's generated bindings. Version matches
-# the example-uppercase-extension in oxigraph-extension so both
+# the example-uppercase-extension in oxigraph-webfunction-plugin so both
 # components resolve against a single wit-bindgen-rt in downstream
 # hosts.
 wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }

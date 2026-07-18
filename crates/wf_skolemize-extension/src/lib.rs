@@ -13,7 +13,7 @@
 //!
 //! Non-bnode arguments are rejected — SPARQL semantics for the caller
 //! are that the function raises an evaluation error at that call
-//! site, which the oxigraph-extension host surfaces as `None`.
+//! site, which the oxigraph-webfunction-plugin host surfaces as `None`.
 //!
 //! # Provenance of the algorithm
 //!

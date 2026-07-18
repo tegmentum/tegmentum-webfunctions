@@ -7,7 +7,7 @@
 //!      (imports `tegmentum:webfunction/graph-callbacks@0.1.0`,
 //!      exports `extension`), instantiates cleanly under the reference
 //!      native host (`host-callbacks-impl` from
-//!      `~/git/oxigraph-extension/`).
+//!      `~/git/oxigraph-webfunction-plugin/`).
 //!   2. `graph-callbacks::execute-update` — a new surface not
 //!      exercised by wf_profile-extension — round-trips through the
 //!      reference host's SPARQL Update path (CLEAR and INSERT DATA).

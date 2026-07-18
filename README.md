@@ -194,7 +194,7 @@ Wasm outputs land in `target/wasm32-wasip1/release/<name>.wasm`.
 
 Sibling crates that re-expose primitives from the Stardog-era `wf_*`
 family on the standardized `tegmentum:webfunction@0.1.0` package
-declared in `~/git/oxigraph-extension/wit/`. Each sibling is a
+declared in `~/git/oxigraph-webfunction-plugin/wit/`. Each sibling is a
 `cdylib` targeting `wasm32-wasip2`, loads under any host implementing
 the standardized extension world, and does not modify the original
 `wf_*` crate. See `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
@@ -229,7 +229,7 @@ cargo test -p wf_infer-extension --test smoke
 ```
 
 The smoke test uses the reference `host-callbacks-impl` from
-`~/git/oxigraph-extension/crates/host-callbacks-impl/` (path
+`~/git/oxigraph-webfunction-plugin/crates/host-callbacks-impl/` (path
 dev-dep) to prove the migrated component loads against the shared
 world's host side. Downstream hosts implementing the same three
 `Host` traits load the migrated component with no adapter layer.
