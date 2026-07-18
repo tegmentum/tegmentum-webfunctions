@@ -1,0 +1,83 @@
+# Sibling crate to wf_profile. Migrates the "given a predicate IRI,
+# probe the surrounding graph and return a shape classification" logic
+# from the Stardog-era `host::execute-query` callback surface onto the
+# standardized `tegmentum:webfunction/graph-callbacks@0.1.0` interface
+# declared in `~/git/oxigraph-extension/wit/host-callbacks.wit`.
+#
+# Design memo: `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
+# (§7 migration path). This is the first Phase-2 migration lifting a
+# real wf_* execute-query consumer off the per-crate `interface host`
+# and onto the shared package.
+#
+# Layout mirrors `wf_skolemize-extension` (Arc 3 of custom-function-
+# registry) plus a fresh copy of the oxigraph-extension WIT
+# (`wit/extension.wit` + `wit/host-callbacks.wit`) so cargo-component
+# resolves the world locally without a cross-repo target-path.
+#
+# The original `wf_profile` crate stays put — it still targets the
+# `stardog:webfunction@0.5.0` host, its evaluate() is called via
+# wf:call on the Stardog plugin path. This sibling exposes the same
+# probes at scalar filter scope so any host implementing the shared
+# extension world (starting with the reference `host-callbacks-impl`
+# in `~/git/oxigraph-extension/`) can dispatch them.
+#
+# The classification algorithm is duplicated with attribution rather
+# than imported cross-crate (same discipline wf_skolemize-extension
+# adopted): the original wf_profile crate is a `cdylib` targeting
+# wasm32-wasip1 and cannot be depended on as a library. Attribution
+# lives at the head of `src/lib.rs`.
+[package]
+name = "wf_profile-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SPARQL extension: predicate-triple-count / classify-predicate — Phase-2 migration of wf_profile onto tegmentum:webfunction/graph-callbacks@0.1.0."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Version matches
+# `example-graph-callback-extension` (the Phase-1 reference consumer of
+# graph-callbacks) and `wf_skolemize-extension` (the Arc-3 sibling
+# pattern this crate follows) so wit-bindgen-rt resolves as one moving
+# part in every downstream host.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+# JSON serialization for the classify-predicate return literal.
+serde_json = "1"
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "wit"
+world = "extension-with-host-callbacks"
+
+# ---------------------------------------------------------------------
+# Smoke test — end-to-end callback round-trip through wasmtime.
+# ---------------------------------------------------------------------
+#
+# `host-callbacks-impl` is a native Rust library crate in a sibling
+# workspace (`~/git/oxigraph-extension/`). Consuming it as a
+# `path = "../../.../"` dev-dep drags its whole workspace (wasmtime,
+# oxigraph with rocksdb, ureq, tokio-free but heavy nonetheless) into
+# THIS workspace's target dir, which is a very large dependency graph
+# for a smoke test. Two paths were considered:
+#
+#   1. Cross-repo path dep on host-callbacks-impl. Trades ceremony
+#      (workspace-conflict fixups, feature-gate alignment) for
+#      free-ride reuse of the reference impl.
+#   2. Reimplement the minimum trait impl locally in tests/smoke.rs.
+#      More code up-front (~200 lines), no cross-repo coupling,
+#      controls its own dependency versions.
+#
+# We take path (1) — cross-repo dep — because the task brief calls out
+# host-callbacks-impl as "the reference host that provides the
+# callbacks (its smoke test will validate your migration end-to-end)".
+# Reimplementing loses the reference-impl proof; the whole point is
+# that a real host loads this component. A dev-dep path is scoped to
+# the test binary and does not pollute the cdylib artifact.
+[dev-dependencies]
+host-callbacks-impl = { path = "../../../oxigraph-extension/crates/host-callbacks-impl" }
+wasmtime = { version = "46.0.1", features = ["component-model"] }
