@@ -110,6 +110,11 @@ fn upper(args: &[WitTerm]) -> Result<WitTerm, String> {
         WitTerm::BlankNode(_) => {
             return Err("upper: argument must be a literal, got blank node".into())
         }
+        // R2: types.term is the 4-arm superset; RDF-star quoted
+        // triples are out of scope for the uppercase filter.
+        WitTerm::Triple(_) => {
+            return Err("upper: argument must be a literal, got quoted triple".into())
+        }
     };
     Ok(WitTerm::Literal(WitLiteral {
         value: literal.value.to_uppercase(),

@@ -130,6 +130,13 @@ impl PropertyFunctionGuest for Component {
             WitTerm::BlankNode(_) => {
                 return Err("power-set: input must be a string literal, got blank node".into())
             }
+            // R2: types.term is the 4-arm superset; RDF-star quoted
+            // triples are out of scope for power-set.
+            WitTerm::Triple(_) => {
+                return Err(
+                    "power-set: input must be a string literal, got quoted triple".into(),
+                )
+            }
         };
 
         let chars: Vec<char> = literal.value.chars().collect();

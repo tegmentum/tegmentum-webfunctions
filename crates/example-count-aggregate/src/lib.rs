@@ -137,6 +137,11 @@ impl GuestAggregateState for DistinctStringSet {
             WitTerm::BlankNode(_) => {
                 Err("count-distinct-strings: argument must be a literal, got blank node".into())
             }
+            // R2: types.term is the 4-arm superset; RDF-star quoted
+            // triples are out of scope for count-distinct-strings.
+            WitTerm::Triple(_) => Err(
+                "count-distinct-strings: argument must be a literal, got quoted triple".into(),
+            ),
         }
     }
 

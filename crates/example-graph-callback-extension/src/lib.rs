@@ -29,7 +29,7 @@ use bindings::tegmentum::webfunction::graph_callbacks::{
     self as gc, QueryResult as CallbackQueryResult,
 };
 use bindings::tegmentum::webfunction::types::{
-    Literal as WitLiteral, Term as WitTerm,
+    FlatTerm as WitFlatTerm, Literal as WitLiteral, Term as WitTerm,
 };
 
 struct Component;
@@ -120,6 +120,13 @@ fn expand_neighborhood(args: &[WitTerm]) -> Result<WitTerm, String> {
         WitTerm::Literal(_) => {
             return Err("expand-neighborhood: argument must be an IRI, got literal".into())
         }
+        // R2: types.term is the 4-arm superset; RDF-star quoted
+        // triples are out of scope for expand-neighborhood.
+        WitTerm::Triple(_) => {
+            return Err(
+                "expand-neighborhood: argument must be an IRI, got quoted triple".into(),
+            )
+        }
     };
 
     // Escape angle brackets inside the IRI so a malicious argument
@@ -189,7 +196,35 @@ fn render_term(t: &WitTerm) -> String {
     match t {
         WitTerm::NamedNode(iri) => format!("<{iri}>"),
         WitTerm::BlankNode(id) => format!("_:{id}"),
+        // R2: types.term is the 4-arm superset; render RDF-star
+        // quoted triples in their `<< s p o >>` shape.
+        WitTerm::Triple(qt) => format!(
+            "<< {} {} {} >>",
+            render_flat_term(&qt.subject),
+            render_flat_term(&qt.predicate),
+            render_flat_term(&qt.object),
+        ),
         WitTerm::Literal(l) => {
+            if let Some(lang) = &l.language {
+                format!("\"{}\"@{lang}", l.value)
+            } else if let Some(dt) = &l.datatype {
+                format!("\"{}\"^^<{dt}>", l.value)
+            } else {
+                format!("\"{}\"", l.value)
+            }
+        }
+    }
+}
+
+/// N-Triples-ish rendering for a flat-term (the depth-bounded arms
+/// permitted inside a quoted-triple). Same shape as `render_term`
+/// minus the `Triple` arm, which cannot appear here per the v0.1
+/// depth-1 constraint documented in `types.wit`.
+fn render_flat_term(t: &WitFlatTerm) -> String {
+    match t {
+        WitFlatTerm::NamedNode(iri) => format!("<{iri}>"),
+        WitFlatTerm::BlankNode(id) => format!("_:{id}"),
+        WitFlatTerm::Literal(l) => {
             if let Some(lang) = &l.language {
                 format!("\"{}\"@{lang}", l.value)
             } else if let Some(dt) = &l.datatype {
