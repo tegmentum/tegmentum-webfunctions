@@ -1,237 +1,285 @@
-//! wf_tree_rows — recursive tree walker that emits flat binding-set rows
-//! rather than the nested JSON string that `wf_tree` produces.
+//! wf_tree_rows — recursive tree walker projecting one row per visited
+//! node, collapsed to a single rdf:JSON literal for the base-substrate
+//! filter export.
 //!
-//! `wf:tree_rows(root, sparql_query [, max_depth])` runs the child-lookup
-//! query the same way `wf_tree` does — `?this` is re-bound to each newly
-//! discovered node — but instead of assembling a JSON tree, every visited
-//! node is projected as one row in a `binding-sets { vars, rows }` result
-//! with columns `("uri", "depth", "parent")`. Emission order is depth-first,
-//! so consumers can render the tree with a stack; cycle detection matches
-//! `wf_tree`'s HashSet<String> guard.
+//! Signature: `wf:tree_rows(root, sparql_query [, max_depth])` returns
+//! an rdf:JSON literal shaped as
+//!   `{"vars": ["uri","depth","parent"], "rows": [ ... ]}`
+//! matching the batch1 / batch2 collapse convention. Each row is a JSON
+//! object with `uri`, `depth`, and (except at depth 0) `parent`.
 //!
-//! The `child` variable of the child-lookup query is always what advances
-//! the recursion, matching wf_tree's `DEFAULT_CHILD_VAR`. Sibling columns
-//! (labels, types, etc.) are ignored — this crate is deliberately narrow so
-//! consumers can bind the three columns as typed SPARQL variables through
-//! the new SERVICE handler in oxigraph-wf. If you need labels or other
-//! attributes, use `wf_tree` and unpack the JSON.
+//! Recursion mechanics:
+//!   * `?this` is rebound to each newly discovered node at every
+//!     descent through
+//!     `prepared-query-callbacks::{prepare-query, run-prepared,
+//!     free-prepared}`.
+//!   * `?child` (from the caller-supplied SPARQL) advances the walk.
+//!   * Cycle detection uses a `HashSet<String>` guard on canonical
+//!     term strings, matching the original.
+//!   * Depth cap tracked via
+//!     `observability-callbacks::callback-depth`.
+//!
+//! Migration deviation (Follow-up F): the legacy `host::run-prepared`
+//! accepted a `max-rows` bound. The R1 shape does not; callers wanting
+//! a per-descent bound must inline `LIMIT N` into their SPARQL text.
+//! The original crate defaulted to `Some(1000)`; the same effect is
+//! achieved by writing `... LIMIT 1000`.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use serde_json::{Value as JsonValue, json};
 use std::collections::HashSet;
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::observability_callbacks as obs;
+use bindings::tegmentum::webfunction::prepared_query_callbacks::{
+    self as pq, PreparedError, PreparedHandle,
+};
+use bindings::tegmentum::webfunction::types::{
+    Binding as WitBinding, Literal as WitLiteral, Term as WitTerm,
+};
 
 struct Component;
 
 const CHILD_VAR: &str = "child";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-
-// Same soft depth cap as wf_tree: the host defaults to a hard cap of 100
-// callback frames, so 90 leaves room to unwind cleanly.
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const DEFAULT_MAX_DEPTH: u32 = 90;
 
-// Per-recursion row limit passed to run-prepared. Matches wf_tree so the
-// two crates share the same "at most 1000 children per node" assumption.
-const CHILD_ROW_LIMIT: u32 = 1_000;
-
-fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
-}
-
-fn integer_literal(n: u32) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
+fn json_literal(s: &str) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: s.into(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
     })
 }
 
-fn value_as_string(v: &Value) -> String {
+fn term_key(v: &WitTerm) -> String {
     match v {
-        Value::Iri(uri) => uri.clone(),
-        Value::Bnode(id) => format!("_:{}", id),
-        Value::Literal(l) => l.label.clone(),
+        WitTerm::NamedNode(uri) => uri.clone(),
+        WitTerm::BlankNode(id) => format!("_:{id}"),
+        WitTerm::Literal(l) => l.value.clone(),
+        WitTerm::Triple(_) => "<<quoted-triple>>".into(),
     }
 }
 
-fn string_arg(v: &Value, name: &str) -> Result<String, String> {
+fn term_to_json(v: &WitTerm) -> JsonValue {
     match v {
-        Value::Literal(l) => Ok(l.label.clone()),
-        _ => Err(format!("wf:tree_rows: `{}` argument must be a string literal", name)),
+        WitTerm::NamedNode(uri) => json!(uri),
+        WitTerm::BlankNode(id) => json!(format!("_:{id}")),
+        WitTerm::Literal(l) => json!(l.value),
+        WitTerm::Triple(_) => json!("<<quoted-triple>>"),
     }
 }
 
-fn u32_arg(v: &Value, name: &str) -> Result<u32, String> {
+fn string_arg(v: &WitTerm, name: &str) -> Result<String, String> {
     match v {
-        Value::Literal(l) => l
-            .label
-            .parse::<u32>()
-            .map_err(|_| format!("wf:tree_rows: `{}` must be a non-negative integer", name)),
-        _ => Err(format!("wf:tree_rows: `{}` argument must be an integer literal", name)),
+        WitTerm::Literal(l) => Ok(l.value.clone()),
+        _ => Err(format!(
+            "wf:tree_rows: `{name}` argument must be a string literal"
+        )),
     }
 }
 
-/// One row of output: (uri, depth, optional parent). The SERVICE handler
-/// (or any direct binding-set consumer) receives `parent` as an
-/// `Option<Value>` — represented in the wire binding-sets as either a
-/// present binding or an omitted one. wf_tree_rows always emits the
-/// binding for `parent` at depth > 0; at depth 0 (the root) it omits the
-/// binding entirely, matching SPARQL semantics for an unbound column.
+fn u32_arg(v: &WitTerm, name: &str) -> Result<u32, String> {
+    match v {
+        WitTerm::Literal(l) => l.value.parse::<u32>().map_err(|_| {
+            format!("wf:tree_rows: `{name}` must be a non-negative integer literal")
+        }),
+        _ => Err(format!(
+            "wf:tree_rows: `{name}` argument must be an integer literal"
+        )),
+    }
+}
+
+fn map_prepared_err(e: PreparedError) -> String {
+    match e {
+        PreparedError::SyntaxError(m) => format!("prepared-query syntax-error: {m}"),
+        PreparedError::BackendError(m) => format!("prepared-query backend-error: {m}"),
+        PreparedError::UnknownHandle => "prepared-query unknown-handle".into(),
+    }
+}
+
+fn split_rows(flat: Vec<WitBinding>) -> Vec<Vec<WitBinding>> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prev| prev.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
 struct Row {
-    uri: Value,
+    uri: WitTerm,
     depth: u32,
-    parent: Option<Value>,
+    parent: Option<WitTerm>,
 }
 
-/// Depth-first walk. `parent` is `None` only at the root; every recursive
-/// descent carries its caller's URI down so we can emit the parent column
-/// without a second lookup. `seen` guards against cycles; a node already
-/// in `seen` is skipped entirely (matches wf_tree, but without emitting a
-/// stub row — this variant is trying to feed a relational binding-set, not
-/// a self-describing tree object).
 fn walk(
-    node: &Value,
+    node: &WitTerm,
     depth: u32,
-    parent: Option<&Value>,
-    query_handle: u32,
+    parent: Option<&WitTerm>,
+    handle: &PreparedHandle,
     max_depth: u32,
     seen: &mut HashSet<String>,
     out: &mut Vec<Row>,
 ) {
-    let node_key = value_as_string(node);
-
-    // Cycle: emit nothing and unwind.
-    if !seen.insert(node_key.clone()) {
+    let key = term_key(node);
+    if !seen.insert(key.clone()) {
         return;
     }
-
-    // Emit the current node first — depth-first, parent-before-children.
     out.push(Row {
         uri: node.clone(),
         depth,
         parent: parent.cloned(),
     });
-
-    // Bail before recursing if the next level would exceed our cap. The
-    // host also enforces its own callback-depth cap; we exit first so the
-    // walk terminates cleanly instead of tripping the host error path.
-    if depth >= max_depth || host::callback_depth() >= DEFAULT_MAX_DEPTH {
-        seen.remove(&node_key);
+    if depth >= max_depth || obs::callback_depth() >= DEFAULT_MAX_DEPTH {
+        seen.remove(&key);
         return;
     }
 
-    let bindings = vec![Binding {
-        name: "this".into(),
+    let inputs = vec![WitBinding {
+        variable: "this".into(),
         value: node.clone(),
     }];
-
-    let rows = match host::run_prepared(query_handle, &bindings, Some(CHILD_ROW_LIMIT)) {
-        Ok(bs) => bs,
-        // A query failure at one node shouldn't wipe the whole walk. Just
-        // stop descending here and let the caller see whatever we've
-        // accumulated. (An earlier design surfaced errors via a stub row;
-        // dropping them keeps the schema uniform for the SERVICE binding.)
+    let flat = match pq::run_prepared(*handle, &inputs) {
+        Ok(v) => v,
         Err(_) => {
-            seen.remove(&node_key);
+            seen.remove(&key);
             return;
         }
     };
-
-    for row in &rows.rows {
-        if let Some(child) = row.iter().find(|b| b.name == CHILD_VAR) {
-            walk(&child.value, depth + 1, Some(node), query_handle, max_depth, seen, out);
+    let rows = split_rows(flat);
+    for row in &rows {
+        if let Some(child) = row.iter().find(|b| b.variable == CHILD_VAR) {
+            walk(
+                &child.value,
+                depth + 1,
+                Some(node),
+                handle,
+                max_depth,
+                seen,
+                out,
+            );
         }
     }
 
-    seen.remove(&node_key);
+    seen.remove(&key);
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        // Args:
-        //   0: root node (any Value)
-        //   1: SPARQL query as a string literal, binding ?child per row
-        //   2 (optional): max recursion depth (integer literal, default 90)
-        if args.len() < 2 || args.len() > 3 {
-            return Err(format!(
-                "wf:tree_rows: expected 2 or 3 args (root, query, [max_depth]), got {}",
-                args.len()
-            ));
-        }
-        let root = args[0].clone();
-        let query = string_arg(&args[1], "query")?;
-        let max_depth = if args.len() == 3 {
-            u32_arg(&args[2], "max_depth")?
-        } else {
-            DEFAULT_MAX_DEPTH
-        };
+fn tree_rows_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "wf:tree_rows: expected 2 or 3 args (root, query, [max_depth]), got {}",
+            args.len()
+        ));
+    }
+    let root = args[0].clone();
+    let query = string_arg(&args[1], "query")?;
+    let max_depth = if args.len() == 3 {
+        u32_arg(&args[2], "max_depth")?
+    } else {
+        DEFAULT_MAX_DEPTH
+    };
 
-        // Amortise SPARQL parse + plan compile across every recursion step
-        // (same optimisation as wf_tree — cuts a 1000-node walk from ~800ms
-        // to ~150ms in the reference impl).
-        let query_handle = host::prepare_query(&query)?;
+    let handle = pq::prepare_query(&query).map_err(map_prepared_err)?;
 
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut rows: Vec<Row> = Vec::new();
-        walk(&root, 0, None, query_handle, max_depth, &mut seen, &mut rows);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows: Vec<Row> = Vec::new();
+    walk(&root, 0, None, &handle, max_depth, &mut seen, &mut rows);
 
-        let wire_rows: Vec<Vec<Binding>> = rows
-            .into_iter()
-            .map(|r| {
-                let mut bs = Vec::with_capacity(3);
-                bs.push(Binding { name: "uri".into(), value: r.uri });
-                bs.push(Binding { name: "depth".into(), value: integer_literal(r.depth) });
-                // Omit the parent binding for the root row so consumers
-                // observe SPARQL-native "unbound" semantics rather than an
-                // empty-string sentinel.
-                if let Some(p) = r.parent {
-                    bs.push(Binding { name: "parent".into(), value: p });
-                }
-                bs
-            })
-            .collect();
+    pq::free_prepared(handle);
 
-        Ok(BindingSets {
-            vars: vec!["uri".into(), "depth".into(), "parent".into()],
-            rows: wire_rows,
+    let json_rows: Vec<JsonValue> = rows
+        .into_iter()
+        .map(|r| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("uri".into(), term_to_json(&r.uri));
+            obj.insert("depth".into(), json!(r.depth));
+            if let Some(p) = r.parent {
+                obj.insert("parent".into(), term_to_json(&p));
+            }
+            JsonValue::Object(obj)
         })
+        .collect();
+    let out = json!({
+        "vars": ["uri", "depth", "parent"],
+        "rows": json_rows,
+    });
+    Ok(json_literal(&out.to_string()))
+}
+
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_tree_rows".into(),
+            min_arity: 2,
+            max_arity: Some(3),
+        }]
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf:tree_rows: aggregate not applicable".into())
-    }
-
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf:tree_rows: aggregate not applicable".into())
-    }
-
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        // We can't cheaply predict how many rows a walk will yield; report
-        // a rough placeholder with `Injected` accuracy so the planner
-        // treats us as a hint, not a promise.
-        Ok(Cardinality { value: 100.0, accuracy: Accuracy::Injected })
-    }
-
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "wf:tree_rows(root, sparql_query [, max_depth=90]) -> binding-sets \
-                     { vars: [uri, depth, parent], rows }. Depth-first recursive walk \
-                     from `root`; `sparql_query` must bind `?child` per row and \
-                     re-uses `?this` as the current node's IRI at each level. \
-                     Emits one row per visited node — `parent` is unbound at depth 0 \
-                     and bound to the caller node otherwise. Cycle-safe."),
-            }]],
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_tree_rows" => tree_rows_impl(&args),
+            other => Err(format!("wf_tree_rows: unknown function '{other}'")),
         }
     }
 }
 
-export!(Component);
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_tree_rows: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_tree_rows: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_tree_rows: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_tree_rows: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);

@@ -1,237 +1,295 @@
-//! wf_tree — recursive tree walker built on the v0.3.0 host callbacks.
+//! wf_tree — recursive tree walker built on prepared-query callbacks.
 //!
-//! `wf:tree(root, sparql_query [, child_var])` returns a plain-JSON tree
-//! shaped by recursively re-running `sparql_query` with `?this` re-bound
-//! to each discovered child.
+//! Signature: `wf:tree(root, sparql_query [, child_var])` returns a
+//! single rdf:JSON literal shaped by recursively re-running
+//! `sparql_query` with `?this` re-bound to each discovered child.
 //!
 //! Semantics:
-//!   1. Take the `root` value and any bindings; assemble
-//!      `[binding{ name: "this", value: root }]`.
-//!   2. Call the host's `execute-query(sparql, bindings, Some(max))`.
-//!   3. Each returned row's `child_var` is the next node to recurse on.
-//!      Every other variable in the row becomes an attribute on that
-//!      child node in the output tree.
-//!   4. Recurse until a node has no children, we hit the depth cap, or
-//!      we detect a cycle via a URI-set carried through the recursion.
+//!   1. Parse + plan `sparql_query` once via
+//!      `prepared-query-callbacks::prepare-query`.
+//!   2. At each recursion step, call
+//!      `prepared-query-callbacks::run-prepared` with a single binding
+//!      `{ this = <current-node> }`. The returned flat list<binding> is
+//!      split into rows on repeated variable identity (the R1 flat
+//!      binding-list convention mirroring
+//!      `graph-callbacks::query-result::bindings`).
+//!   3. Each row's `child_var` (default: `child`) is the next node to
+//!      recurse on; every other bound variable becomes an attribute on
+//!      that child in the output tree.
+//!   4. Recurse until a node has no children, we hit the depth cap
+//!      (`observability-callbacks::callback-depth`), or we detect a
+//!      cycle via a URI-set carried through the recursion.
 //!
-//! Output shape (regular JSON — no `@`-keys, full URLs everywhere):
+//! Migration deviation (Follow-up F): the legacy `host::run-prepared`
+//! took a `max-rows` bound; the R1 shape does not. Callers that need a
+//! per-descent bound must inline `LIMIT N` into the SPARQL text. This
+//! crate previously passed `Some(1000)` — the same effect is achieved
+//! by writing `... LIMIT 1000` in the child-lookup query.
 //!
-//! ```json
-//! {
-//!   "uri": "http://example.org/root",
-//!   "children": [
-//!     { "uri": "http://example.org/child-a",
-//!       "label": "…", "type": "…",
-//!       "children": [ … ] },
-//!     …
-//!   ]
-//! }
-//! ```
+//! Output collapses to a single rdf:JSON literal (mirror of the batch1
+//! / batch2 collapse convention).
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use serde_json::{json, Value as JsonValue};
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use serde_json::{Value as JsonValue, json};
 use std::collections::HashSet;
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::observability_callbacks as obs;
+use bindings::tegmentum::webfunction::prepared_query_callbacks::{
+    self as pq, PreparedError, PreparedHandle,
+};
+use bindings::tegmentum::webfunction::types::{
+    Binding as WitBinding, Literal as WitLiteral, Term as WitTerm,
+};
 
 struct Component;
 
 const DEFAULT_CHILD_VAR: &str = "child";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
-// RDF 1.2 canonical JSON datatype. Stardog exposes it natively; Oxigraph
-// and Jena/RDF4J parse it as an opaque literal with an application-JSON
-// content marker so consumers can dispatch on the datatype instead of
-// re-parsing an untyped string.
-const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 
-// Conservative guard below the host's default max-depth of 100. If the host
-// admin has lowered the cap, we still exit cleanly before reaching it.
 const DEPTH_SOFT_CAP: u32 = 90;
 
-// Per-recursion row limit passed to execute-query. Trees rarely need more
-// than a few dozen children per node; higher values just bloat memory.
-const CHILD_ROW_LIMIT: u32 = 1_000;
-
-fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+fn json_literal(s: &str) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: s.into(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    })
 }
 
-fn json_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: RDF_JSON.into(), lang: None })
-}
-
-fn value_as_string(v: &Value) -> String {
+fn term_key(v: &WitTerm) -> String {
     match v {
-        Value::Iri(uri) => uri.clone(),
-        Value::Bnode(id) => format!("_:{}", id),
-        Value::Literal(l) => l.label.clone(),
+        WitTerm::NamedNode(uri) => uri.clone(),
+        WitTerm::BlankNode(id) => format!("_:{id}"),
+        WitTerm::Literal(l) => l.value.clone(),
+        WitTerm::Triple(_) => "<<quoted-triple>>".into(),
     }
 }
 
-fn value_to_json(v: &Value) -> JsonValue {
+fn term_to_json(v: &WitTerm) -> JsonValue {
     match v {
-        Value::Iri(uri) => json!(uri),
-        Value::Bnode(id) => json!(format!("_:{}", id)),
-        Value::Literal(l) => {
-            let dt = l.datatype.as_str();
+        WitTerm::NamedNode(uri) => json!(uri),
+        WitTerm::BlankNode(id) => json!(format!("_:{id}")),
+        WitTerm::Literal(l) => {
+            let dt = l.datatype.as_deref().unwrap_or("");
             if dt == XSD_INTEGER || dt.ends_with("#integer") || dt.ends_with("#long") {
-                if let Ok(n) = l.label.parse::<i64>() { return json!(n); }
+                if let Ok(n) = l.value.parse::<i64>() {
+                    return json!(n);
+                }
             }
-            if dt == XSD_DECIMAL || dt.ends_with("#decimal") || dt.ends_with("#double") || dt.ends_with("#float") {
-                if let Ok(n) = l.label.parse::<f64>() {
-                    if n.is_finite() { return json!(n); }
+            if dt == XSD_DECIMAL
+                || dt.ends_with("#decimal")
+                || dt.ends_with("#double")
+                || dt.ends_with("#float")
+            {
+                if let Ok(n) = l.value.parse::<f64>() {
+                    if n.is_finite() {
+                        return json!(n);
+                    }
                 }
             }
             if dt == XSD_BOOLEAN || dt.ends_with("#boolean") {
-                if l.label == "true" { return json!(true); }
-                if l.label == "false" { return json!(false); }
+                if l.value == "true" {
+                    return json!(true);
+                }
+                if l.value == "false" {
+                    return json!(false);
+                }
             }
-            json!(l.label)
+            json!(l.value)
         }
+        WitTerm::Triple(_) => json!("<<quoted-triple>>"),
     }
 }
 
-/// Recursively walk from `node`, running the prepared `query_handle` at each
-/// level with `?this` bound to the current node. The parse + precompile cost
-/// is paid once by the caller via `host::prepare_query`; each recursion step
-/// only pays initial-binding substitution and iteration.
-fn walk(node: &Value, query_handle: u32, child_var: &str, seen: &mut HashSet<String>) -> JsonValue {
-    let node_key = value_as_string(node);
+fn string_arg(v: &WitTerm, name: &str) -> Result<String, String> {
+    match v {
+        WitTerm::Literal(l) => Ok(l.value.clone()),
+        _ => Err(format!(
+            "wf:tree: `{name}` argument must be a string literal"
+        )),
+    }
+}
 
+fn map_prepared_err(e: PreparedError) -> String {
+    match e {
+        PreparedError::SyntaxError(m) => format!("prepared-query syntax-error: {m}"),
+        PreparedError::BackendError(m) => format!("prepared-query backend-error: {m}"),
+        PreparedError::UnknownHandle => "prepared-query unknown-handle".into(),
+    }
+}
+
+/// Split a flat `list<binding>` into rows on repeated variable identity.
+/// A row ends and a new row begins when we see a variable name we've
+/// already seen in the current row (the R1 convention encoded in
+/// `graph-callbacks::query-result::bindings` and mirrored here).
+fn split_rows(flat: Vec<WitBinding>) -> Vec<Vec<WitBinding>> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prev| prev.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+fn walk(
+    node: &WitTerm,
+    handle: &PreparedHandle,
+    child_var: &str,
+    seen: &mut HashSet<String>,
+) -> JsonValue {
+    let key = term_key(node);
     let mut obj = serde_json::Map::new();
-    obj.insert("uri".into(), json!(node_key));
+    obj.insert("uri".into(), json!(key));
 
-    // Cycle: emit a stub, don't recurse.
-    if !seen.insert(node_key.clone()) {
+    if !seen.insert(key.clone()) {
         obj.insert("cycle".into(), json!(true));
         return JsonValue::Object(obj);
     }
-
-    // Depth guard: emit a stub, don't recurse.
-    if host::callback_depth() >= DEPTH_SOFT_CAP {
+    if obs::callback_depth() >= DEPTH_SOFT_CAP {
         obj.insert("depth_bounded".into(), json!(true));
-        seen.remove(&node_key);
+        seen.remove(&key);
         return JsonValue::Object(obj);
     }
 
-    let bindings = vec![Binding {
-        name: "this".into(),
+    let inputs = vec![WitBinding {
+        variable: "this".into(),
         value: node.clone(),
     }];
-
-    let rows = match host::run_prepared(query_handle, &bindings, Some(CHILD_ROW_LIMIT)) {
-        Ok(bs) => bs,
+    let flat = match pq::run_prepared(*handle, &inputs) {
+        Ok(v) => v,
         Err(e) => {
-            obj.insert("error".into(), json!(e));
-            seen.remove(&node_key);
+            obj.insert("error".into(), json!(map_prepared_err(e)));
+            seen.remove(&key);
             return JsonValue::Object(obj);
         }
     };
+    let rows = split_rows(flat);
 
     let mut children: Vec<JsonValue> = Vec::new();
-    for row in &rows.rows {
-        let child_slot = row.iter().find(|b| b.name == child_var);
-        let Some(child_binding) = child_slot else { continue };
-
-        // Non-child variables become attributes of this child in the tree.
-        let attrs: Vec<(String, JsonValue)> = row.iter()
-            .filter(|b| b.name != child_var)
-            .map(|b| (b.name.clone(), value_to_json(&b.value)))
+    for row in &rows {
+        let Some(child_binding) = row.iter().find(|b| b.variable == child_var) else {
+            continue;
+        };
+        let attrs: Vec<(String, JsonValue)> = row
+            .iter()
+            .filter(|b| b.variable != child_var)
+            .map(|b| (b.variable.clone(), term_to_json(&b.value)))
             .collect();
-
-        let child_tree = walk(&child_binding.value, query_handle, child_var, seen);
+        let child_tree = walk(&child_binding.value, handle, child_var, seen);
         let mut child_obj = child_tree.as_object().cloned().unwrap_or_default();
         for (k, v) in attrs {
-            // Don't clobber existing keys (mainly "uri", "children", "cycle").
             child_obj.entry(k).or_insert(v);
         }
         children.push(JsonValue::Object(child_obj));
     }
     obj.insert("children".into(), JsonValue::Array(children));
 
-    seen.remove(&node_key);
+    seen.remove(&key);
     JsonValue::Object(obj)
 }
 
-fn string_arg(v: &Value, name: &str) -> Result<String, String> {
-    match v {
-        Value::Literal(l) => Ok(l.label.clone()),
-        _ => Err(format!("wf:tree: `{}` argument must be a string literal", name)),
+fn tree_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "wf:tree: expected 2 or 3 args (root, query, [child_var]), got {}",
+            args.len()
+        ));
     }
+    let root = args[0].clone();
+    let query = string_arg(&args[1], "query")?;
+    let child_var = if args.len() == 3 {
+        string_arg(&args[2], "child_var")?
+    } else {
+        DEFAULT_CHILD_VAR.into()
+    };
+
+    let handle = pq::prepare_query(&query).map_err(map_prepared_err)?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let tree = walk(&root, &handle, &child_var, &mut seen);
+
+    pq::free_prepared(handle);
+
+    Ok(json_literal(&tree.to_string()))
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        // Args:
-        //   0: root node (any Value)
-        //   1: SPARQL query as a string literal
-        //   2 (optional): child variable name (string literal, defaults to "child")
-        if args.len() < 2 || args.len() > 3 {
-            return Err(format!(
-                "wf:tree: expected 2 or 3 args (root, query, [child_var]), got {}",
-                args.len()
-            ));
-        }
-        let root = args[0].clone();
-        let query = string_arg(&args[1], "query")?;
-        let child_var = if args.len() == 3 {
-            string_arg(&args[2], "child_var")?
-        } else {
-            DEFAULT_CHILD_VAR.into()
-        };
-
-        // Parse + precompile the child-lookup query once. Every recursion
-        // step reuses the handle, so we don't re-pay ~400µs of parse +
-        // strategy.precompile on each of N nodes.
-        let query_handle = host::prepare_query(&query)?;
-
-        let mut seen: HashSet<String> = HashSet::new();
-        let tree = walk(&root, query_handle, &child_var, &mut seen);
-
-        Ok(BindingSets {
-            vars: vec!["tree".into()],
-            rows: vec![vec![Binding {
-                name: "tree".into(),
-                value: json_literal(&tree.to_string()),
-            }]],
-        })
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_tree".into(),
+            min_arity: 2,
+            max_arity: Some(3),
+        }]
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf:tree: aggregate not applicable".into())
-    }
-
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf:tree: aggregate not applicable".into())
-    }
-
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Injected })
-    }
-
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "wf:tree(root, sparql_query [, child_var='child']) -> JSON tree. \
-                     Recursively runs sparql_query with `?this` re-bound to each \
-                     discovered child. Any variable named `?child` (or the caller-\
-                     supplied child_var) in the query's result becomes the next \
-                     node to recurse; all other bound variables become attributes \
-                     of that child in the emitted tree. Cycle-safe and depth-bounded. \
-                     Output is regular JSON — no @-keys, full URLs everywhere."),
-            }]],
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_tree" => tree_impl(&args),
+            other => Err(format!("wf_tree: unknown function '{other}'")),
         }
     }
 }
 
-export!(Component);
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_tree: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_tree: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_tree: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_tree: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
