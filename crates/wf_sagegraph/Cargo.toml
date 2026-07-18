@@ -67,7 +67,10 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wit-bindgen.workspace = true
+# Runtime for cargo-component's generated bindings. Matches the
+# version other tegmentum:webfunction-based extension crates use
+# (json_path, example-uppercase-extension, wf_fulltext).
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -96,8 +99,15 @@ tract-onnx = { version = "0.21", default-features = false }
 graphblas-sparse = { path = "../../../graphblas-wasm/crates/sparse" }
 
 [package.metadata.component]
-package = "wf:sagegraph"
+package = "stardog:wf-sagegraph"
 
 [package.metadata.component.target]
 path = "wit"
-world = "wf-sagegraph"
+world = "sagegraph-extension"
+
+[package.metadata.component.target.dependencies]
+# Shared tegmentum:webfunction@0.1.0 WIT — brings in the
+# well-known-exports memo's `embed` named interface plus the
+# `sparql-extension` include (empty registries for filter /
+# aggregate / property-function under this guest).
+"tegmentum:webfunction" = { path = "../../wit" }

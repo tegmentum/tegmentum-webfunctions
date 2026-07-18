@@ -1,0 +1,119 @@
+// wf_sagegraph WIT world — well-known-exports migration.
+//
+// Prototype landing for the well-known-exports memo
+// (~/git/webfunction-wit/docs/design/well-known-exports.md). The
+// text-to-vector dispatch surface migrates to the named
+// `tegmentum:webfunction/embed@0.1.0` interface. The KNN `search`
+// and precompute `sweep` remain as bare world-level exports —
+// wf_sagegraph's `search` takes a query vector (not text), and
+// `sweep` is not covered by any of the memo's three initial named
+// interfaces (search / execute / embed).
+//
+// Shape adaptations (see src/lib.rs for the mapping code):
+//
+//   * `embed(node-iri, model-url, k-hops, opts)` collapses into
+//     `tegmentum:webfunction/embed@0.1.0::embed(request)`. The
+//     named `embed-request` only carries `text` / `model`:
+//       - `request.text` is interpreted as the node IRI. Semantic
+//         shift: the well-known `embed` interface names this field
+//         `text` because typical guests (fastembed-rs, wonnx) run
+//         text through an embedder; wf_sagegraph runs a graph node
+//         through GraphSAGE. The wire shape fits (string in, vector
+//         out) even though the meaning shifts.
+//       - `request.model` maps to `model-url`.
+//       - `k-hops` and `opts.dimensions` / `opts.pool` /
+//         `opts.runtime` / `opts.fuel-limit` fall to environment
+//         variables with defaults (`WF_SAGEGRAPH_K_HOPS`,
+//         `WF_SAGEGRAPH_DIMENSIONS`, `WF_SAGEGRAPH_POOL`).
+//   * Errors map into `embed-error` variants: unknown model URL
+//     surfaces as `no-such-model`; oversize inputs (the memo's
+//     `too-large(u32)` arm) don't naturally fit GraphSAGE — the
+//     mapping folds unclassified failures into `backend-error`.
+//
+// Retained bare exports:
+//
+//   * `sweep(model-url, subject-pattern, target-sink-url, k-hops,
+//     opts)` — no well-known interface for precompute-and-write.
+//   * `search(index-url, query-vec, k, opts)` — KNN over embeddings;
+//     semantically distinct from the memo's text-based
+//     `tegmentum:webfunction/search@0.1.0`. Retained as bare so
+//     legacy callers still reach it; a future vector-search
+//     well-known interface would fold it in without source change.
+
+package stardog:wf-sagegraph@0.2.0;
+
+/// Local types for the retained bare exports (sweep / search).
+/// Mirrors the legacy wf:sagegraph/types shape byte-for-byte so
+/// existing callers keep working.
+interface local-types {
+    /// One returned KNN hit — the shape wf-vector's cache emits.
+    record hit {
+        node: string,
+        score: f64,
+    }
+
+    /// Embed options retained for the retained-bare `sweep` export
+    /// (which mirrors it into `sweep-opts`).
+    record embed-opts {
+        dimensions: u32,
+        pool: string,
+        runtime: option<string>,
+        fuel-limit: option<u64>,
+    }
+
+    record sweep-opts {
+        dimensions: u32,
+        pool: string,
+        batch-size: u32,
+        concurrency: u32,
+    }
+
+    record search-opts {
+        metric: option<string>,
+        oversample: option<u32>,
+    }
+}
+
+/// Local host callback surface. Kept crate-local because this
+/// crate's kernels only need `execute-query` (SPARQL text →
+/// SPARQL Results JSON) and `http-post-json` (body-in / body-out).
+/// The shared `tegmentum:webfunction/graph-callbacks` /
+/// `http-callbacks` interfaces carry richer typed results (query
+/// variant, http-response record); folding into them is a
+/// follow-on shape change deferred to keep this prototype minimal.
+interface host {
+    execute-query: func(query: string) -> result<string, string>;
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}
+
+/// Guest world for wf_sagegraph. Named-extension `embed` sits
+/// alongside the sparql-extension include (empty filter / aggregate
+/// / property-function registries) and the crate-local bare
+/// `sweep` / `search` exports.
+world sagegraph-extension {
+    // Base substrate discipline — a guest carrying only well-known
+    // named exports still declares empty registries.
+    include tegmentum:webfunction/sparql-extension@0.1.0;
+
+    // Named-extension entry point — this session's landing.
+    export tegmentum:webfunction/embed@0.1.0;
+
+    // Retained bare exports (see WIT header comment for rationale).
+    use local-types.{hit, sweep-opts, search-opts};
+    import host;
+
+    export sweep: func(
+        model-url: string,
+        subject-pattern: string,
+        target-sink-url: string,
+        k-hops: u32,
+        opts: sweep-opts,
+    ) -> result<u32, string>;
+
+    export search: func(
+        index-url: string,
+        query-vec: list<f32>,
+        k: u32,
+        opts: search-opts,
+    ) -> result<list<hit>, string>;
+}

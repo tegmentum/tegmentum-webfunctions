@@ -47,43 +47,194 @@
 // the WIT record shape byte-for-byte, so the wasm and non-wasm builds
 // share one kernel implementation.
 
+// wit-bindgen bindings live in a cargo-component-generated
+// `bindings.rs`; both are gated on the wasm target so the pure
+// kernels remain testable on the native host.
 #[cfg(target_family = "wasm")]
-wit_bindgen::generate!({
-    world: "wf-sagegraph",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 #[cfg(target_family = "wasm")]
 mod wasm_glue {
-    //! Wire the wit-bindgen-generated `Guest` trait to the kernel
+    //! Wire the wit-bindgen-generated Guest traits to the kernel
     //! modules. Only compiled for the wasm build; the host build uses
     //! the plain-Rust types below.
-    use super::*;
+    //!
+    //! # Well-known-exports migration
+    //!
+    //! The named `tegmentum:webfunction/embed@0.1.0` interface is
+    //! wired to `embed_kernel::embed`. The `embed-request` shape
+    //! only carries `text` / `model`; the legacy `node-iri`,
+    //! `model-url`, `k-hops`, and `opts` arguments map as:
+    //!
+    //!   * `request.text` → `node_iri` (semantic shift: the
+    //!     well-known interface names the input `text` because
+    //!     typical guests run text through an embedder; wf_sagegraph
+    //!     runs a graph node through GraphSAGE).
+    //!   * `request.model` → `model_url` (defaults from env var
+    //!     `WF_SAGEGRAPH_MODEL_URL` when absent, else empty string).
+    //!   * `k_hops` from env `WF_SAGEGRAPH_K_HOPS` (default 1).
+    //!   * `EmbedOpts` fields from env vars with defaults matching
+    //!     the crate's demo model (`dimensions=8`, `pool="mean"`).
+    //!
+    //! Errors map into `embed-error`:
+    //!   * `no-such-model` — kernel returned an error whose message
+    //!     mentions "model" (unknown model URL / model load failure).
+    //!   * `backend-error` — everything else (SPARQL failure, graph
+    //!     shape errors, ONNX runtime errors).
+    //!   * `too-large(u32)` — not fired by GraphSAGE; the neighborhood
+    //!     bound is `k_hops`, not an input token count.
+    //!
+    //! Retained bare exports (`sweep`, `search`) stay on the
+    //! world-level Guest trait unchanged.
 
-    struct Component;
+    use super::bindings;
+    // Top-level bindings aliases for the world's `use local-types.{...}`
+    // — these are the record shapes the world-level Guest trait's
+    // sweep / search methods take as parameters and return.
+    use bindings::{Hit as WitHit, SearchOpts as WitSearchOpts, SweepOpts as WitSweepOpts};
+    use bindings::exports::tegmentum::webfunction::aggregate::{
+        AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+    };
+    use bindings::exports::tegmentum::webfunction::embed::{
+        EmbedError, EmbedRequest, Guest as EmbedGuest,
+    };
+    use bindings::exports::tegmentum::webfunction::extension::{
+        FunctionDescriptor, Guest as ExtensionGuest,
+    };
+    use bindings::exports::tegmentum::webfunction::property_function::{
+        BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+    };
+    use bindings::stardog::wf_sagegraph::host;
+    use bindings::tegmentum::webfunction::types::Term as WitTerm;
 
-    impl Guest for Component {
-        fn embed(
-            node_iri: String,
-            model_url: String,
-            k_hops: u32,
-            opts: EmbedOpts,
-        ) -> Result<Vec<f32>, String> {
+    pub(crate) struct Component;
+
+    // ---------------------------------------------------------------
+    // Named-extension `embed` — well-known-exports memo §4.
+    // ---------------------------------------------------------------
+
+    impl EmbedGuest for Component {
+        fn embed(request: EmbedRequest) -> Result<Vec<f32>, EmbedError> {
+            let node_iri = request.text;
+            let model_url = request
+                .model
+                .unwrap_or_else(|| env_or("WF_SAGEGRAPH_MODEL_URL", ""));
+            let k_hops = env_u32("WF_SAGEGRAPH_K_HOPS", 1);
             let opts = crate::EmbedOpts {
-                dimensions: opts.dimensions,
-                pool: opts.pool,
-                runtime: opts.runtime,
-                fuel_limit: opts.fuel_limit,
+                dimensions: env_u32("WF_SAGEGRAPH_DIMENSIONS", 8),
+                pool: env_or("WF_SAGEGRAPH_POOL", "mean"),
+                runtime: std::env::var("WF_SAGEGRAPH_RUNTIME").ok(),
+                fuel_limit: std::env::var("WF_SAGEGRAPH_FUEL_LIMIT")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
             };
             crate::embed_kernel::embed(&node_iri, &model_url, k_hops, &opts, &HostCallbacks)
+                .map_err(classify_embed_error)
+        }
+    }
+
+    /// Route kernel error strings into the typed `embed-error`
+    /// variant. GraphSAGE has no natural `too-large(u32)` arm — the
+    /// neighborhood bound is `k_hops`, not a token count — so
+    /// everything unclassified falls to `backend-error`.
+    fn classify_embed_error(msg: String) -> EmbedError {
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("model") && (lower.contains("unknown") || lower.contains("not found") ||
+            lower.contains("load") || lower.contains("no such"))
+        {
+            EmbedError::NoSuchModel(msg)
+        } else {
+            EmbedError::BackendError(msg)
+        }
+    }
+
+    fn env_or(name: &str, default: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    fn env_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    // ---------------------------------------------------------------
+    // sparql-extension stubs — no filter / aggregate / property
+    // functions.
+    // ---------------------------------------------------------------
+
+    impl ExtensionGuest for Component {
+        fn register() -> Vec<FunctionDescriptor> {
+            Vec::new()
         }
 
+        fn call(name: String, _args: Vec<WitTerm>) -> Result<WitTerm, String> {
+            Err(format!(
+                "wf_sagegraph: no filter function '{name}' registered \
+                 (embed is dispatched via the named-extension interface; \
+                 sweep / search remain as bare world-level exports)"
+            ))
+        }
+    }
+
+    impl AggregateGuest for Component {
+        type AggregateState = UnreachableAggregateState;
+
+        fn register_aggregates() -> Vec<AggregateDescriptor> {
+            Vec::new()
+        }
+
+        fn new_aggregate(name: String) -> Result<AggregateState, String> {
+            Err(format!(
+                "wf_sagegraph: unknown aggregate '{name}' (this component provides none)"
+            ))
+        }
+    }
+
+    pub struct UnreachableAggregateState;
+
+    impl GuestAggregateState for UnreachableAggregateState {
+        fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+            Err("wf_sagegraph: aggregate state was never constructed".into())
+        }
+
+        fn finish(&self) -> Result<WitTerm, String> {
+            Err("wf_sagegraph: aggregate state was never constructed".into())
+        }
+    }
+
+    impl PropertyFunctionGuest for Component {
+        fn register_property_functions() -> Vec<PropertyDescriptor> {
+            Vec::new()
+        }
+
+        fn evaluate(
+            name: String,
+            _subjects: Vec<WitTerm>,
+            _objects: Vec<WitTerm>,
+        ) -> Result<Vec<BindingRow>, String> {
+            Err(format!(
+                "wf_sagegraph: unknown property function '{name}' (this component provides none)"
+            ))
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // World-level bare exports — retained `sweep` and `search`.
+    // ---------------------------------------------------------------
+
+    impl bindings::Guest for Component {
         fn sweep(
             model_url: String,
             subject_pattern: String,
             target_sink_url: String,
             k_hops: u32,
-            opts: SweepOpts,
+            opts: WitSweepOpts,
         ) -> Result<u32, String> {
             let opts = crate::SweepOpts {
                 dimensions: opts.dimensions,
@@ -105,8 +256,8 @@ mod wasm_glue {
             index_url: String,
             query_vec: Vec<f32>,
             k: u32,
-            opts: SearchOpts,
-        ) -> Result<Vec<Hit>, String> {
+            opts: WitSearchOpts,
+        ) -> Result<Vec<WitHit>, String> {
             let opts = crate::SearchOpts {
                 metric: opts.metric,
                 oversample: opts.oversample,
@@ -115,7 +266,7 @@ mod wasm_glue {
                 crate::search_kernel::search(&index_url, &query_vec, k, &opts, &HostCallbacks)?;
             Ok(hits
                 .into_iter()
-                .map(|h| Hit {
+                .map(|h| WitHit {
                     node: h.node,
                     score: h.score,
                 })
@@ -127,37 +278,36 @@ mod wasm_glue {
 
     impl crate::HostBridge for HostCallbacks {
         fn execute_query(&self, query: &str) -> Result<String, String> {
-            wf::sagegraph::host::execute_query(query)
+            host::execute_query(query)
         }
         fn http_post_json(&self, url: &str, body: &str) -> Result<String, String> {
-            wf::sagegraph::host::http_post_json(url, body)
+            host::http_post_json(url, body)
         }
     }
 
-    export!(Component);
+    bindings::export!(Component with_types_in bindings);
 }
 
 // ---------------------------------------------------------------------------
-// Plain-Rust structs mirroring the WIT records.
-//
-// These are the shapes the pure kernels consume on the host (unit-test)
-// build. Kept fieldwise-identical to the WIT record layout so kernels
-// compile against the same field names in both builds — on wasm the
-// `crate::EmbedOpts` symbol resolves to the wit-bindgen-generated
-// `wf::sagegraph::types::EmbedOpts` re-export (see `bindings.rs`),
-// which carries the same fields. Gated with
-// `#[cfg(not(target_family = "wasm"))]` because the wasm build's
-// wit-bindgen `generate!` re-exports the same identifiers at crate
-// root; declaring plain-Rust structs of the same name there would
-// collide (E0428) and their derived traits would conflict (E0119).
+// Plain-Rust structs — the shapes the pure kernels consume in BOTH
+// the native (unit-test) build and the wasm build. Kept
+// fieldwise-identical to the WIT record layouts so the wasm_glue
+// module can translate WIT records to these with a per-field
+// assignment. No cfg gate: the wit-bindgen-generated aliases live
+// inside `mod bindings`, so declaring the same identifiers at crate
+// root does not collide.
 // ---------------------------------------------------------------------------
 
 pub mod embed_kernel;
 pub mod sweep_kernel;
 pub mod search_kernel;
 
-/// Mirror of the WIT `embed-opts` record.
-#[cfg(not(target_family = "wasm"))]
+/// Kernel-side mirror of the historical WIT `embed-opts` record.
+/// The well-known-exports migration dropped `embed-opts` from the
+/// WIT (the named `tegmentum:webfunction/embed@0.1.0` interface's
+/// `embed-request` only carries `text` / `model`). The struct
+/// remains here because the kernel still needs the tuning knobs;
+/// wasm_glue populates it from env vars.
 #[derive(Debug, Clone)]
 pub struct EmbedOpts {
     pub dimensions: u32,
@@ -166,8 +316,7 @@ pub struct EmbedOpts {
     pub fuel_limit: Option<u64>,
 }
 
-/// Mirror of the WIT `sweep-opts` record.
-#[cfg(not(target_family = "wasm"))]
+/// Kernel-side mirror of the WIT `sweep-opts` record.
 #[derive(Debug, Clone)]
 pub struct SweepOpts {
     pub dimensions: u32,
@@ -176,17 +325,15 @@ pub struct SweepOpts {
     pub concurrency: u32,
 }
 
-/// Mirror of the WIT `search-opts` record.
-#[cfg(not(target_family = "wasm"))]
+/// Kernel-side mirror of the WIT `search-opts` record.
 #[derive(Debug, Clone)]
 pub struct SearchOpts {
     pub metric: Option<String>,
     pub oversample: Option<u32>,
 }
 
-/// Mirror of the WIT `hit` record. Kernels return this; the wasm
-/// glue re-projects it into the generated `Hit` when crossing back.
-#[cfg(not(target_family = "wasm"))]
+/// Kernel-side mirror of the WIT `hit` record. Kernels return this;
+/// wasm_glue re-projects it into `bindings::Hit` when crossing back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub node: String,
