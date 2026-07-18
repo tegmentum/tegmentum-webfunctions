@@ -1,0 +1,28 @@
+# Trivial reference SPARQL extension. Exports one filter function,
+# `upper`, that uppercases a string literal. Its sole purpose is to
+# prove the extension lifecycle end-to-end — `register` at load,
+# `call` per invocation — against the native host. Additional
+# functions belong in follow-up crates so each is honestly the
+# smallest thing that can fail.
+[package]
+name = "example-uppercase-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference SPARQL extension: single `upper` filter function."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Matches the
+# version oxigraph-wasm's Phase 2 shim uses so the two components
+# resolve against a single wit-bindgen-rt in the wider workspace.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "sparql-extension"

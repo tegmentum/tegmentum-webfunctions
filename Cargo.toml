@@ -186,6 +186,12 @@ members = [
     "crates/sirix_udf_hello",
     "crates/sirix_commit_hook_logger",
     "crates/sirix_shredder_uppercase",
+    # Reference SPARQL extensions against tegmentum:webfunction@0.1.0
+    # (migrated from oxigraph-webfunction-plugin@378a956 as part of R2).
+    "crates/example-uppercase-extension",
+    "crates/example-count-aggregate",
+    "crates/example-power-set-property",
+    "crates/example-graph-callback-extension",
 ]
 resolver = "2"
 

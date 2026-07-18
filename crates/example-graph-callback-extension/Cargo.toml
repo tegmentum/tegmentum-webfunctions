@@ -1,0 +1,35 @@
+# Reference SPARQL extension that exercises the Phase 1 host-
+# callback surface. Exports one filter function,
+# `expand-neighborhood`, that takes an IRI argument, issues a SPARQL
+# query via the host's `graph-callbacks::execute-query` to fetch the
+# node's outgoing neighbors, and returns them as a comma-separated
+# string literal.
+#
+# Its sole purpose is to prove the callback round-trip end-to-end —
+# host wires up graph-callbacks, extension imports it, invokes it
+# mid-`call`, gets bindings back, folds them into a return term.
+# Additional shapes (http-callbacks consumer, wasm-callbacks
+# consumer once Phase 2 lands) belong in follow-up crates so each is
+# honestly the smallest thing that can fail.
+[package]
+name = "example-graph-callback-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference SPARQL extension: single `expand-neighborhood` filter function driving graph-callbacks."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Same version the
+# rest of the workspace pins so wit-bindgen-rt resolves as one
+# moving part.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "extension-with-host-callbacks"

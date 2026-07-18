@@ -1,0 +1,29 @@
+# Reference SPARQL property-function extension. Exports one
+# property function, `power-set`, that emits one binding row per
+# subset of a single input character-string literal. Its sole
+# purpose is to prove the property-function surface end-to-end
+# (multi-binding output, subject-arity=1, object-arity=1).
+#
+# oxigraph 0.5 does NOT expose a hook for custom property
+# functions; this component builds and instantiates but the
+# oxigraph host does not wire property-function dispatch into the
+# SPARQL evaluator. See `docs/architecture.md`.
+[package]
+name = "example-power-set-property"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference SPARQL property function: character-set power-set."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "sparql-extension"

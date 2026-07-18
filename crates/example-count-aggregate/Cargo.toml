@@ -1,0 +1,27 @@
+# Reference SPARQL aggregate extension. Exports one aggregate,
+# `count-distinct-strings`, that counts the distinct string values
+# in a group. Its purpose is to prove the aggregate lifecycle
+# end-to-end — `register-aggregates` at load, `new-aggregate` per
+# SPARQL group, `step` per row, `finish` per group — against the
+# native oxigraph host.
+[package]
+name = "example-count-aggregate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference SPARQL aggregate: distinct-string-count."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Same version
+# the filter-only reference extension pins.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "sparql-extension"
