@@ -169,6 +169,7 @@ members = [
     "crates/wf_skolemize",
     "crates/wf_skolemize-extension",
     "crates/wf_profile-extension",
+    "crates/wf_infer-extension",
     "crates/wf_sql",
     "crates/wf_validate",
     "crates/wf_tree",
