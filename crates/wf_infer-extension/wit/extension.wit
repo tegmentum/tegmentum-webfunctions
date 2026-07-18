@@ -1,0 +1,223 @@
+package tegmentum:webfunction@0.1.0;
+
+/// The RDF value model an extension consumes and produces.
+///
+/// This mirrors the `types` interface exported by the engine world
+/// in `~/git/oxigraph-wasm/wit/world.wit`. Bundled here so the
+/// extension world resolves without a cross-package `use` — the
+/// two interfaces are wire-compatible by sharing a package version.
+///
+/// A second engine (Jena, RDF4J, QLever, distributed) implementing
+/// the sparql-extension surface drops in unchanged: no engine
+/// concept leaks past the `term` variant.
+interface types {
+    /// An IRI as a string. Validation is the engine's job; the WIT
+    /// carries the raw lexical form.
+    type iri = string;
+
+    /// An RDF literal: lexical form, optional datatype, optional
+    /// language tag. `datatype = none` means `xsd:string`; the
+    /// engine applies the RDF 1.1 defaulting rule when it needs a
+    /// concrete datatype.
+    record literal {
+        value: string,
+        datatype: option<iri>,
+        language: option<string>,
+    }
+
+    /// An RDF term restricted to the three non-quoted arms. Phase-1
+    /// extensions do not accept or produce RDF-star quoted triples;
+    /// that surface is a later revision.
+    variant term {
+        named-node(iri),
+        blank-node(string),
+        literal(literal),
+    }
+}
+
+/// The extension surface — what a SPARQL extension component
+/// exports for the host to discover and dispatch into.
+///
+/// Designed around what a SPARQL extension NEEDS TO DO, not around
+/// any single engine's function-registration ABI. The host is
+/// responsible for translating engine terms into `term` values
+/// before calling `call`, and translating the returned `term` back
+/// into the engine's native term type. Neither side of the
+/// crossing knows anything about the other engine's internals.
+///
+/// v0.1 first cut exposed scalar filter functions only. Arc 4 adds
+/// two more interfaces (`aggregate`, `property-function`) IN
+/// SEPARATE WIT INTERFACES so the extension surface remains
+/// composable. A component that only provides filter functions is
+/// unaffected — it exports `extension` and leaves the other two
+/// interfaces' `register-*` functions returning empty lists.
+///
+/// The virtual-predicate, custom-storage-backend, and authorization
+/// surfaces remain future WIT interfaces and MUST NOT be
+/// back-patched onto any of these.
+interface extension {
+    use types.{term};
+
+    /// One function an extension registers with the host at load
+    /// time. `min-arity` and `max-arity` bound the number of
+    /// arguments the host will pass to `call`; `max-arity = none`
+    /// denotes an unbounded variadic function.
+    record function-descriptor {
+        name: string,
+        min-arity: u32,
+        max-arity: option<u32>,
+    }
+
+    /// Announce the filter functions this extension provides.
+    /// Called by the host exactly once, at component load. The host
+    /// binds each descriptor to a name in its SPARQL evaluator's
+    /// custom-function registry.
+    ///
+    /// No arguments: the extension declares its own surface. Every
+    /// invocation later flows through `call` with the descriptor's
+    /// `name`.
+    register: func() -> list<function-descriptor>;
+
+    /// Execute one previously-registered function. The host passes
+    /// the function's `name` (from a prior `register` result) and
+    /// the arguments the SPARQL query bound to it, translated into
+    /// the engine-neutral `term` model.
+    ///
+    /// String error for MVP; a later revision replaces it with an
+    /// `extension-error` variant carrying typed arms (bad-arity,
+    /// bad-argument-type, unbound-argument, ...).
+    call: func(name: string, args: list<term>) -> result<term, string>;
+}
+
+/// User-defined aggregate functions.
+///
+/// SPARQL aggregate semantics: for each GROUP the engine constructs
+/// one accumulator, `step`s it once per input row in the group,
+/// then `finish`es it to produce the per-group value. The WIT
+/// surface mirrors that lifecycle: `new-aggregate(name)` builds a
+/// state; `step` accumulates; `finish` returns the term.
+///
+/// The state is exported as a WIT `resource` so per-group instances
+/// live on the guest side of the boundary — the host holds a
+/// `ResourceAny` handle, drops it once `finish` returns.
+///
+/// Deviation from the initial sketch: the memo proposed
+/// `constructor()` with no name, which cannot disambiguate WHICH
+/// aggregate a component provides more than one of. `new-aggregate:
+/// func(name: string)` is the honest analogue — component-side
+/// state construction is the only way to route to the right
+/// accumulator. The resource still carries `step` + `finish`; the
+/// constructor is replaced by the factory function.
+///
+/// Multi-argument aggregates: `step(args: list<term>)` is a list on
+/// the wire because a future engine (e.g. one that supports the
+/// draft SPARQL 1.2 multi-arg aggregate syntax) can pass more than
+/// one value per row. Oxigraph 0.5 always passes a single-element
+/// list; the extension writes its arity assumption into `step` and
+/// returns an error if the host disagrees.
+interface aggregate {
+    use types.{term};
+
+    /// Same descriptor shape the `extension` interface uses for
+    /// filter functions. `min-arity` / `max-arity` bound the number
+    /// of arguments per `step` call.
+    record aggregate-descriptor {
+        name: string,
+        min-arity: u32,
+        max-arity: option<u32>,
+    }
+
+    /// Per-query-per-group accumulator. One is constructed at the
+    /// start of each SPARQL group, stepped once per row, then
+    /// finished. The host drops the resource handle after `finish`.
+    resource aggregate-state {
+        /// Accumulate one row into the state. `args` is the list of
+        /// per-argument values for this row's contribution.
+        step: func(args: list<term>) -> result<_, string>;
+
+        /// Produce the final aggregated value for this group.
+        /// Called exactly once, after all `step` calls.
+        finish: func() -> result<term, string>;
+    }
+
+    /// Announce the aggregate functions this extension provides.
+    /// Called once at component load; a component that has no
+    /// aggregates returns `[]`.
+    register-aggregates: func() -> list<aggregate-descriptor>;
+
+    /// Construct a fresh accumulator for the named aggregate. The
+    /// host holds the returned resource across `step` and `finish`
+    /// for the lifetime of one SPARQL group.
+    new-aggregate: func(name: string) -> result<aggregate-state, string>;
+}
+
+/// User-defined property functions.
+///
+/// A property function looks like a triple pattern in SPARQL
+/// (`?s :fn ?o`) but is answered by an extension rather than by a
+/// literal triple match. Multi-binding semantics: one invocation
+/// returns zero or more solution rows.
+///
+/// The extension declares, per function, how many bound terms enter
+/// on the "subject side" and the "object side" of the pattern. The
+/// arities determine the shape of each `binding-row` the extension
+/// emits back: `values` is laid out
+/// `[subject-position-0..subject-position-{subject-arity-1},
+///   object-position-0..object-position-{object-arity-1}]`.
+/// Either side may be zero — a property function with
+/// `subject-arity = 0` acts purely on the object side, and vice
+/// versa.
+///
+/// Phase-1 note: oxigraph 0.5 does NOT expose a hook for custom
+/// property functions. This interface still ships so extension
+/// authors can prepare components against the target surface; a
+/// second engine (Jena, RDF4J, distributed) with native
+/// property-function dispatch drives the returned rows directly.
+/// The oxigraph host builds and loads the component but does not
+/// wire property-function dispatch into the SPARQL evaluator; see
+/// `docs/architecture.md`.
+interface property-function {
+    use types.{term};
+
+    /// One returned solution row. `values` positions are declared
+    /// by the descriptor's `subject-arity` + `object-arity`.
+    record binding-row {
+        values: list<term>,
+    }
+
+    /// One property function an extension registers. `subject-arity`
+    /// is the number of terms the host passes as `subjects`;
+    /// `object-arity` is the number passed as `objects`. Both may
+    /// be zero.
+    record property-descriptor {
+        name: string,
+        subject-arity: u32,
+        object-arity: u32,
+    }
+
+    /// Announce the property functions this extension provides.
+    /// A component that has no property functions returns `[]`.
+    register-property-functions: func() -> list<property-descriptor>;
+
+    /// Run a property function. Returns zero or more rows; each
+    /// row's `values` matches the declared arity as documented on
+    /// `binding-row`.
+    evaluate: func(name: string, subjects: list<term>, objects: list<term>)
+        -> result<list<binding-row>, string>;
+}
+
+/// Guest world for SPARQL extension components. A component that
+/// targets this world compiles to a single `.wasm` artifact that
+/// loads unchanged under every host implementing the extension
+/// dispatch protocol — native oxigraph, standalone wasm host, or
+/// (Phase 2) a browser build via jco + wasi-polyfill.
+///
+/// A component may implement any non-empty subset of the three
+/// exported interfaces: a filter-only component returns `[]` from
+/// `register-aggregates` and `register-property-functions` and can
+/// panic in the never-called `new-aggregate` / `evaluate`.
+world sparql-extension {
+    export extension;
+    export aggregate;
+    export property-function;
+}

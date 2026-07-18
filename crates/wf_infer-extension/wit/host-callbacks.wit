@@ -1,0 +1,198 @@
+// Host-side callback interfaces — the extension's half of the
+// substrate boundary. Sits in the same package
+// (`tegmentum:webfunction@0.1.0`) as the extension exports declared
+// in `extension.wit` and the engine world declared in
+// `~/git/oxigraph-wasm/wit/world.wit`.
+//
+// Design memo:
+//   ~/git/wf-conformance/docs/design/wf-host-callbacks.md
+//
+// Phase 1 landing. The three interfaces below are the "extension
+// imports, host exports" direction. The `custom-function-registry`
+// / `aggregate-registry` / `property-function-registry` in the engine
+// world are the "engine imports, extension exports" direction.
+// Together they close the substrate's I/O boundary.
+//
+// Constraints hit in Phase 1:
+//
+// * `types` is already defined once in `extension.wit`. WIT permits
+//   one definition per interface name per package, so `binding` and
+//   `quad` — which the memo carries in the engine world's `types` —
+//   land here as records inside the interface that consumes them
+//   rather than as an addition to `types`. Wire-compatible with the
+//   engine's counterparts.
+//
+// * `wasm-callbacks::invoke-wasm` returns a single `term` rather than
+//   the memo §4 `list<term>` — the Phase 1 stub only signals
+//   `not-found`, and single-term keeps the interface minimal while
+//   Phase 2 designs the full sub-component dispatch shape.
+//
+// * `list<http-header>` (record) is used rather than the memo's
+//   `list<tuple<string, string>>` per the deliverable spec — reads
+//   more clearly at guest and host sites; tuple form would render as
+//   `Vec<(String, String)>` but the record form generates a named
+//   struct.
+package tegmentum:webfunction@0.1.0;
+
+/// SPARQL access to the surrounding graph. Extensions import this to
+/// reach out of the wasm sandbox into the host's engine (native
+/// oxigraph store, jena/RDF4J bridge, remote SPARQL endpoint —
+/// unchanged at the WIT surface).
+///
+/// The reference host implementation in
+/// `crates/host-callbacks-impl/` holds an `oxigraph::Store` behind
+/// this interface. A second host implementing this against a
+/// different engine drops in unchanged: no engine concept surfaces.
+interface graph-callbacks {
+    use types.{term};
+
+    /// One SPARQL solution entry — variable name plus its bound term.
+    ///
+    /// Named record here rather than `use types.{binding}` because the
+    /// current `types` interface (declared in `extension.wit`) does
+    /// not carry `binding`; adding it there was ruled out for Phase 1
+    /// (scope-fenced). Wire-compatible with the engine world's
+    /// `types.binding` record.
+    record binding {
+        variable: string,
+        value: term,
+    }
+
+    /// An RDF quad. `graph = none` denotes the default graph. IRI
+    /// carried as `string` rather than `use types.{iri}` for the
+    /// same reason `binding` is defined here.
+    record quad {
+        subject: term,
+        predicate: term,
+        object: term,
+        graph: option<string>,
+    }
+
+    /// The three shapes SPARQL produces — `SELECT` returns bindings,
+    /// `CONSTRUCT`/`DESCRIBE` return quads, `ASK` returns a boolean.
+    /// The variant makes the query shape a compile-time property of
+    /// the callback site.
+    ///
+    /// Deviation from memo §4: `bindings` carries `list<binding>` —
+    /// a flat list of bindings across all solutions — rather than
+    /// `list<list<binding>>` per the deliverable spec. The flat shape
+    /// keeps the wire simple; guests that need per-row grouping split
+    /// on variable identity.
+    variant query-result {
+        bindings(list<binding>),
+        quads(list<quad>),
+        boolean(bool),
+    }
+
+    /// Typed error for graph-callbacks. Three cases, no catchall:
+    ///
+    ///   * `syntax-error` — the SPARQL text did not parse.
+    ///   * `backend-error` — the native engine failed at evaluation.
+    ///   * `not-permitted` — the host declined per capability policy
+    ///     (memo §5). Guests handle policy denial differently from a
+    ///     genuine backend failure (retry pointless, degrade or fail).
+    variant graph-call-error {
+        syntax-error(string),
+        backend-error(string),
+        not-permitted(string),
+    }
+
+    /// Execute a SPARQL query. Returns eagerly (Preview 2 async
+    /// streams remain immature in wit-bindgen 0.44 / cargo-component
+    /// 0.21.1); a streaming variant is a follow-on revision.
+    execute-query: func(sparql: string) -> result<query-result, graph-call-error>;
+
+    /// Execute a SPARQL Update. Returns no mutation count — every
+    /// backend counts differently. Guests that need a count run a
+    /// follow-up SELECT.
+    execute-update: func(sparql: string) -> result<_, graph-call-error>;
+}
+
+/// Outbound HTTP. Extensions import this to reach services that do
+/// not sit behind SPARQL — vector-index endpoints, LLM inference,
+/// blob stores. The reference host implementation uses `ureq` under
+/// a hostname allowlist.
+interface http-callbacks {
+    /// One header — name/value pair. Case sensitivity: HTTP header
+    /// names are case-insensitive on the wire; the host trampoline
+    /// lower-cases on receipt and returns canonical casing on the
+    /// way out. WIT does not encode case-insensitivity.
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    /// The HTTP response returned by both `http-get` and
+    /// `http-post-json`. Withholding status / headers at the WIT
+    /// surface forces ad-hoc conventions (body prefix, marker
+    /// strings) — the memo's motivation for lifting these into the
+    /// typed shape.
+    record http-response {
+        status: u16,
+        headers: list<http-header>,
+        body: string,
+    }
+
+    /// Four cases, split so guests can react differently. A 404 as
+    /// `status(404)` is often a valid "does not exist" answer where
+    /// a network error is a retry candidate.
+    variant http-error {
+        network(string),
+        status(u16),
+        invalid-request(string),
+        not-permitted(string),
+    }
+
+    http-get: func(url: string, headers: list<http-header>)
+        -> result<http-response, http-error>;
+
+    http-post-json: func(url: string, body: string, headers: list<http-header>)
+        -> result<http-response, http-error>;
+}
+
+/// Sub-component dispatch. An extension asks the host to invoke
+/// another extension component, mediated by the host's component
+/// registry. Phase 1 lands the WIT surface only — the reference
+/// implementation is a stub returning `not-found` for every
+/// invocation. Full impl is Phase 2 concern (component-registry
+/// composition, reentrancy discipline, resource lifetime).
+interface wasm-callbacks {
+    use types.{term};
+
+    /// Three cases, no catchall. `not-found` is the routing-table
+    /// miss; `invocation-error` is opaque runtime failure inside the
+    /// invoked component; `not-permitted` is capability denial.
+    variant wasm-call-error {
+        not-found(string),
+        invocation-error(string),
+        not-permitted(string),
+    }
+
+    /// Invoke a named function on a sub-component identified by URI.
+    /// Return shape is a single `term` for Phase 1; a `list<term>` /
+    /// binding-row shape is a Phase 2 decision once the full
+    /// component-registry lands.
+    invoke-wasm: func(component-uri: string, function-name: string, args: list<term>)
+        -> result<term, wasm-call-error>;
+}
+
+/// Guest world for extensions that require host callbacks. Combines
+/// the extension exports declared in `extension.wit` (filter,
+/// aggregate, property-function surfaces) with the three callback
+/// imports declared above. A component that targets this world
+/// compiles to a single `.wasm` artifact that loads under any host
+/// implementing the callback traits.
+///
+/// A component that provides only filter functions and imports only
+/// `graph-callbacks` still targets this world — the unused aggregate
+/// / property-function exports return `[]` from their register
+/// functions, and unused callback imports never surface.
+world extension-with-host-callbacks {
+    export extension;
+    export aggregate;
+    export property-function;
+
+    import graph-callbacks;
+    import http-callbacks;
+    import wasm-callbacks;
+}

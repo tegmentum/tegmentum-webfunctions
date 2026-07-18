@@ -1,0 +1,88 @@
+# Sibling crate to wf_infer. Migrates the "run a CONSTRUCT rule and
+# insert its derivations into a target graph" logic from the Stardog-
+# era `host::execute-query` / `host::execute-update` callback surface
+# onto the standardized `tegmentum:webfunction/graph-callbacks@0.1.0`
+# interface declared in `~/git/oxigraph-extension/wit/host-callbacks.wit`.
+#
+# Design memo: `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
+# (§7 migration path). This is the second Phase-2 migration lifting a
+# real wf_* execute-query consumer off the per-crate `interface host`
+# and onto the shared package; wf_profile-extension was the first.
+#
+# Shape validated beyond wf_profile:
+#   * `graph-callbacks::execute-update` — wf_profile only exercised
+#     `execute-query`. This crate CLEARs and INSERTs, closing the
+#     write-side callback surface.
+#   * `query-result::quads` arm — the CONSTRUCT SPARQL that
+#     materializes derived triples returns `Quads`, not `Bindings`.
+#     wf_profile only touched the Bindings arm.
+#   * Multi-callback per invocation — a single `run-rule` call issues
+#     at least three callbacks (CLEAR + CONSTRUCT + INSERT) and up to
+#     `2 * max_iterations + 1` under iterate mode. Validates callback
+#     discipline / reentrancy against the reference host impl.
+#
+# Layout mirrors `wf_profile-extension` (Arc 5 of custom-function-
+# registry) plus a fresh copy of the oxigraph-extension WIT
+# (`wit/extension.wit` + `wit/host-callbacks.wit`) so cargo-component
+# resolves the world locally without a cross-repo target-path.
+#
+# The original `wf_infer` crate stays put — it still targets the
+# `stardog:webfunction@0.5.0` host, its evaluate() is called via
+# wf:call on the Stardog plugin path. This sibling exposes the same
+# rule engine at scalar filter scope so any host implementing the
+# shared extension world (starting with the reference
+# `host-callbacks-impl` in `~/git/oxigraph-extension/`) can dispatch
+# it.
+#
+# The rule parser and CONSTRUCT-text synthesis are duplicated with
+# attribution rather than imported cross-crate (same discipline
+# wf_skolemize-extension and wf_profile-extension adopted): the
+# original wf_infer crate is a `cdylib` targeting wasm32-wasip1 under
+# `stardog:webfunction@0.5.0` and cannot be depended on as a library.
+# Attribution lives at the head of `src/lib.rs`.
+[package]
+name = "wf_infer-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SPARQL extension: run-rule — Phase-2 migration of wf_infer onto tegmentum:webfunction/graph-callbacks@0.1.0."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Version matches
+# `wf_profile-extension` (the Arc-5 sibling this crate follows) so
+# wit-bindgen-rt resolves as one moving part in every downstream host.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+# JSON parse for the rule descriptor and serialize for the summary
+# return literal. Same version wf_profile-extension pins.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "wit"
+world = "extension-with-host-callbacks"
+
+# ---------------------------------------------------------------------
+# Smoke test — end-to-end callback round-trip through wasmtime.
+# ---------------------------------------------------------------------
+#
+# Same rationale as `wf_profile-extension/Cargo.toml`: consume the
+# reference `host-callbacks-impl` from `~/git/oxigraph-extension/` as
+# a cross-repo dev-dep so the smoke test validates the migration
+# against the actual reference host, not a hand-rolled trait impl.
+# Dev-dep only — does not pollute the cdylib artifact.
+[dev-dependencies]
+host-callbacks-impl = { path = "../../../oxigraph-extension/crates/host-callbacks-impl" }
+wasmtime = { version = "46.0.1", features = ["component-model"] }
+serde_json = "1"
+# Direct oxigraph handle so the smoke test can inspect the underlying
+# store out-of-band after the extension writes through the callback
+# surface (verify that INSERT / CLEAR actually landed as expected).
+# Version pinned to the same major that host-callbacks-impl uses.
+oxigraph = "0.5"
