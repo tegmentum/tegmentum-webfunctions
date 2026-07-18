@@ -1,0 +1,40 @@
+# Sibling crate to wf_skolemize. Exports the skolemization primitive
+# (well-known-genid IRI minted deterministically from a blank-node
+# label) as a Phase-1 SPARQL extension filter function under the
+# `tegmentum:webfunction/extension@0.1.0` world.
+#
+# Layout mirrors `example-uppercase-extension` in
+# `~/git/oxigraph-extension/crates/example-uppercase-extension/` so
+# any host implementing the extension surface loads this component
+# with no additional wiring.
+#
+# The original wf_skolemize crate remains a stardog:webfunction guest
+# targeting the full v0.5.0 world (host callbacks, execute-query,
+# execute-update). Its evaluate() orchestrates a batch graph rewrite;
+# the per-value primitive it uses to mint each canonical IRI is what
+# this sibling crate re-exposes at SPARQL BIND scope. The algorithmic
+# core (see src/lib.rs) is duplicated with attribution rather than
+# imported cross-crate to avoid modifying wf_skolemize.
+[package]
+name = "wf_skolemize-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SPARQL extension: skolemize(term) — mint a deterministic well-known-genid IRI from a blank-node label."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Version matches
+# the example-uppercase-extension in oxigraph-extension so both
+# components resolve against a single wit-bindgen-rt in downstream
+# hosts.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "wit"
+world = "sparql-extension"
