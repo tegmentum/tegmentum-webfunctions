@@ -5,32 +5,49 @@
 //! `use std::iter` — that never compiled. This port implements the
 //! evidently-intended behaviour.)
 
-wit_bindgen::generate!({ world: "webfunction", path: "wit" });
+#[allow(warnings)]
+mod bindings;
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+/// Legacy names — kept as type aliases so the ported business logic
+/// below reads with minimum diff against the flat-world original. The
+/// `Term::Triple` arm added by the R2 types consolidation is handled
+/// in each `match` inside this file.
+type Value = WitTerm;
+type Literal = WitLiteral;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
-
 struct Component;
 
 const XSD_STRING:      &str = "http://www.w3.org/2001/XMLSchema#string";
 const ARRAY_DATATYPE:  &str = "tag:stardog:api:array";
 
 fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+    WitTerm::Literal(WitLiteral { value: s.into(), datatype: Some(XSD_STRING.into()), language: None })
 }
 
 fn value_to_json(v: &Value) -> JsonValue {
     match v {
-        Value::Iri(s) => {
+        WitTerm::NamedNode(s) => {
             let mut m = JsonMap::new();
             m.insert("iri".into(), JsonValue::String(s.clone()));
             JsonValue::Object(m)
         }
-        Value::Literal(l) => {
+        WitTerm::Literal(l) => {
             let mut inner = JsonMap::new();
-            inner.insert("label".into(), JsonValue::String(l.label.clone()));
-            inner.insert("datatype".into(), JsonValue::String(l.datatype.clone()));
-            inner.insert("lang".into(), match &l.lang {
+            inner.insert("label".into(), JsonValue::String(l.value.clone()));
+            inner.insert("datatype".into(), JsonValue::String(l.datatype.clone().unwrap_or_default()));
+            inner.insert("lang".into(), match &l.language {
                 Some(s) => JsonValue::String(s.clone()),
                 None => JsonValue::Null,
             });
@@ -38,63 +55,97 @@ fn value_to_json(v: &Value) -> JsonValue {
             m.insert("literal".into(), JsonValue::Object(inner));
             JsonValue::Object(m)
         }
-        Value::Bnode(s) => {
+        WitTerm::BlankNode(s) => {
             let mut m = JsonMap::new();
             m.insert("bnode".into(), JsonValue::String(s.clone()));
             JsonValue::Object(m)
         }
-    }
+            WitTerm::Triple(_) => panic!("quoted triples are not supported by this component"),
+}
 }
 
 fn size_of(v: &Value) -> Result<usize, String> {
     match v {
-        Value::Literal(l) => l.label.parse::<usize>()
+        WitTerm::Literal(l) => l.value.parse::<usize>()
             .map_err(|e| format!("array_fill: size not a non-negative integer: {}", e)),
         _ => Err("array_fill: size must be a numeric literal".into()),
     }
 }
 
 fn encode_array_json(items: Vec<JsonValue>) -> Value {
-    Value::Literal(Literal {
-        label: JsonValue::Array(items).to_string(),
-        datatype: ARRAY_DATATYPE.into(),
-        lang: None,
-    })
+    WitTerm::Literal(WitLiteral { value: JsonValue::Array(items).to_string(), datatype: Some(ARRAY_DATATYPE.into()), language: None })
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "array_fill".to_string(),
+            min_arity: 0,
+            max_arity: None,
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "array_fill" => evaluate_impl(args),
+            other => Err(format!("array_fill: unknown function '{other}'")),
+        }
+    }
+}
+
+fn evaluate_impl(args: Vec<Value>) -> Result<Value, String> {
         if args.len() != 2 {
             return Err(format!("array_fill: expected 2 args (value, size), got {}", args.len()));
         }
         let element = value_to_json(&args[0]);
         let size = size_of(&args[1])?;
         let filled: Vec<JsonValue> = std::iter::repeat(element).take(size).collect();
-        Ok(BindingSets {
-            vars: vec!["result".into()],
-            rows: vec![vec![Binding { name: "result".into(), value: encode_array_json(filled) }]],
-        })
+        Ok(encode_array_json(filled))
     }
 
-    fn aggregate_step(_a: Vec<Value>, _m: u64) -> Result<(), String> {
-        Err("array_fill: aggregate not applicable".into())
+/// Aggregate interface stub — this component provides none.
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("array_fill: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(_i: Cardinality, _a: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "array_fill(value, size) -> array of `size` copies of `value`."),
-            }]],
-        }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "array_fill: unknown aggregate '{name}' (this component provides none)"
+        ))
     }
 }
 
-export!(Component);
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("array_fill: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("array_fill: aggregate state was never constructed".into())
+    }
+}
+
+/// Property-function interface stub — this component provides none.
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "array_fill: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+
