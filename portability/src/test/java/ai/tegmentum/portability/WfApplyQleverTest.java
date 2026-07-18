@@ -56,8 +56,8 @@ import static org.junit.Assume.assumeTrue;
  * <pre>
  *   # Prepare a fixture graph and wasm dir on the host.
  *   mkdir -p /tmp/wf-apply-qlever && cd /tmp/wf-apply-qlever
- *   cp ~/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_apply.wasm .
- *   cp ~/git/tegmentum-webfunctions/target/wasm32-wasip1/release/string_lang_detect.wasm .
+ *   cp ~/git/webfunctions/target/wasm32-wasip1/release/wf_apply.wasm .
+ *   cp ~/git/webfunctions/target/wasm32-wasip1/release/string_lang_detect.wasm .
  *   cat &gt; graph.ttl &lt;&lt;'EOF'
  *   @prefix comp: &lt;http://tegmentum.ai/ns/composition/&gt; .
  *   @prefix :    &lt;urn:demo:&gt; .

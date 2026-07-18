@@ -1,4 +1,5 @@
-# Cargo workspace for the tegmentum WebAssembly component standard library.
+# Cargo workspace for the webfunctions WebAssembly component library —
+# reusable SPARQL extension components against the shared substrate.
 # Each crate is a single-function wasm component (built via cargo component).
 # All crates share the WIT world at shared/wit/webfunction.wit.
 

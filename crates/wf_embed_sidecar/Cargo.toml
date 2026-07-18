@@ -39,7 +39,7 @@ path = "src/main.rs"
 # doesn't apply here.
 #
 # NOTE: enabling `ort-download-binaries` inside a workspace member is
-# safe here because no other tegmentum-webfunctions workspace crate
+# safe here because no other webfunctions workspace crate
 # depends on `ort` or `fastembed` (the guest wasms target
 # wasm32-wasip1 and neither transitively pulls fastembed in).
 fastembed = "=5.2.0"

@@ -47,7 +47,7 @@ public class WfServiceOxigraphValuesTest {
             "oxigraph.update.url", "http://localhost:3137/update");
     private static final String WASM_URL_IN_QUERY = System.getProperty(
             "oxigraph.wasm.url",
-            "file:///Users/zacharywhitley/git/tegmentum-webfunctions/"
+            "file:///Users/zacharywhitley/git/webfunctions/"
                 + "target/wasm32-wasip1/release/wf_tree_rows.wasm");
 
     private static final String IN_STORE = "urn:eng";

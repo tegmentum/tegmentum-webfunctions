@@ -1,8 +1,17 @@
-# tegmentum-webfunctions
+# webfunctions
 
-WebAssembly Component Model library of reusable SPARQL procedures. Each
-crate builds to a single `.wasm` binary callable via `wf:call` from any
-triplestore with the tegmentum plugins installed (Stardog, Jena, RDF4J).
+Canonical repository of WebAssembly Component Model SPARQL extension
+components. Each crate builds to a single `.wasm` binary callable
+from any triplestore that speaks the substrate contract — via
+`wf:call` under the legacy `stardog:webfunction@0.5.x` plugin path,
+or as a native SPARQL custom function / aggregate / property function
+under the `tegmentum:webfunction@0.1.0` engine world (see
+`~/git/webfunction-wit/`).
+
+Not tied to a single organizational identity — the `tegmentum` in
+the WIT namespace stays as an identifier for stability, but this
+repository is the canonical extension-components home for the
+ecosystem.
 
 Two flavours of crate live here:
 

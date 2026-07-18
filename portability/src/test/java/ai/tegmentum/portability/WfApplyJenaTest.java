@@ -36,12 +36,12 @@ public class WfApplyJenaTest {
     private static final String WF_APPLY_WASM = System.getProperty(
             "wf.apply.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_apply.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/wf_apply.wasm");
 
     private static final String DETECT_WASM = System.getProperty(
             "wf.detect.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/string_lang_detect.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/string_lang_detect.wasm");
 
     private static Dataset dataset;
 

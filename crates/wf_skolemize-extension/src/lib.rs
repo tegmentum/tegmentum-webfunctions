@@ -18,7 +18,7 @@
 //! # Provenance of the algorithm
 //!
 //! The mint_genid function, IRI prefix, and salt are duplicated from
-//! `~/git/tegmentum-webfunctions/crates/wf_skolemize/src/lib.rs`
+//! `~/git/webfunctions/crates/wf_skolemize/src/lib.rs`
 //! (see mint_genid there). Duplication rather than a cross-crate
 //! import keeps the original wf_skolemize crate unmodified while the
 //! Phase-1 extension WIT surface stabilizes. Both crates converge

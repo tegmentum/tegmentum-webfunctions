@@ -33,7 +33,7 @@ public class WfTreeScaleRdf4jTest {
 
     private static final String WF_TREE_WASM = System.getProperty("wf.tree.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_tree.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/wf_tree.wasm");
 
     private static final int TARGET_NODES = Integer.getInteger("wf.tree.scale.n", 1000);
     private static final int BRANCHING = Integer.getInteger("wf.tree.scale.branching", 3);

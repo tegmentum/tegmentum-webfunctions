@@ -135,7 +135,7 @@ public class WfCallQleverTest {
     /**
      * URL of a guest that calls {@code host::execute_query()} exactly once
      * and returns the first row's first cell as an xsd:string. Not shipped
-     * from tegmentum-webfunctions/crates/ — the crates dir was carved off
+     * from webfunctions/crates/ — the crates dir was carved off
      * from this task's edit scope, so we build the fixture out-of-tree at
      * {@code scratchpad/debug_execute_query/} and mount its wasm into the
      * container. See the 0.5.0 boot-recipe comment on the class Javadoc.

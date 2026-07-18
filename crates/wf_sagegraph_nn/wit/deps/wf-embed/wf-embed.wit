@@ -1,6 +1,6 @@
 // wf_embed WIT world — v0.1.0.
 //
-// Byte-identical copy of ~/git/tegmentum-webfunctions/crates/wf_embed/
+// Byte-identical copy of ~/git/webfunctions/crates/wf_embed/
 // wit/wf-embed.wit; vendored under this crate's wit/deps/ tree so
 // cargo-component's WIT resolver picks the same package + interface
 // path (`wf:embed/host@0.1.0`) at bindings-generation time. The

@@ -9,7 +9,7 @@
     <artifactId>webfunction-portability</artifactId>
     <version>0.1.0-SNAPSHOT</version>
 
-    <name>tegmentum-webfunctions portability harness</name>
+    <name>webfunctions portability harness</name>
     <description>
         Executable proof of Paper 2's headline claim: one wf_tree.wasm
         binary drives recursive execute-query callbacks under multiple

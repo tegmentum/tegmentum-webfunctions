@@ -55,7 +55,7 @@ use host_callbacks_impl::bindings::tegmentum::webfunction::types::Term as WitTer
 /// built artifact under `target/wasm32-wasip2/release/`.
 fn workspace_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // .../tegmentum-webfunctions/crates/wf_profile-extension
+    // .../webfunctions/crates/wf_profile-extension
     p.pop(); // crates/
     p.pop(); // repo root
     p

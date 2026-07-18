@@ -51,7 +51,7 @@ public class WfPropertyRdf4jTest {
 
     private static final String WF_TREE_ROWS_WASM = System.getProperty("wf.tree.rows.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_tree_rows.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/wf_tree_rows.wasm");
 
     // Small fixed graph so we can assert exact structure (row count, depth
     // distribution, single root). A 6-node balanced ternary tree gives us

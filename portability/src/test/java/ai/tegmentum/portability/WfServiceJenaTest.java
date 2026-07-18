@@ -52,7 +52,7 @@ public class WfServiceJenaTest {
     private static final String WF_TREE_ROWS_WASM = System.getProperty(
             "wf.tree.rows.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_tree_rows.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/wf_tree_rows.wasm");
 
     private static final String NS = "urn:";
     private static final String HAS_CHILD = "urn:hasChild";

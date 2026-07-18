@@ -23,7 +23,7 @@
 //! The `Rule` deserializer, `construct_sparql()` synthesis,
 //! CLEAR / INSERT SPARQL templates, and the fixed-point convergence
 //! loop are adapted from
-//! `~/git/tegmentum-webfunctions/crates/wf_infer/src/lib.rs`. The
+//! `~/git/webfunctions/crates/wf_infer/src/lib.rs`. The
 //! shape of every SPARQL string, default values, and error messages
 //! are preserved so a caller migrating from wf:call(wf_infer.wasm)
 //! to run-rule sees byte-equivalent behavior for the same rule JSON.

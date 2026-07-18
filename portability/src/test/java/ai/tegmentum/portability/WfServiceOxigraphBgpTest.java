@@ -50,7 +50,7 @@ public class WfServiceOxigraphBgpTest {
             "oxigraph.update.url", "http://localhost:3139/update");
     private static final String WASM_URL_IN_QUERY = System.getProperty(
             "oxigraph.wasm.url",
-            "file:///Users/zacharywhitley/git/tegmentum-webfunctions/"
+            "file:///Users/zacharywhitley/git/webfunctions/"
                 + "target/wasm32-wasip1/release/wf_tree_rows.wasm");
 
     // Three depts, one employee each — matches the WfServiceOxigraphValuesTest

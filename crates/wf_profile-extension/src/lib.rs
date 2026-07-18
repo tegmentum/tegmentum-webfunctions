@@ -23,7 +23,7 @@
 //! The `classify()`, `is_rdf_list()`, `list_value_type()`,
 //! `dominant_datatype()`, and `xsd_to_column_type()` helpers are
 //! adapted from
-//! `~/git/tegmentum-webfunctions/crates/wf_profile/src/lib.rs`. The
+//! `~/git/webfunctions/crates/wf_profile/src/lib.rs`. The
 //! shape of every SPARQL string, the classification thresholds
 //! (0.95 for pure literal / IRI, 0.85 for RDF-Collection detection,
 //! etc.), and the target-type mapping are preserved byte-for-byte so

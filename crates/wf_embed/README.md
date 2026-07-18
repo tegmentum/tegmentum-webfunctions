@@ -28,7 +28,7 @@ change; only the substrate-side registration flips.
 ## Not yet in the workspace
 
 This crate is intentionally not added to `[workspace.members]` in
-`tegmentum-webfunctions/Cargo.toml`. The guest-side wrappers that
+`webfunctions/Cargo.toml`. The guest-side wrappers that
 would produce a compiled component live in the wf_sagegraph /
 wf_sagegraph_nn tree and land in a follow-up sweep once the WIT is
 stable. For now this crate is a WIT-only home so the interface

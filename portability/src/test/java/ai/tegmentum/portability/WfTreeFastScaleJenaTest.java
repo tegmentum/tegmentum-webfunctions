@@ -12,7 +12,7 @@ public class WfTreeFastScaleJenaTest {
 
     private static final String WF_TREE_FAST_WASM = System.getProperty("wf.tree.fast.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_tree_fast.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/wf_tree_fast.wasm");
 
     private static final int TARGET_NODES = Integer.getInteger("wf.tree.scale.n", 1000);
     private static final int BRANCHING = Integer.getInteger("wf.tree.scale.branching", 3);
