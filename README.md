@@ -180,7 +180,11 @@ The key wins:
 
 ### wit/webfunction.wit
 
-Every crate copies the same WIT world from `shared/wit/webfunction.wit`.
+Each legacy `stardog:webfunction@0.5.x` crate carries its own copy of
+the WIT world in its `wit/` directory (self-contained per crate).
+Newer extension crates that target the substrate WIT
+(`tegmentum:webfunction@0.1.0`) point at the webfunction-wit
+submodule at repo-root `wit/`.
 This is the contract every plugin talks to. Keep it byte-identical
 across crates or components won't be portable.
 

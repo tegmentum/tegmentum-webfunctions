@@ -1,7 +1,9 @@
 # Cargo workspace for the webfunctions WebAssembly component library —
 # reusable SPARQL extension components against the shared substrate.
 # Each crate is a single-function wasm component (built via cargo component).
-# All crates share the WIT world at shared/wit/webfunction.wit.
+# Legacy stardog:webfunction@0.5.x crates carry their own wit/webfunction.wit.
+# Extension crates against the substrate contract consume the
+# tegmentum:webfunction@0.1.0 WIT via the webfunction-wit submodule at wit/.
 
 [workspace]
 members = [
