@@ -11,34 +11,60 @@
 //! needed. Result crate is ~1.5 MB. For higher-accuracy detection on
 //! short text, see the parallel string_lang_lingua_* set.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+/// Legacy names — kept as type aliases so the ported business logic
+/// below reads with minimum diff against the flat-world original. The
+/// `Term::Triple` arm added by the R2 types consolidation is handled
+/// in each `match` inside this file.
+type Value = WitTerm;
+type Literal = WitLiteral;
 
 struct Component;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
-    })
+    WitTerm::Literal(WitLiteral { value: s.into(), datatype: Some(XSD_STRING.into()), language: None })
 }
 
 fn string_of(arg: &Value) -> Result<&str, String> {
     match arg {
-        Value::Literal(l) => Ok(l.label.as_str()),
+        WitTerm::Literal(l) => Ok(l.value.as_str()),
         _ => Err("string_lang_detect: argument must be a string literal".into()),
     }
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "string_lang_detect".to_string(),
+            min_arity: 0,
+            max_arity: None,
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "string_lang_detect" => evaluate_impl(args),
+            other => Err(format!("string_lang_detect: unknown function '{other}'")),
+        }
+    }
+}
+
+fn evaluate_impl(args: Vec<Value>) -> Result<Value, String> {
         if args.len() != 1 {
             return Err(format!(
                 "string_lang_detect: expected 1 arg (text), got {}",
@@ -48,35 +74,52 @@ impl Guest for Component {
         let text = string_of(&args[0])?;
         let info = whatlang::detect(text)
             .ok_or_else(|| "string_lang_detect: unable to detect language".to_string())?;
-        Ok(BindingSets {
-            vars: vec!["lang".into()],
-            rows: vec![vec![Binding {
-                name: "lang".into(),
-                value: string_literal(info.lang().code()),
-            }]],
-        })
+        Ok(string_literal(info.lang().code()))
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("string_lang_detect: aggregate not applicable".into())
+/// Aggregate interface stub — this component provides none.
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("string_lang_detect: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "string_lang_detect(text) -> ISO 639-3 code of the detected language.",
-                ),
-            }]],
-        }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "string_lang_detect: unknown aggregate '{name}' (this component provides none)"
+        ))
     }
 }
 
-export!(Component);
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("string_lang_detect: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("string_lang_detect: aggregate state was never constructed".into())
+    }
+}
+
+/// Property-function interface stub — this component provides none.
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "string_lang_detect: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+

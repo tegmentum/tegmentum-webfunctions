@@ -3,9 +3,26 @@
 //! Ports the semantalytics function_string/count_graphemes crate
 //! (voca_rs::count::count_graphemes).
 
-wit_bindgen::generate!({ world: "webfunction", path: "wit" });
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+/// Legacy names — kept as type aliases so the ported business logic
+/// below reads with minimum diff against the flat-world original. The
+/// `Term::Triple` arm added by the R2 types consolidation is handled
+/// in each `match` inside this file.
+type Value = WitTerm;
+type Literal = WitLiteral;
 
 struct Component;
 
@@ -13,48 +30,86 @@ const XSD_STRING:  &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
 fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+    WitTerm::Literal(WitLiteral { value: s.into(), datatype: Some(XSD_STRING.into()), language: None })
 }
 fn integer_literal(v: i64) -> Value {
-    Value::Literal(Literal { label: v.to_string(), datatype: XSD_INTEGER.into(), lang: None })
+    WitTerm::Literal(WitLiteral { value: v.to_string(), datatype: Some(XSD_INTEGER.into()), language: None })
 }
 fn string_of(a: &Value) -> Result<&str, String> {
     match a {
-        Value::Literal(l) => Ok(l.label.as_str()),
+        WitTerm::Literal(l) => Ok(l.value.as_str()),
         _ => Err("string_count_graphemes: argument must be a string literal".into()),
     }
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        if args.len() != 1 {
-            return Err(format!("string_count_graphemes: expected 1 arg, got {}", args.len()));
-        }
-        let n = voca_rs::count::count_graphemes(string_of(&args[0])?) as i64;
-        Ok(BindingSets {
-            vars: vec!["result".into()],
-            rows: vec![vec![Binding { name: "result".into(), value: integer_literal(n) }]],
-        })
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "string_count_graphemes".to_string(),
+            min_arity: 0,
+            max_arity: None,
+        }]
     }
-    fn aggregate_step(_a: Vec<Value>, _m: u64) -> Result<(), String> {
-        Err("string_count_graphemes: aggregate not applicable".into())
-    }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("string_count_graphemes: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(_i: Cardinality, _a: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "string_count_graphemes(s) -> number of grapheme clusters in s (xsd:integer)."),
-            }]],
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "string_count_graphemes" => evaluate_impl(args),
+            other => Err(format!("string_count_graphemes: unknown function '{other}'")),
         }
     }
 }
 
-export!(Component);
+fn evaluate_impl(args: Vec<Value>) -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err(format!("string_count_graphemes: expected 1 arg, got {}", args.len()));
+        }
+        let n = voca_rs::count::count_graphemes(string_of(&args[0])?) as i64;
+        Ok(integer_literal(n))
+    }
+
+/// Aggregate interface stub — this component provides none.
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "string_count_graphemes: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("string_count_graphemes: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("string_count_graphemes: aggregate state was never constructed".into())
+    }
+}
+
+/// Property-function interface stub — this component provides none.
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "string_count_graphemes: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+
