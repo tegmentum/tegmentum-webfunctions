@@ -1,76 +1,54 @@
 //! wf_infer — derived facts as materialized SPARQL views.
 //!
-//! Signature: `wf:call(<wf_infer.wasm>, "<rule-json>")`
-//!    → binding-set { rule: xsd:string, inserted: xsd:integer }
+//! Migrated (Follow-up E) from the Stardog overlay
+//! `stardog:webfunction@0.5.0` world to the base
+//! `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` world.
+//! Semantics identical to the sibling `wf_infer-extension` crate; the
+//! two artifacts differ only in wasm binary name / exported function
+//! name (`wf_infer` here, `run-rule` in the sibling). Both dispatch
+//! through `graph-callbacks::{execute-query, execute-update}`.
 //!
-//! Runs a user-authored CONSTRUCT query and INSERTs the resulting
-//! triples into a target named graph. This is the substrate's answer to
-//! OWL — rules are SPARQL you wrote, derived triples live in a graph
-//! whose provenance is obvious, delete semantics are honest (drop the
-//! graph or delete individual quads).
+//! Signature: `wf_infer("<rule-json>")` -> rdf:JSON literal
+//!   `{ "rule": ..., "iterations": ..., "emitted_total": ...,
+//!      "graph_size": ... }`
 //!
-//! Rule JSON shape — two forms accepted, same semantics:
+//! Runs a user-authored CONSTRUCT (via `graph-callbacks::execute-query`
+//! returning `Quads`) and INSERTs the resulting triples into a target
+//! named graph (via `graph-callbacks::execute-update`). Optional
+//! fixed-point iteration loops the CONSTRUCT / INSERT pair until the
+//! target graph's size stops growing, guarded by `max_iterations`.
 //!
-//! **Explicit CONSTRUCT** (raw SPARQL text):
-//!
-//! ```json
-//! {
-//!   "name": "type_from_subclass",
-//!   "construct": "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
-//!                 CONSTRUCT { ?s a ?super } \
-//!                 WHERE { ?s a ?sub . ?sub rdfs:subClassOf+ ?super }",
-//!   "graph": "http://tegmentum.ai/graph/derived/type_from_subclass",
-//!   "refresh_mode": "replace"
-//! }
-//! ```
-//!
-//! **Stardog-SRS-style if/then sugar** (translates to CONSTRUCT
-//! automatically; the two triple-pattern strings each go into the
-//! WHERE and CONSTRUCT clauses verbatim, with `prefixes` prepended
-//! once):
-//!
-//! ```json
-//! {
-//!   "name": "type_from_subclass",
-//!   "prefixes": "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>",
-//!   "if":   "?s a ?sub . ?sub rdfs:subClassOf+ ?super",
-//!   "then": "?s a ?super",
-//!   "graph": "http://tegmentum.ai/graph/derived/type_from_subclass"
-//! }
-//! ```
-//!
-//! Reads like SRS but stays as a CONSTRUCT operationally — same code
-//! path, same delete semantics, same predictable cost.
-//!
-//! `refresh_mode`:
-//!   * `"replace"` (default) — CLEAR the target graph before insert.
-//!     Full recompute; safe when a rule's dependencies changed.
-//!   * `"append"` — no clear; add new derivations, keep old ones. Fast
-//!     but stale rows may persist. Useful when the rule strictly
-//!     accumulates (e.g. temporal facts that never retract).
-//!
-//! No profile choice. No reasoner. No mystery costs. The CONSTRUCT
-//! you wrote is what runs. Whether it's O(1) or exponential is
-//! visible in the query text itself.
-//!
-//! Complements `wf_reason_pyreason` (planned) — that guest handles the
-//! fuzzy/probabilistic/paraconsistent cases via a pyreason microservice
-//! and writes annotated triples to the same derived-graph pattern.
+//! The Stardog-era shape returned one row with four columns; the base
+//! `extension::call` surface returns a single term, so the summary
+//! collapses into one rdf:JSON literal.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 use serde::Deserialize;
+use serde_json::json;
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, Binding as WitBinding, Quad as WitQuad, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
 
 struct Component;
 
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
+
+// ---------------------------------------------------------------------------
+// Rule descriptor
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct Rule {
@@ -87,22 +65,15 @@ struct Rule {
     #[serde(default = "default_refresh")]
     refresh_mode: String,
 
-    /// Loop until fixed point. Each iteration reads from
-    /// `default_graph ∪ target_graph` (the user writes their WHERE to
-    /// reference the target graph via UNION or GRAPH clauses) and writes
-    /// to `target_graph`. INSERT DATA is idempotent at the store level,
-    /// so re-inserting already-derived triples is a no-op; we detect
-    /// convergence by comparing target-graph size before and after each
-    /// pass.
     #[serde(default)]
     iterate: bool,
 
-    /// Safety cap on iteration count. Non-terminating rules or slow
-    /// convergence would otherwise loop forever. Default 100; the
-    /// transitive closure of anything human-scale converges well
-    /// under that.
     #[serde(default = "default_max_iterations")]
     max_iterations: u32,
+}
+
+fn default_refresh() -> String {
+    "replace".into()
 }
 
 fn default_max_iterations() -> u32 {
@@ -110,11 +81,6 @@ fn default_max_iterations() -> u32 {
 }
 
 impl Rule {
-    /// Build the CONSTRUCT SPARQL text. If the rule specifies `construct`
-    /// verbatim, use it as-is. If it uses the `if`/`then` sugar,
-    /// synthesise a CONSTRUCT that wraps the two triple-pattern strings
-    /// into WHERE and CONSTRUCT clauses respectively, prefixing any
-    /// declared namespaces once at the top.
     fn construct_sparql(&self) -> Result<String, String> {
         match (&self.construct, &self.if_clause, &self.then_clause) {
             (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(format!(
@@ -144,128 +110,108 @@ impl Rule {
     }
 }
 
-fn default_refresh() -> String {
-    "replace".into()
+// ---------------------------------------------------------------------------
+// Guest impls
+// ---------------------------------------------------------------------------
+
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_infer".into(),
+            min_arity: 1,
+            max_arity: Some(1),
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_infer" => wf_infer_impl(&args),
+            other => Err(format!("wf_infer: unknown function '{other}'")),
+        }
+    }
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        let rule_json = match args.first() {
-            Some(Value::Literal(l)) => l.label.clone(),
-            _ => {
-                return Err(
-                    "wf_infer: first arg must be a rule-json string literal".into(),
-                );
-            }
-        };
-        let rule: Rule = serde_json::from_str(&rule_json)
-            .map_err(|e| format!("wf_infer: rule parse: {e}"))?;
+fn wf_infer_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    let rule_json = require_literal(args, "wf_infer")?;
+    let rule: Rule = serde_json::from_str(&rule_json)
+        .map_err(|e| format!("wf_infer: rule parse: {e}"))?;
 
-        // Full-recompute mode: clear the target graph first so stale
-        // derivations don't accumulate. "append" mode skips the clear.
-        if rule.refresh_mode == "replace" {
-            // SILENT so a first-run against a graph that doesn't exist
-            // yet is a no-op rather than an error. SPARQL 1.1 Update:
-            // absent SILENT, CLEAR GRAPH of a nonexistent graph is an
-            // evaluation error.
-            let clear = format!("CLEAR SILENT GRAPH <{}>", rule.graph);
-            host::execute_update(&clear)
-                .map_err(|e| format!("wf_infer: clear graph `{}`: {e}", rule.graph))?;
-        } else if rule.refresh_mode != "append" {
-            return Err(format!(
-                "wf_infer: unknown refresh_mode `{}` (want replace | append)",
-                rule.refresh_mode
-            ));
-        }
-
-        let construct_sparql = rule.construct_sparql()?;
-
-        if rule.iterate {
-            let (iterations, emitted_total, final_size) =
-                iterate_to_fixpoint(&rule, &construct_sparql)?;
-            // Naming discipline: `emitted_total` counts CONSTRUCT rows
-            // across every pass — including the ones INSERT DATA set-
-            // semantics silently absorbed as duplicates. It's a
-            // diagnostic (how much SPARQL work happened) not a fact
-            // count. `graph_size` is the honest "how many derived
-            // triples exist" number.
-            Ok(BindingSets {
-                vars: vec![
-                    "rule".into(),
-                    "iterations".into(),
-                    "emitted_total".into(),
-                    "graph_size".into(),
-                ],
-                rows: vec![vec![
-                    Binding {
-                        name: "rule".into(),
-                        value: string_lit(&rule.name),
-                    },
-                    Binding {
-                        name: "iterations".into(),
-                        value: int_lit(iterations as i64),
-                    },
-                    Binding {
-                        name: "emitted_total".into(),
-                        value: int_lit(emitted_total as i64),
-                    },
-                    Binding {
-                        name: "graph_size".into(),
-                        value: int_lit(final_size as i64),
-                    },
-                ]],
-            })
-        } else {
-            // Single-pass: run the CONSTRUCT once, insert the results.
-            let bs = host::execute_query(&construct_sparql, &[], None)?;
-            let inserted = bulk_insert(&rule.graph, &bs)?;
-            Ok(BindingSets {
-                vars: vec!["rule".into(), "inserted".into()],
-                rows: vec![vec![
-                    Binding {
-                        name: "rule".into(),
-                        value: string_lit(&rule.name),
-                    },
-                    Binding {
-                        name: "inserted".into(),
-                        value: int_lit(inserted as i64),
-                    },
-                ]],
-            })
-        }
+    if rule.refresh_mode == "replace" {
+        let clear = format!("CLEAR SILENT GRAPH <{}>", rule.graph);
+        execute_update(&clear)
+            .map_err(|e| format!("wf_infer: clear graph `{}`: {e}", rule.graph))?;
+    } else if rule.refresh_mode != "append" {
+        return Err(format!(
+            "wf_infer: unknown refresh_mode `{}` (want replace | append)",
+            rule.refresh_mode
+        ));
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_infer: aggregate not applicable".into())
+    let construct_sparql = rule.construct_sparql()?;
+
+    let (iterations, emitted_total, final_size) = if rule.iterate {
+        iterate_to_fixpoint(&rule, &construct_sparql)?
+    } else {
+        let quads = query_quads(&construct_sparql)?;
+        let inserted = insert_quads(&rule.graph, &quads)?;
+        let size = graph_size(&rule.graph)?;
+        (1u32, inserted, size)
+    };
+
+    let payload = json!({
+        "rule": rule.name,
+        "iterations": iterations,
+        "emitted_total": emitted_total,
+        "graph_size": final_size,
+    });
+    let serialized = serde_json::to_string(&payload)
+        .map_err(|e| format!("wf_infer: serializing summary: {e}"))?;
+    Ok(WitTerm::Literal(WitLiteral {
+        value: serialized,
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    }))
+}
+
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_infer: aggregate not applicable".into())
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_infer: unknown aggregate '{name}' (this component provides none)"
+        ))
     }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_infer: aggregate state was never constructed".into())
     }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label: "wf_infer(\"<rule-json>\") — runs a CONSTRUCT and \
-                            INSERTs the derived triples into a named graph. \
-                            replace mode clears the graph first; append mode \
-                            accumulates. Returns (rule, inserted) counts."
-                        .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
-        }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_infer: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_infer: unknown property function '{name}' (this component provides none)"
+        ))
     }
 }
 
@@ -273,54 +219,134 @@ impl Guest for Component {
 // Fixed-point iteration
 // ---------------------------------------------------------------------------
 
-/// Loop the CONSTRUCT until the target graph stops growing. Returns
-/// (iterations_run, total_triples_inserted, final_graph_size).
-fn iterate_to_fixpoint(rule: &Rule, construct_sparql: &str) -> Result<(u32, u64, u64), String> {
+fn iterate_to_fixpoint(
+    rule: &Rule,
+    construct_sparql: &str,
+) -> Result<(u32, u64, u64), String> {
     let mut prev_size = graph_size(&rule.graph)?;
-    let mut total_inserted = 0u64;
-    let mut iterations = 0u32;
+    let mut total_emitted: u64 = 0;
+    let mut iterations: u32 = 0;
 
     while iterations < rule.max_iterations {
-        let bs = host::execute_query(construct_sparql, &[], None)?;
-        let inserted = bulk_insert(&rule.graph, &bs)?;
-        total_inserted += inserted;
+        let quads = query_quads(construct_sparql)?;
+        let emitted = insert_quads(&rule.graph, &quads)?;
+        total_emitted += emitted;
         iterations += 1;
 
         let new_size = graph_size(&rule.graph)?;
         if new_size == prev_size {
-            // Fixed point: nothing new was added this pass.
-            return Ok((iterations, total_inserted, new_size));
+            return Ok((iterations, total_emitted, new_size));
         }
         prev_size = new_size;
     }
-    // Hit the cap without converging. Return what we have; the caller
-    // sees iterations == max_iterations as the signal that the loop was
-    // truncated. In practice this means the rule diverges or is very
-    // slow to converge — inspect and consider raising max_iterations
-    // or restructuring the rule.
-    Ok((iterations, total_inserted, prev_size))
+    Ok((iterations, total_emitted, prev_size))
 }
 
-/// Count triples currently in the target graph. Returns 0 if the graph
-/// doesn't exist yet.
+// ---------------------------------------------------------------------------
+// graph-callbacks helpers
+// ---------------------------------------------------------------------------
+
+fn require_literal(args: &[WitTerm], func: &str) -> Result<String, String> {
+    let [arg] = args else {
+        return Err(format!(
+            "{func}: expected 1 argument (rule-json string literal), got {}",
+            args.len()
+        ));
+    };
+    match arg {
+        WitTerm::Literal(l) => Ok(l.value.clone()),
+        WitTerm::NamedNode(_) => Err(format!("{func}: argument must be a string literal, got IRI")),
+        WitTerm::BlankNode(_) => Err(format!(
+            "{func}: argument must be a string literal, got blank node"
+        )),
+        WitTerm::Triple(_) => Err(format!(
+            "{func}: argument must be a string literal, got quoted triple"
+        )),
+    }
+}
+
+fn query_quads(sparql: &str) -> Result<Vec<WitQuad>, String> {
+    match execute_query(sparql)? {
+        CallbackQueryResult::Quads(q) => Ok(q),
+        CallbackQueryResult::Bindings(bs) => Ok(bindings_to_quads(bs)),
+        CallbackQueryResult::Boolean(_) => {
+            Err("wf_infer: CONSTRUCT unexpectedly returned boolean".into())
+        }
+    }
+}
+
+fn bindings_to_quads(flat: Vec<WitBinding>) -> Vec<WitQuad> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prior| prior.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+
+    let mut quads: Vec<WitQuad> = Vec::new();
+    for row in rows {
+        let mut s: Option<WitTerm> = None;
+        let mut p: Option<WitTerm> = None;
+        let mut o: Option<WitTerm> = None;
+        for b in row {
+            match b.variable.as_str() {
+                "s" | "subject" => s = Some(b.value),
+                "p" | "predicate" => p = Some(b.value),
+                "o" | "object" => o = Some(b.value),
+                _ => {}
+            }
+        }
+        if let (Some(s), Some(p), Some(o)) = (s, p, o) {
+            quads.push(WitQuad {
+                subject: s,
+                predicate: p,
+                object: o,
+                graph: None,
+            });
+        }
+    }
+    quads
+}
+
 fn graph_size(graph: &str) -> Result<u64, String> {
     let sparql = format!(
         "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}"
     );
-    let bs = host::execute_query(&sparql, &[], Some(1))?;
-    let row = bs
-        .rows
-        .first()
-        .ok_or_else(|| "wf_infer: graph_size returned no row".to_string())?;
-    let n = row
-        .iter()
-        .find(|b| b.name == "n")
+    match execute_query(&sparql)? {
+        CallbackQueryResult::Bindings(bs) => Ok(read_first_int(&bs, "n")),
+        _ => Ok(0),
+    }
+}
+
+fn read_first_int(bs: &[WitBinding], var: &str) -> u64 {
+    bs.iter()
+        .find(|b| b.variable == var)
         .and_then(|b| match &b.value {
-            Value::Literal(l) => l.label.parse::<u64>().ok(),
+            WitTerm::Literal(l) => l.value.parse::<u64>().ok(),
             _ => None,
         })
-        .unwrap_or(0);
-    Ok(n)
+        .unwrap_or(0)
+}
+
+fn execute_query(sparql: &str) -> Result<CallbackQueryResult, String> {
+    gc::execute_query(sparql).map_err(|e| match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    })
+}
+
+fn execute_update(sparql: &str) -> Result<(), String> {
+    gc::execute_update(sparql).map_err(|e| match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -329,31 +355,17 @@ fn graph_size(graph: &str) -> Result<u64, String> {
 
 const BATCH_SIZE: usize = 500;
 
-fn bulk_insert(graph: &str, bs: &BindingSets) -> Result<u64, String> {
-    let mut total = 0u64;
+fn insert_quads(graph: &str, quads: &[WitQuad]) -> Result<u64, String> {
+    let mut total: u64 = 0;
     let mut buffer = String::new();
     let mut in_batch = 0usize;
 
-    for row in &bs.rows {
-        let mut s: Option<&Value> = None;
-        let mut p: Option<&Value> = None;
-        let mut o: Option<&Value> = None;
-        for b in row {
-            match b.name.as_str() {
-                "s" => s = Some(&b.value),
-                "p" => p = Some(&b.value),
-                "o" => o = Some(&b.value),
-                _ => {}
-            }
-        }
-        let (Some(s), Some(p), Some(o)) = (s, p, o) else {
-            continue;
-        };
-        buffer.push_str(&value_to_sparql(s));
+    for q in quads {
+        buffer.push_str(&term_to_sparql(&q.subject));
         buffer.push(' ');
-        buffer.push_str(&value_to_sparql(p));
+        buffer.push_str(&term_to_sparql(&q.predicate));
         buffer.push(' ');
-        buffer.push_str(&value_to_sparql(o));
+        buffer.push_str(&term_to_sparql(&q.object));
         buffer.push_str(" .\n");
         in_batch += 1;
         total += 1;
@@ -371,48 +383,34 @@ fn bulk_insert(graph: &str, bs: &BindingSets) -> Result<u64, String> {
 }
 
 fn flush(graph: &str, triples: &str) -> Result<(), String> {
-    let insert = format!(
-        "INSERT DATA {{ GRAPH <{graph}> {{ {triples} }} }}"
-    );
-    host::execute_update(&insert)
-        .map_err(|e| format!("wf_infer: insert batch: {e}"))
+    let insert = format!("INSERT DATA {{ GRAPH <{graph}> {{ {triples} }} }}");
+    execute_update(&insert).map_err(|e| format!("wf_infer: insert batch: {e}"))
 }
 
-fn value_to_sparql(v: &Value) -> String {
-    match v {
-        Value::Iri(s) => format!("<{s}>"),
-        Value::Bnode(label) => format!("_:{label}"),
-        Value::Literal(l) => {
-            let escaped = l
-                .label
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            if let Some(lang) = &l.lang {
-                format!("\"{escaped}\"@{lang}")
-            } else {
-                format!("\"{escaped}\"^^<{}>", l.datatype)
-            }
-        }
+fn term_to_sparql(t: &WitTerm) -> String {
+    match t {
+        WitTerm::NamedNode(iri) => format!("<{iri}>"),
+        WitTerm::BlankNode(label) => format!("_:{label}"),
+        WitTerm::Literal(l) => literal_to_sparql(l),
+        WitTerm::Triple(_) => String::new(),
     }
 }
 
-fn string_lit(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
-    })
+fn literal_to_sparql(l: &WitLiteral) -> String {
+    let escaped = l
+        .value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    if let Some(lang) = &l.language {
+        format!("\"{escaped}\"@{lang}")
+    } else if let Some(dt) = &l.datatype {
+        format!("\"{escaped}\"^^<{dt}>")
+    } else {
+        format!("\"{escaped}\"")
+    }
 }
 
-fn int_lit(n: i64) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
-    })
-}
-
-export!(Component);
+bindings::export!(Component with_types_in bindings);

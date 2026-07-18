@@ -1,206 +1,267 @@
 //! wf_skolemize — replace every blank node with a deterministic
 //! well-known-genid IRI.
 //!
-//! Signature: `wf:call(<wf_skolemize.wasm>)`
-//!    → binding-set { renamed: xsd:integer, deleted: xsd:integer }
+//! Migrated (Follow-up E) from the Stardog overlay
+//! `stardog:webfunction@0.5.0` world to the base
+//! `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` world.
 //!
-//! Walks every triple involving a blank-node subject or object, mints a
-//! deterministic IRI per bnode from a stable hash of its label, and
-//! rewrites the graph:
+//! Signature: `wf_skolemize()` -> rdf:JSON literal
+//!   `{ "renamed": <int>, "deleted": <int> }`
 //!
-//!   ?s <p> _:x .   →   ?s <p> <https://tegmentum.ai/.well-known/genid/HASH> .
-//!   _:x <p> ?o .   →   <https://tegmentum.ai/.well-known/genid/HASH> <p> ?o .
+//! Walks every triple involving a blank-node subject or object, mints
+//! a deterministic IRI per bnode from a stable hash of its label, and
+//! rewrites the graph in three phases:
+//!   1. Enumerate every triple that involves a blank node in either
+//!      subject or object position via `graph-callbacks::execute-query`.
+//!   2. INSERT rewritten (ground) triples via
+//!      `graph-callbacks::execute-update`.
+//!   3. DELETE every remaining bnode-bearing triple in one filter-
+//!      based sweep.
 //!
-//! The hash is derived from the bnode's SPARQL-visible ID plus a global
-//! salt (to avoid collisions across separate skolemize runs on data that
-//! shares bnode labels). The IRI prefix follows RDF 1.1's recommendation
-//! for "well-known genid" URIs — round-trip-friendly for any consumer
-//! that wants to re-anonymize the subtree.
-//!
-//! Idempotent-ish: running twice on the same graph is a no-op because
-//! the second pass finds no blank nodes.
-//!
-//! Uses execute-update through the substrate's SPARQL Update path. Runs
-//! in three phases:
-//!   1. Enumerate distinct blank-node labels.
-//!   2. For each, INSERT rewritten triples and DELETE originals in one
-//!      DELETE/INSERT statement.
-//!   3. Return counts.
+//! The Stardog-era shape returned one row with two columns (renamed,
+//! deleted); the base `extension::call` surface returns a single
+//! term, so the counts collapse into one rdf:JSON literal.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use serde_json::json;
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, Binding as WitBinding, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
 
 struct Component;
 
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const GENID_PREFIX: &str = "https://tegmentum.ai/.well-known/genid/";
 const SALT: u64 = 0x9E3779B97F4A7C15; // fractional part of the golden ratio
 
-impl Guest for Component {
-    fn evaluate(_args: Vec<Value>) -> Result<BindingSets, String> {
-        // Phase 1: enumerate every triple that involves a blank node in
-        // either subject or object position. SPARQL blank-node labels are
-        // stable per query result so we get their identifiers via the
-        // wit Value::Bnode variant.
-        //
-        // We can't reference specific stored bnodes from SPARQL Update
-        // text (any `_:x` in query text is a fresh variable, not a
-        // reference to the bnode `x` in the store, and SPARQL 1.1 forbids
-        // bnodes in DELETE templates entirely). So skolemization has to
-        // happen in three phases: read triples out, compute rewritten
-        // ground triples in the guest, INSERT them, then DELETE every
-        // remaining bnode-bearing triple in one filter-based sweep.
-        let read_sparql = "\
-            SELECT ?s ?p ?o WHERE { \
-              ?s ?p ?o . \
-              FILTER(isBlank(?s) || isBlank(?o)) \
-            }";
-        let bs = host::execute_query(read_sparql, &[], None)?;
+// ---------------------------------------------------------------------------
+// graph-callbacks helpers
+// ---------------------------------------------------------------------------
 
-        // Phase 2: emit rewritten triples as one INSERT DATA batch.
-        // Ground terms only — bnode positions become genid IRIs.
-        let mut insert_body = String::new();
-        let mut renamed = 0u64;
-        let mut unique_bnodes = std::collections::HashSet::new();
+fn execute_query(sparql: &str) -> Result<CallbackQueryResult, String> {
+    gc::execute_query(sparql).map_err(|e| match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    })
+}
 
-        for row in &bs.rows {
-            let s = binding_value(row, "s");
-            let p = binding_value(row, "p");
-            let o = binding_value(row, "o");
-            let (Some(s), Some(p), Some(o)) = (s, p, o) else {
-                continue;
-            };
+fn execute_update(sparql: &str) -> Result<(), String> {
+    gc::execute_update(sparql).map_err(|e| match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    })
+}
 
-            let s_txt = value_to_sparql(&s, &mut unique_bnodes);
-            let p_txt = value_to_sparql(&p, &mut unique_bnodes);
-            let o_txt = value_to_sparql(&o, &mut unique_bnodes);
-
-            insert_body.push_str(&s_txt);
-            insert_body.push(' ');
-            insert_body.push_str(&p_txt);
-            insert_body.push(' ');
-            insert_body.push_str(&o_txt);
-            insert_body.push_str(" .\n");
-            renamed += 1;
+fn group_bindings_into_rows(flat: Vec<WitBinding>) -> Vec<Vec<WitBinding>> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prior| prior.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
         }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
 
-        if !insert_body.is_empty() {
-            let insert = format!("INSERT DATA {{ {insert_body} }}");
-            host::execute_update(&insert)
-                .map_err(|e| format!("wf_skolemize: insert rewritten batch: {e}"))?;
-        }
+// ---------------------------------------------------------------------------
+// Guest impls
+// ---------------------------------------------------------------------------
 
-        // Phase 3: delete every remaining bnode-bearing triple. Filter-
-        // based, so no need to reference specific bnodes — the isBlank()
-        // test hits exactly the originals, and the INSERT above already
-        // seeded the ground-term replacements.
-        let delete_update = "\
-            DELETE { ?s ?p ?o } \
-            WHERE  { ?s ?p ?o . FILTER(isBlank(?s) || isBlank(?o)) }";
-        host::execute_update(delete_update)
-            .map_err(|e| format!("wf_skolemize: delete originals: {e}"))?;
-
-        Ok(BindingSets {
-            vars: vec!["renamed".into(), "deleted".into()],
-            rows: vec![vec![
-                Binding {
-                    name: "renamed".into(),
-                    value: int_literal(unique_bnodes.len() as i64),
-                },
-                Binding {
-                    name: "deleted".into(),
-                    value: int_literal(renamed as i64),
-                },
-            ]],
-        })
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_skolemize".into(),
+            min_arity: 0,
+            max_arity: Some(0),
+        }]
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_skolemize: aggregate not applicable".into())
-    }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_skolemize: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label: "wf_skolemize() — rewrites every blank node in \
-                            the store as a deterministic <https://tegmentum.\
-                            ai/.well-known/genid/…> IRI. Idempotent-ish. \
-                            Returns (renamed, deleted) counts."
-                        .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
+    fn call(name: String, _args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_skolemize" => wf_skolemize_impl(),
+            other => Err(format!("wf_skolemize: unknown function '{other}'")),
         }
     }
 }
 
-/// Render a WIT `value` as its SPARQL serialization for use in INSERT
-/// DATA. Bnodes get replaced with their genid IRI; the caller's
-/// `seen_bnodes` accumulator tracks how many distinct labels we saw so
-/// the return payload can report the rename count.
-fn value_to_sparql(v: &Value, seen_bnodes: &mut std::collections::HashSet<String>) -> String {
+fn wf_skolemize_impl() -> Result<WitTerm, String> {
+    // Phase 1: enumerate every triple that involves a blank node.
+    let read_sparql = "\
+        SELECT ?s ?p ?o WHERE { \
+          ?s ?p ?o . \
+          FILTER(isBlank(?s) || isBlank(?o)) \
+        }";
+    let flat = match execute_query(read_sparql)? {
+        CallbackQueryResult::Bindings(b) => b,
+        _ => {
+            return Err(
+                "wf_skolemize: SELECT ?s ?p ?o unexpectedly returned non-bindings shape"
+                    .into(),
+            );
+        }
+    };
+    let rows = group_bindings_into_rows(flat);
+
+    // Phase 2: emit rewritten ground triples in one INSERT DATA batch.
+    let mut insert_body = String::new();
+    let mut renamed = 0u64;
+    let mut unique_bnodes = std::collections::HashSet::new();
+
+    for row in &rows {
+        let s = binding_value(row, "s");
+        let p = binding_value(row, "p");
+        let o = binding_value(row, "o");
+        let (Some(s), Some(p), Some(o)) = (s, p, o) else {
+            continue;
+        };
+
+        let s_txt = value_to_sparql(&s, &mut unique_bnodes);
+        let p_txt = value_to_sparql(&p, &mut unique_bnodes);
+        let o_txt = value_to_sparql(&o, &mut unique_bnodes);
+
+        insert_body.push_str(&s_txt);
+        insert_body.push(' ');
+        insert_body.push_str(&p_txt);
+        insert_body.push(' ');
+        insert_body.push_str(&o_txt);
+        insert_body.push_str(" .\n");
+        renamed += 1;
+    }
+
+    if !insert_body.is_empty() {
+        let insert = format!("INSERT DATA {{ {insert_body} }}");
+        execute_update(&insert)
+            .map_err(|e| format!("wf_skolemize: insert rewritten batch: {e}"))?;
+    }
+
+    // Phase 3: delete every remaining bnode-bearing triple.
+    let delete_update = "\
+        DELETE { ?s ?p ?o } \
+        WHERE  { ?s ?p ?o . FILTER(isBlank(?s) || isBlank(?o)) }";
+    execute_update(delete_update)
+        .map_err(|e| format!("wf_skolemize: delete originals: {e}"))?;
+
+    let payload = json!({
+        "renamed": unique_bnodes.len() as u64,
+        "deleted": renamed,
+    });
+    let serialized = serde_json::to_string(&payload)
+        .map_err(|e| format!("wf_skolemize: serialize summary: {e}"))?;
+    Ok(WitTerm::Literal(WitLiteral {
+        value: serialized,
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    }))
+}
+
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_skolemize: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_skolemize: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_skolemize: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_skolemize: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rewriting helpers
+// ---------------------------------------------------------------------------
+
+fn value_to_sparql(v: &WitTerm, seen_bnodes: &mut std::collections::HashSet<String>) -> String {
     match v {
-        Value::Iri(s) => format!("<{s}>"),
-        Value::Bnode(label) => {
+        WitTerm::NamedNode(s) => format!("<{s}>"),
+        WitTerm::BlankNode(label) => {
             seen_bnodes.insert(label.clone());
             format!("<{}>", mint_genid(label))
         }
-        Value::Literal(l) => {
-            // Escape backslash + double-quote + newline + CR + tab per
-            // SPARQL string literal rules. Datatype-tagged with the
-            // literal's IRI so integer/date/… survive round-trip.
+        WitTerm::Literal(l) => {
             let escaped = l
-                .label
+                .value
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace('\n', "\\n")
                 .replace('\r', "\\r")
                 .replace('\t', "\\t");
-            if let Some(lang) = &l.lang {
+            if let Some(lang) = &l.language {
                 format!("\"{escaped}\"@{lang}")
+            } else if let Some(dt) = &l.datatype {
+                format!("\"{escaped}\"^^<{dt}>")
             } else {
-                format!("\"{escaped}\"^^<{}>", l.datatype)
+                format!("\"{escaped}\"^^<{XSD_STRING}>")
             }
+        }
+        WitTerm::Triple(_) => {
+            // Quoted triples in either subject or object position — skip
+            // (skolemization discipline is for blank-node substitution).
+            String::new()
         }
     }
 }
 
-fn binding_value(row: &[Binding], name: &str) -> Option<Value> {
-    row.iter().find(|b| b.name == name).map(|b| b.value.clone())
+fn binding_value(row: &[WitBinding], name: &str) -> Option<WitTerm> {
+    row.iter()
+        .find(|b| b.variable == name)
+        .map(|b| b.value.clone())
 }
 
-/// Deterministic per-label genid IRI. Salt-hashed so a fresh session on
-/// data that reused bnode labels from a prior session doesn't collide.
-/// Not cryptographic — collisions are catastrophic but astronomically
-/// unlikely at 128 bits.
 fn mint_genid(label: &str) -> String {
     let mut hash: u64 = SALT;
     for byte in label.bytes() {
         hash = hash.wrapping_mul(0x100000001B3).wrapping_add(byte as u64);
     }
-    // Second half of the hash from a fresh accumulator seeded with the
-    // first — gives us 128 bits of collision domain from a 64-bit state.
     let mut hash2: u64 = hash.rotate_left(23) ^ 0x428A2F98D728AE22;
     for byte in label.bytes() {
         hash2 = hash2.wrapping_mul(0x100000001B3).wrapping_add(byte as u64);
@@ -208,12 +269,4 @@ fn mint_genid(label: &str) -> String {
     format!("{GENID_PREFIX}{hash:016x}{hash2:016x}")
 }
 
-fn int_literal(n: i64) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
-    })
-}
-
-export!(Component);
+bindings::export!(Component with_types_in bindings);
