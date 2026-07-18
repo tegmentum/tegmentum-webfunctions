@@ -1,47 +1,53 @@
-//! wf_validate — check a subject's shape against a descriptor's
+//! wf_validate — check subjects' shape against a descriptor's
 //! constraint block.
 //!
-//! Signatures:
-//!   * `wf:call(<wf_validate.wasm>, "<descriptor-json>", <subject-iri>)`
-//!         — validate one subject, return one row per violation.
-//!   * `wf:call(<wf_validate.wasm>, "<descriptor-json>")`
-//!         — validate every subject matched by the descriptor's anchor,
-//!         return one row per violation across all subjects.
+//! Migrated (Follow-up E) from the Stardog overlay
+//! `stardog:webfunction@0.5.0` world to the base
+//! `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` world.
 //!
-//! Return columns: (subject, column, kind, message). Kind is a short
-//! machine-readable tag; message is human-readable. Empty result = every
-//! subject is valid.
+//! Signature: `wf_validate("<descriptor-json>" [, <subject-iri>])`
+//!   -> rdf:JSON literal `{ "violations": [ ... ] }`
 //!
-//! Checks performed per column:
-//!   * cardinality: 1 requires exactly one value; 1..n requires >=1;
-//!     0..1 requires <=1; 0..n is unconstrained.
-//!   * type: literal columns whose objects don't match the declared xsd
-//!     datatype produce a type violation. IRI columns whose objects
-//!     aren't IRIs produce a type violation.
-//!   * constraint.regex: literal values (string-typed) must match.
-//!   * constraint.min / max: numeric bounds on integer/decimal columns.
-//!   * constraint.enum: value must appear in the enumerated set.
-//!   * constraint.min_length / max_length: string length bounds.
+//! The Stardog-era shape returned one row per violation with columns
+//! (subject, column, kind, message). The base `extension::call`
+//! surface returns a single term, so violations are collapsed into a
+//! single rdf:JSON literal whose top-level `violations` array carries
+//! one object per violation with the same four keys. Callers that
+//! need row-shaped output can `SELECT ... WHERE { BIND(...) }` to
+//! parse the JSON per row.
 //!
-//! Read-only: uses execute-query for anchor discovery and per-subject
-//! column probes. Doesn't touch execute-update, sink-*, or invoke-wasm.
+//! Read-only against `graph-callbacks::execute-query` for anchor
+//! discovery and per-subject column probes. Does not touch
+//! execute-update, sink-*, or invoke-wasm.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 use std::collections::HashSet;
 
 use regex_lite::Regex;
 use serde::Deserialize;
+use serde_json::{json, Value as JsonValue};
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, Binding as WitBinding, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
 
 struct Component;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
+#[allow(dead_code)]
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 // ---------------------------------------------------------------------------
@@ -101,84 +107,149 @@ fn default_cardinality() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Guest impl
+// graph-callbacks helpers
 // ---------------------------------------------------------------------------
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        let descriptor_json = match args.first() {
-            Some(Value::Literal(l)) => l.label.clone(),
-            _ => {
-                return Err(
-                    "wf_validate: first arg must be a descriptor-json string literal"
-                        .into(),
-                );
-            }
-        };
-        let d: Descriptor = serde_json::from_str(&descriptor_json)
-            .map_err(|e| format!("wf_validate: descriptor parse: {e}"))?;
+fn execute_query(sparql: &str) -> Result<CallbackQueryResult, String> {
+    gc::execute_query(sparql).map_err(|e| match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    })
+}
 
-        // Optional second arg: a specific subject IRI. Absent = validate
-        // every subject the anchor matches.
-        let subject_iri = args.get(1).and_then(|v| match v {
-            Value::Iri(s) => Some(s.clone()),
-            _ => None,
-        });
-
-        let subjects = match subject_iri {
-            Some(s) => vec![s],
-            None => enumerate_subjects(&d)?,
-        };
-
-        let mut violations: Vec<Violation> = Vec::new();
-        for subject in &subjects {
-            for col in &d.columns {
-                check_column(subject, col, &mut violations)?;
-            }
+/// Group a flat `list<binding>` from graph-callbacks into per-row
+/// vectors — bindings are emitted in row-major order and each row is
+/// delimited by re-appearance of any variable name.
+fn group_bindings_into_rows(flat: Vec<WitBinding>) -> Vec<Vec<WitBinding>> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prior| prior.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
         }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
 
-        Ok(BindingSets {
-            vars: vec![
-                "subject".into(),
-                "column".into(),
-                "kind".into(),
-                "message".into(),
-            ],
-            rows: violations.into_iter().map(violation_to_row).collect(),
-        })
-    }
-
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_validate: aggregate not applicable".into())
-    }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_validate: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 100.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label: "wf_validate(\"<descriptor-json>\" [, <subject-iri>]) \
-                            — check cardinality / type / constraint block per \
-                            column. Returns (subject, column, kind, message) \
-                            per violation."
-                        .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
+fn select_rows(sparql: &str) -> Result<Vec<Vec<WitBinding>>, String> {
+    match execute_query(sparql)? {
+        CallbackQueryResult::Bindings(bs) => Ok(group_bindings_into_rows(bs)),
+        CallbackQueryResult::Quads(_) => {
+            Err("wf_validate: SELECT expected but graph-callbacks returned quads".into())
         }
+        CallbackQueryResult::Boolean(_) => {
+            Err("wf_validate: SELECT expected but graph-callbacks returned boolean".into())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guest impls
+// ---------------------------------------------------------------------------
+
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_validate".into(),
+            min_arity: 1,
+            max_arity: Some(2),
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_validate" => wf_validate_impl(&args),
+            other => Err(format!("wf_validate: unknown function '{other}'")),
+        }
+    }
+}
+
+fn wf_validate_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    let descriptor_json = match args.first() {
+        Some(WitTerm::Literal(l)) => l.value.clone(),
+        _ => {
+            return Err(
+                "wf_validate: first arg must be a descriptor-json string literal".into(),
+            );
+        }
+    };
+    let d: Descriptor = serde_json::from_str(&descriptor_json)
+        .map_err(|e| format!("wf_validate: descriptor parse: {e}"))?;
+
+    // Optional second arg: a specific subject IRI. Absent = validate
+    // every subject the anchor matches.
+    let subject_iri = args.get(1).and_then(|v| match v {
+        WitTerm::NamedNode(s) => Some(s.clone()),
+        _ => None,
+    });
+
+    let subjects = match subject_iri {
+        Some(s) => vec![s],
+        None => enumerate_subjects(&d)?,
+    };
+
+    let mut violations: Vec<Violation> = Vec::new();
+    for subject in &subjects {
+        for col in &d.columns {
+            check_column(subject, col, &mut violations)?;
+        }
+    }
+
+    let payload: Vec<JsonValue> = violations.into_iter().map(violation_to_json).collect();
+    let out = json!({ "violations": payload });
+    let serialized = serde_json::to_string(&out)
+        .map_err(|e| format!("wf_validate: serialize summary: {e}"))?;
+    Ok(WitTerm::Literal(WitLiteral {
+        value: serialized,
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    }))
+}
+
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_validate: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_validate: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_validate: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_validate: unknown property function '{name}' (this component provides none)"
+        ))
     }
 }
 
@@ -198,11 +269,11 @@ fn enumerate_subjects(d: &Descriptor) -> Result<Vec<String>, String> {
     } else {
         return Err("wf_validate: anchor missing both class and predicate_signature".into());
     };
-    let bs = host::execute_query(&sparql, &[], None)?;
-    let mut out = Vec::with_capacity(bs.rows.len());
-    for row in &bs.rows {
+    let rows = select_rows(&sparql)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
         if let Some(iri) = row.first().and_then(|b| match &b.value {
-            Value::Iri(s) => Some(s.clone()),
+            WitTerm::NamedNode(s) => Some(s.clone()),
             _ => None,
         }) {
             out.push(iri);
@@ -229,9 +300,8 @@ fn check_column(
     };
 
     let sparql = format!("SELECT ?o WHERE {{ <{subject}> <{predicate}> ?o }}");
-    let bs = host::execute_query(&sparql, &[], None)?;
-    let values: Vec<Value> = bs
-        .rows
+    let rows = select_rows(&sparql)?;
+    let values: Vec<WitTerm> = rows
         .iter()
         .filter_map(|row| row.first().map(|b| b.value.clone()))
         .collect();
@@ -260,7 +330,6 @@ fn check_column(
         _ => {}
     }
 
-    // Type + constraint checks per value.
     for v in &values {
         check_type(subject, col, v, violations);
         if let Some(c) = &col.constraint {
@@ -268,30 +337,20 @@ fn check_column(
         }
     }
 
-    // rdf:type is implicit for class-anchored shapes; if the descriptor
-    // has a class anchor, verify the subject actually has the type. Only
-    // once per subject — record on the anchor class column-key.
-    // Not per-column; skip here.
-
     Ok(())
 }
 
-fn check_type(
-    subject: &str,
-    col: &Column,
-    v: &Value,
-    violations: &mut Vec<Violation>,
-) {
+fn check_type(subject: &str, col: &Column, v: &WitTerm, violations: &mut Vec<Violation>) {
     let expect_iri = col.r#type == "iri";
     match v {
-        Value::Iri(_) if expect_iri => {}
-        Value::Iri(_) => violations.push(Violation {
+        WitTerm::NamedNode(_) if expect_iri => {}
+        WitTerm::NamedNode(_) => violations.push(Violation {
             subject: subject.into(),
             column: col.name.clone(),
             kind: "type".into(),
             message: format!("expected literal of type `{}`, got IRI", col.r#type),
         }),
-        Value::Literal(l) => {
+        WitTerm::Literal(l) => {
             if expect_iri {
                 violations.push(Violation {
                     subject: subject.into(),
@@ -301,30 +360,36 @@ fn check_type(
                 });
             } else {
                 let expected_datatype = xsd_iri(&col.r#type);
-                if l.datatype != expected_datatype {
-                    // xsd:string is often the source's default; permit
-                    // it as a soft match for string columns.
-                    let permissive =
-                        col.r#type == "string" && l.datatype == XSD_STRING;
+                let actual_datatype = l
+                    .datatype
+                    .as_deref()
+                    .unwrap_or(XSD_STRING);
+                if actual_datatype != expected_datatype {
+                    let permissive = col.r#type == "string" && actual_datatype == XSD_STRING;
                     if !permissive {
                         violations.push(Violation {
                             subject: subject.into(),
                             column: col.name.clone(),
                             kind: "type".into(),
                             message: format!(
-                                "expected xsd datatype `{}`, got `{}`",
-                                expected_datatype, l.datatype
+                                "expected xsd datatype `{expected_datatype}`, got `{actual_datatype}`"
                             ),
                         });
                     }
                 }
             }
         }
-        Value::Bnode(_) => violations.push(Violation {
+        WitTerm::BlankNode(_) => violations.push(Violation {
             subject: subject.into(),
             column: col.name.clone(),
             kind: "type".into(),
             message: "expected typed value, got bnode".into(),
+        }),
+        WitTerm::Triple(_) => violations.push(Violation {
+            subject: subject.into(),
+            column: col.name.clone(),
+            kind: "type".into(),
+            message: "expected typed value, got quoted triple".into(),
         }),
     }
 }
@@ -332,13 +397,13 @@ fn check_type(
 fn check_constraint(
     subject: &str,
     col: &Column,
-    v: &Value,
+    v: &WitTerm,
     c: &Constraint,
     violations: &mut Vec<Violation>,
 ) {
     let lex = match v {
-        Value::Literal(l) => Some(l.label.as_str()),
-        Value::Iri(s) => Some(s.as_str()),
+        WitTerm::Literal(l) => Some(l.value.as_str()),
+        WitTerm::NamedNode(s) => Some(s.as_str()),
         _ => None,
     };
     let Some(lex) = lex else { return };
@@ -394,7 +459,10 @@ fn check_constraint(
                 subject: subject.into(),
                 column: col.name.clone(),
                 kind: "min_length".into(),
-                message: format!("value has {} chars, min_length {min_len}", lex.chars().count()),
+                message: format!(
+                    "value has {} chars, min_length {min_len}",
+                    lex.chars().count()
+                ),
             });
         }
     }
@@ -404,7 +472,10 @@ fn check_constraint(
                 subject: subject.into(),
                 column: col.name.clone(),
                 kind: "max_length".into(),
-                message: format!("value has {} chars, max_length {max_len}", lex.chars().count()),
+                message: format!(
+                    "value has {} chars, max_length {max_len}",
+                    lex.chars().count()
+                ),
             });
         }
     }
@@ -439,7 +510,7 @@ fn xsd_iri(t: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Violation → row
+// Violation → JSON
 // ---------------------------------------------------------------------------
 
 struct Violation {
@@ -449,48 +520,19 @@ struct Violation {
     message: String,
 }
 
-fn violation_to_row(v: Violation) -> Vec<Binding> {
-    vec![
-        Binding {
-            name: "subject".into(),
-            value: Value::Iri(v.subject),
-        },
-        Binding {
-            name: "column".into(),
-            value: string_lit(&v.column),
-        },
-        Binding {
-            name: "kind".into(),
-            value: string_lit(&v.kind),
-        },
-        Binding {
-            name: "message".into(),
-            value: string_lit(&v.message),
-        },
-    ]
-}
-
-fn string_lit(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
+fn violation_to_json(v: Violation) -> JsonValue {
+    json!({
+        "subject": v.subject,
+        "column": v.column,
+        "kind": v.kind,
+        "message": v.message,
     })
 }
 
-// Suppress unused-import warnings for shapes we don't reach at v1.
-#[allow(dead_code)]
-fn _touch() {
-    let _ = RDF_TYPE;
-    let _: Option<&Anchor> = None::<&Anchor>.map(|a| a);
-    let _: Option<&Vec<String>> = None;
-}
-
-// Ensure Anchor.predicate_signature is considered used by the compiler
-// even though enumerate_subjects reads it via pattern match.
+// Silence unused-import checks that fell out of the migration.
 #[allow(dead_code)]
 fn _use_anchor(a: &Anchor) -> (Option<&String>, Option<&Vec<String>>) {
     (a.class.as_ref(), a.predicate_signature.as_ref())
 }
 
-export!(Component);
+bindings::export!(Component with_types_in bindings);
