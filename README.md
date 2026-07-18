@@ -200,20 +200,32 @@ the standardized extension world, and does not modify the original
 `wf_*` crate. See `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
 §7 for the migration path.
 
-| Sibling | Upstream contract | Imported callbacks | Original crate |
-|---|---|---|---|
-| `wf_skolemize-extension` | `tegmentum:webfunction/extension@0.1.0` | (none — pure filter) | `wf_skolemize` |
-| `wf_profile-extension` | `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` | `tegmentum:webfunction/graph-callbacks@0.1.0` | `wf_profile` |
+| Sibling | Upstream contract | Imported callbacks | Original crate | Callback surface validated |
+|---|---|---|---|---|
+| `wf_skolemize-extension` | `tegmentum:webfunction/extension@0.1.0` | (none — pure filter) | `wf_skolemize` | scalar filter export only |
+| `wf_profile-extension` | `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` | `tegmentum:webfunction/graph-callbacks@0.1.0` | `wf_profile` | `execute-query` (Bindings arm) |
+| `wf_infer-extension` | `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` | `tegmentum:webfunction/graph-callbacks@0.1.0` | `wf_infer` | `execute-query` (Quads arm from CONSTRUCT) + `execute-update` (CLEAR + INSERT DATA); multi-callback per invocation |
 
 The `-extension` siblings target the shared world under
 `tegmentum:webfunction@0.1.0`; the originals keep their per-crate
 `stardog:webfunction@0.5.0` (or peer) worlds intact for existing
 Stardog-plugin consumers.
 
+Between them the three migrated siblings exercise the full Phase-1
+`graph-callbacks` surface (both `execute-query` result arms plus
+`execute-update`) plus reentrancy under the reference
+`host-callbacks-impl` — the iteration path in `wf_infer-extension`
+issues on the order of `4 * max_iterations` callbacks per invocation,
+proving the callback boundary tolerates high-frequency dispatch
+against a live oxigraph store.
+
 Build one sibling and run its round-trip:
 ```bash
 cargo component build --release -p wf_profile-extension --target wasm32-wasip2
 cargo test -p wf_profile-extension --test smoke
+
+cargo component build --release -p wf_infer-extension --target wasm32-wasip2
+cargo test -p wf_infer-extension --test smoke
 ```
 
 The smoke test uses the reference `host-callbacks-impl` from
