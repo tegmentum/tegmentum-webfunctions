@@ -247,6 +247,47 @@ dev-dep) to prove the migrated component loads against the shared
 world's host side. Downstream hosts implementing the same three
 `Host` traits load the migrated component with no adapter layer.
 
+## Overlay-crate migration status
+
+The 22-crate overlay wave (Follow-up E + F) moves each Stardog-era
+`stardog:webfunction@0.3.x`–`0.6.x` crate onto the substrate
+contract at `tegmentum:webfunction@0.1.0` (submodule `wit/`).
+
+Progress: 21 / 22 attempted, 16 / 22 successfully migrated, 6
+deferred pending sink-callbacks read-side landing.
+
+| Wave / batch | Crates | World | Callbacks used |
+|---|---|---|---|
+| Follow-up E batch1 (`4252647`) | `debug_execute_update`, `vega_bar_chart`, `wf_validate` | `extension-with-host-callbacks` | `graph-callbacks` |
+| Follow-up E batch2 (`0104cda`) | `wf_infer`, `wf_profile`, `wf_skolemize` | `extension-with-host-callbacks` | `graph-callbacks` |
+| Follow-up F batch3 (`7ec4eda`) | `debug_callback_depth`, `wf_tree_fast` | `extension-with-all-host-callbacks` | `observability-callbacks` (+ `graph-callbacks` for wf_tree_fast) |
+| Follow-up F batch4 (`69584ce`) | `adjacency_tree`, `wf_tree`, `wf_tree_rows` | `extension-with-all-host-callbacks` | `prepared-query-callbacks` + `observability-callbacks` |
+| Follow-up F batch5 (`f04fd51`) | `wf_apply`, `wf_map`, `wf_pipeline` | `extension-with-all-host-callbacks` | `wasm-callbacks` + `graph-callbacks` |
+| Follow-up F batch6 (`3beeb6a`) | `wf_materialize`, `wf_materialize_list` | `extension-with-all-host-callbacks` | `sink-callbacks` (write-only) + `graph-callbacks` (+ `prepared-query-callbacks` for the list variant) |
+
+### Deferred (6 crates)
+
+Each of these consumes the Stardog-era sink-* triple
+(`sink-open` / `sink-execute` / `sink-close`) for READ-side operations
+that the R1 `sink-callbacks` interface does not surface — its two
+functions (`emit-quad`, `emit-quads`) are strictly write-only per
+`~/git/webfunction-wit/docs/design/sink-callbacks.md` §7. A
+substrate-neutral sink-read primitive is out of scope for R1 and
+awaits a follow-on design memo.
+
+| Crate | Reason deferred |
+|---|---|
+| `wf_fetch` | Uses sink-* for both read and write (READ half not landed) |
+| `wf_sql` | Sink-side SQL SELECT is the crate's entire purpose (pure sink-read) |
+| `wf_demote` | Reads sink's `subject_iri` column via `sink-execute(SELECT ...)` to know what to delete |
+| `wf_demote_tree` | Same read pattern as `wf_demote`, scoped to the tree-shaped materialisation |
+| `wf_canonicalize` | Extensive `sink-execute(SELECT ...)` over its canonical-mapping table plus custom fulltext bridge |
+| `wf_materialize_tree` | Writes opaque JSON documents via `sink-execute("INSERT DOC", <json-lit>)`; the document-store shape does not decompose into typed quads without a substrate-side document sink descriptor |
+
+These crates continue to build against their per-crate legacy
+`stardog:webfunction@0.5.0/host` world and are unchanged by the
+overlay migration.
+
 ## Publishing as a wasm-in-database bundle
 
 The long game (see the tegmentum roadmap): publish the whole suite as a
