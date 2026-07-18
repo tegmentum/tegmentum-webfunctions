@@ -8,11 +8,9 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen.workspace = true
-
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
 [package.metadata.component]
-package = "tegmentum:math-truncate"
-
+package = "tegmentum:webfunction"
 [package.metadata.component.target]
-path = "wit"
-world = "webfunction"
+path = "../../wit"
+world = "sparql-extension"
