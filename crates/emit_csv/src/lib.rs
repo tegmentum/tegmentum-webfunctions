@@ -1,74 +1,125 @@
 //! emit_csv — aggregate rows into a CSV string.
 //!
-//! Inverse of `parse_csv`. Given a sequence of input rows presented via the
-//! aggregate protocol, produce a single CSV document as an xsd:string literal
-//! on `aggregate-finish`. Each `aggregate-step` receives the values for one
-//! row as separate arguments, all expected to be string literals — cast via
+//! Inverse of `parse_csv`. Given a sequence of input rows presented via
+//! the aggregate protocol, produce a single CSV document as an xsd:string
+//! literal on `finish`. Each `step` call receives the values for one row
+//! as separate arguments, all expected to be string literals — cast via
 //! `xsd:string(?x)` in the query if the source values aren't strings.
 //!
-//! Column count is fixed by the first row: subsequent rows with a different
-//! arity are rejected so the emitted CSV stays rectangular. Rows are emitted
-//! in the order they arrive (SPARQL aggregates see rows in whatever order the
-//! plan produces; wrap the SERVICE in a sub-select with ORDER BY if a
-//! deterministic ordering matters).
+//! Column count is fixed by the first row: subsequent rows with a
+//! different arity are rejected so the emitted CSV stays rectangular.
+//! Rows are emitted in the order they arrive.
 //!
-//! Row multiplicity is honored: a row seen with `mult = k` is written k
-//! times, matching SPARQL bag semantics.
-//!
-//! v1 does not accept a header row — feed one in as the first data row if
-//! you want headers, or wait for a follow-up revision that takes an
-//! explicit header list.
-//!
-//! `evaluate` is not meaningful for an aggregate; it returns an error.
+//! **Multiplicity note.** Under the old flat world, `aggregate-step`
+//! received a per-row `mult: u64`; the base sparql-extension world
+//! folds that into a single call per row (Stardog historically passed
+//! `mult = 1`). Callers that relied on non-unit multiplicity semantics
+//! need a per-row repeat at the host side.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
 use std::cell::RefCell;
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const AGGREGATE_NAME: &str = "emit_csv";
 
 struct Component;
 
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+/// Filter interface stub.
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        Vec::new()
+    }
 
-// Per-instance accumulation state.
-//   - `columns` is set by the first row and locks arity for the rest of the
-//     aggregation.
-//   - `rows` holds owned string cells so aggregate_finish can hand them to a
-//     csv::Writer without borrowing across the RefCell boundary.
-struct State {
+    fn call(name: String, _args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        Err(format!(
+            "emit_csv: unknown filter function '{name}' (use via SPARQL aggregate)"
+        ))
+    }
+}
+
+/// Aggregate interface: one aggregate, `emit_csv`.
+impl AggregateGuest for Component {
+    type AggregateState = CsvAccumulator;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        vec![AggregateDescriptor {
+            name: AGGREGATE_NAME.to_string(),
+            min_arity: 1,
+            max_arity: None,
+        }]
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        match name.as_str() {
+            AGGREGATE_NAME => Ok(AggregateState::new(CsvAccumulator::new())),
+            other => Err(format!("emit_csv: unknown aggregate '{other}'")),
+        }
+    }
+}
+
+/// Property-function interface stub.
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "emit_csv: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+/// Per-instance accumulation state.
+/// - `columns` is set by the first row and locks arity for the rest.
+/// - `rows` holds owned string cells so `finish` can hand them to a
+///   csv::Writer without borrowing across the RefCell boundary.
+pub struct CsvAccumulator {
+    state: RefCell<CsvState>,
+}
+
+struct CsvState {
     columns: Option<usize>,
     rows: Vec<Vec<String>>,
 }
 
-thread_local! {
-    static STATE: RefCell<State> = const {
-        RefCell::new(State { columns: None, rows: Vec::new() })
-    };
+impl CsvAccumulator {
+    fn new() -> Self {
+        Self {
+            state: RefCell::new(CsvState {
+                columns: None,
+                rows: Vec::new(),
+            }),
+        }
+    }
 }
 
-fn string_literal(s: String) -> Value {
-    Value::Literal(Literal { label: s, datatype: XSD_STRING.into(), lang: None })
-}
-
-fn string_of(v: &Value) -> Result<&str, String> {
+fn string_of(v: &WitTerm) -> Result<&str, String> {
     match v {
-        Value::Literal(l) => Ok(l.label.as_str()),
+        WitTerm::Literal(l) => Ok(l.value.as_str()),
         _ => Err("emit_csv: every argument must be a string literal".into()),
     }
 }
 
-impl Guest for Component {
-    /// `evaluate` is meaningful only inside an aggregate context — a single
-    /// row can't be aggregated into anything richer than itself, and the
-    /// caller almost certainly wanted the aggregate path.
-    fn evaluate(_args: Vec<Value>) -> Result<BindingSets, String> {
-        Err("emit_csv: use via SPARQL aggregate; direct evaluate is not supported".into())
-    }
-
-    fn aggregate_step(args: Vec<Value>, mult: u64) -> Result<(), String> {
+impl GuestAggregateState for CsvAccumulator {
+    fn step(&self, args: Vec<WitTerm>) -> Result<(), String> {
         if args.is_empty() {
             return Err("emit_csv: expected at least one argument per row".into());
         }
@@ -78,49 +129,28 @@ impl Guest for Component {
         for a in &args {
             cells.push(string_of(a)?.to_string());
         }
-
-        STATE.with(|s| -> Result<(), String> {
-            let mut st = s.borrow_mut();
-            match st.columns {
-                None => st.columns = Some(cells.len()),
-                Some(n) if n == cells.len() => {}
-                Some(n) => {
-                    return Err(format!(
-                        "emit_csv: row arity {} does not match first row arity {}",
-                        cells.len(),
-                        n
-                    ));
-                }
+        let mut st = self.state.borrow_mut();
+        match st.columns {
+            None => st.columns = Some(cells.len()),
+            Some(n) if n == cells.len() => {}
+            Some(n) => {
+                return Err(format!(
+                    "emit_csv: row arity {} does not match first row arity {}",
+                    cells.len(),
+                    n
+                ));
             }
-            // Honor multiplicity: mult=k means the row appears k times in
-            // the bag; k=0 means it's filtered out. Cap at usize::MAX to
-            // avoid overflow on absurd inputs.
-            let k: usize = mult.try_into().unwrap_or(usize::MAX);
-            for i in 0..k {
-                if i + 1 == k {
-                    // Last copy — move `cells` in instead of cloning again.
-                    st.rows.push(cells);
-                    return Ok(());
-                }
-                st.rows.push(cells.clone());
-            }
-            Ok(())
-        })
+        }
+        st.rows.push(cells);
+        Ok(())
     }
 
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        // Drain state up front so a re-run on the same instance starts clean
-        // even if the CSV writer errors below.
-        let (columns, rows) = STATE.with(|s| {
-            let mut st = s.borrow_mut();
-            let columns = st.columns.take();
-            let rows = std::mem::take(&mut st.rows);
-            (columns, rows)
-        });
-
+    fn finish(&self) -> Result<WitTerm, String> {
+        let (columns, rows) = {
+            let mut st = self.state.borrow_mut();
+            (st.columns.take(), std::mem::take(&mut st.rows))
+        };
         let csv = if columns.is_none() {
-            // Zero-row aggregation: emit the empty string, mirroring what
-            // csv::Writer would produce for no records.
             String::new()
         } else {
             let mut writer = csv::WriterBuilder::new()
@@ -129,47 +159,20 @@ impl Guest for Component {
             for row in &rows {
                 writer
                     .write_record(row.iter().map(|s| s.as_str()))
-                    .map_err(|e| format!("emit_csv: write error: {}", e))?;
+                    .map_err(|e| format!("emit_csv: write error: {e}"))?;
             }
             let bytes = writer
                 .into_inner()
-                .map_err(|e| format!("emit_csv: flush error: {}", e))?;
+                .map_err(|e| format!("emit_csv: flush error: {e}"))?;
             String::from_utf8(bytes)
-                .map_err(|e| format!("emit_csv: non-utf8 output: {}", e))?
+                .map_err(|e| format!("emit_csv: non-utf8 output: {e}"))?
         };
-
-        Ok(BindingSets {
-            vars: vec!["value_0".into()],
-            rows: vec![vec![Binding {
-                name: "value_0".into(),
-                value: string_literal(csv),
-            }]],
-        })
-    }
-
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        // Any non-empty input produces exactly one row; an empty input still
-        // produces the single (empty-string) result row.
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
-    }
-
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "emit_csv(cell_0, cell_1, ...) -> xsd:string. \
-                     Aggregate. Concatenates rows into a CSV document; all \
-                     cells must be string literals (cast with xsd:string(?x) \
-                     if needed). Column count is fixed by the first row. Row \
-                     multiplicity is honored. No header row is emitted; \
-                     supply one as the first data row if you want one."
-                        .to_string(),
-                ),
-            }]],
-        }
+        Ok(WitTerm::Literal(WitLiteral {
+            value: csv,
+            datatype: Some(XSD_STRING.to_string()),
+            language: None,
+        }))
     }
 }
 
-export!(Component);
+bindings::export!(Component with_types_in bindings);
