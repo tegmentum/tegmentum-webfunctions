@@ -1,0 +1,96 @@
+// wf_fulltext WIT world — well-known-exports migration.
+//
+// Prototype landing for the well-known-exports memo
+// (~/git/webfunction-wit/docs/design/well-known-exports.md). This
+// world declares the named `tegmentum:webfunction/search@0.1.0`
+// interface as the query-facing dispatch surface, alongside a stub
+// `sparql-extension` include (for the substrate discipline of
+// registering filter/aggregate/property-function even when a guest
+// provides none) and the crate's local admin bare exports for
+// insert / delete.
+//
+// Shape adaptations (see src/lib.rs for the mapping code):
+//
+//   * The legacy `search(backend-url, index, query, opts)` collapsed
+//     into `tegmentum:webfunction/search@0.1.0::search(request)` per
+//     the memo — `search-request` only carries `query`, `limit`,
+//     `offset`. `backend-url` and `index` now come from environment
+//     variables (`WF_FULLTEXT_BACKEND_URL`, `WF_FULLTEXT_INDEX`)
+//     with defaults; the substrate's operator sets them per
+//     deployment. Extended query-opts fields (`fields`, `highlight`,
+//     `lang`, `filter`) are dropped by the well-known interface; the
+//     Manticore-specific admin path can still receive them via a
+//     future admin-side interface.
+//   * `search-hit.subject: term` receives the legacy `hit.doc`
+//     wrapped as a named-node IRI. Legacy `hit.lang` / `hit.fields`
+//     drop off the named-interface return; downstream consumers that
+//     need them run through the crate's original interface.
+//
+// The `insert-batch` and `delete-batch` administrative exports stay
+// as bare world-level exports because the well-known-exports memo
+// covers only search / execute / embed today. A future admin-facing
+// well-known interface would fold these in without a source change
+// on this crate's guest body.
+
+package stardog:wf-fulltext@0.1.0;
+
+/// Local admin types — retained for the bare `insert-batch` /
+/// `delete-batch` exports. Kept crate-local because no shared
+/// well-known interface for bulk-document admin exists yet.
+interface admin-types {
+    /// One document to insert or replace in the fulltext backend.
+    /// `id` is the subject IRI in literal-index mode; `fields`
+    /// carries (predicate → literal-lex) pairs; `lang` is the
+    /// language tag if any.
+    record doc-write {
+        id: string,
+        fields: list<tuple<string, string>>,
+        lang: option<string>,
+    }
+}
+
+/// Local host callback surface. Kept crate-local because this
+/// crate's Manticore adapter only needs a body-in / body-out shape.
+/// The shared `tegmentum:webfunction/http-callbacks` interface
+/// returns a full `http-response` record (status / headers /
+/// body) — folding into that surface is a follow-on shape change
+/// that this prototype defers to keep the diff minimal.
+interface host {
+    /// POST a JSON `body` to `url` and return the response body as
+    /// a string. Success = HTTP 2xx; non-2xx / transport / URL
+    /// errors surface as `Err(<message>)`.
+    http-post-json: func(url: string, body: string) -> result<string, string>;
+}
+
+/// Guest world for wf_fulltext. Named-extension `search` sits
+/// alongside the sparql-extension include (empty filter / aggregate
+/// / property-function registries) and the crate-local admin bare
+/// exports.
+world fulltext-extension {
+    // Base substrate discipline — a guest carrying only well-known
+    // named exports still declares empty filter / aggregate /
+    // property-function registries so host-side dispatch (in either
+    // direction — extension.register()-based or bindgen-side
+    // lookup) sees a consistent surface.
+    include tegmentum:webfunction/sparql-extension@0.1.0;
+
+    // Named-extension entry point — this session's landing.
+    export tegmentum:webfunction/search@0.1.0;
+
+    // Legacy admin surface. Bare exports; the well-known-exports
+    // memo does not name an admin interface for bulk-document
+    // operations. Retained to preserve the crate's existing wire
+    // shape for insert / delete callers.
+    use admin-types.{doc-write};
+    import host;
+    export insert-batch: func(
+        backend-url: string,
+        index: string,
+        docs: list<doc-write>,
+    ) -> result<u32, string>;
+    export delete-batch: func(
+        backend-url: string,
+        index: string,
+        ids: list<string>,
+    ) -> result<u32, string>;
+}
