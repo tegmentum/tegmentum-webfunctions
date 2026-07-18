@@ -1,49 +1,85 @@
-//! wf_materialize_list — RDF-Collection-to-child-table materializer.
+//! wf_materialize_list — RDF-Collection-to-substrate-sink materializer.
 //!
-//! Signature: `wf:call(<wf_materialize_list.wasm>, "<descriptor-json>")`
-//!    → binding-set { rows: xsd:integer }
+//! Signature: `wf:materialize_list("<descriptor-json>")` returns an
+//! rdf:JSON literal shaped as `{"source_rows": N, "quads_accepted": M}`.
 //!
-//! For a shape=list descriptor, walks the `rdf:first`/`rdf:rest` chain
-//! starting from every anchor subject's list head, and emits ordered
-//! (subject, idx, value) rows into the sink. The sink table is created
-//! idempotently as `(subject TEXT NOT NULL, idx INTEGER NOT NULL, value
-//! <value_type>, PRIMARY KEY (subject, idx))`.
+//! For a `shape=list` descriptor, walks each anchor subject's
+//! `rdf:first`/`rdf:rest` chain via
+//! `prepared-query-callbacks::{prepare-query, run-prepared,
+//! free-prepared}` and emits typed positional quads at a named sink
+//! via `sink-callbacks::emit-quads`. Each list element becomes a
+//! quad `(subject, <descriptor.list_element_predicate>, value)`
+//! carrying the descriptor's declared value type. Positional ordering
+//! is preserved via a companion `(subject, <..#position>, idx)`
+//! quad — the substrate sink projects both into whatever ordered
+//! storage the backend uses.
 //!
-//! v1 handles RDF Collections (rdf:first/rdf:rest chains). RDF Containers
-//! (rdf:_1, rdf:_2, ...) are a straightforward variant — enumerate by
-//! predicate name pattern instead of walking — added in a follow-up if
-//! real data has them.
+//! Migration deviations (Follow-up F, sink-* rewrite):
 //!
-//! Uses prepare-query for the chain-walk step so each anchor's chain
-//! amortises SPARQL parsing across N recursion steps.
+//!   * Descriptor's `sink` field is a substrate-side sink NAME (not a
+//!     driver URL). Sinks must be pre-registered; `list-sinks`
+//!     validates presence.
+//!   * Guest-side DDL emission is dropped. The Stardog-era shape
+//!     `(subject TEXT, idx INTEGER, value <T>, PRIMARY KEY(subject,
+//!     idx))` used to be authored by the guest via
+//!     `sink-execute(CREATE TABLE ...)`. On the new substrate the
+//!     sink adapter owns its schema.
+//!   * The chain-walk still amortises SPARQL parse cost via
+//!     `prepared-query-callbacks::prepare-query`, unchanged.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 use serde::Deserialize;
+use serde_json::json;
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::prepared_query_callbacks::{
+    self as pq, PreparedError,
+};
+use bindings::tegmentum::webfunction::sink_callbacks::{self as sc, SinkError};
+use bindings::tegmentum::webfunction::types::{
+    Binding as WitBinding, Literal as WitLiteral, Quad as WitQuad, Term as WitTerm,
+};
 
 struct Component;
 
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const RDF_NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+// The substrate contract does not fix a positional-order predicate for
+// list materialisation; the guest declares its own under the tegmentum
+// namespace so the sink adapter can project it without further
+// vocabulary coordination.
+const TEGMENTUM_LIST_POSITION: &str = "http://tegmentum.ai/ns/list/position";
 
 #[derive(Deserialize)]
 struct Descriptor {
     #[allow(dead_code)]
     name: String,
-    #[allow(dead_code)]
     shape: String,
     anchor: Anchor,
     list_predicate: String,
     #[serde(default = "default_value_type")]
     value_type: String,
     sink: Option<String>,
+    /// The predicate the sink stores the list value under. Defaults to
+    /// the descriptor's `list_predicate` when omitted (preserves the
+    /// original chain predicate at the sink surface).
+    #[serde(default)]
+    list_element_predicate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,166 +92,92 @@ fn default_value_type() -> String {
     "string".into()
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        let descriptor_json = match args.first() {
-            Some(Value::Literal(l)) => l.label.clone(),
-            _ => {
-                return Err(
-                    "wf_materialize_list: first arg must be a descriptor json literal"
-                        .into(),
-                );
-            }
-        };
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-        let d: Descriptor = serde_json::from_str(&descriptor_json)
-            .map_err(|e| format!("wf_materialize_list: descriptor parse: {e}"))?;
-        if d.shape != "list" {
-            return Err(format!(
-                "wf_materialize_list: descriptor shape must be `list`, got `{}`",
-                d.shape
-            ));
-        }
-        let sink_url = d
-            .sink
-            .as_deref()
-            .ok_or_else(|| "wf_materialize_list: descriptor has no `sink`".to_string())?;
+fn json_literal(s: &str) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: s.into(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    })
+}
 
-        // Open sink + create the child table. Fixed shape: (subject TEXT
-        // NOT NULL, idx INTEGER NOT NULL, value <T>, PRIMARY KEY).
-        let handle = host::sink_open(sink_url)?;
-        let table = table_name_from(sink_url);
-        let value_sqlite_type = sqlite_type_for(&d.value_type);
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (\
-             subject TEXT NOT NULL, \
-             idx INTEGER NOT NULL, \
-             value {value_sqlite_type} NOT NULL, \
-             PRIMARY KEY (subject, idx))"
-        );
-        host::sink_execute(handle, &ddl, &[])
-            .map_err(|e| format!("wf_materialize_list: create table: {e}"))?;
-
-        // Enumerate anchor subjects + their list heads. One SELECT covers
-        // both — the JOIN is trivial and lets us skip subjects that don't
-        // have a list.
-        let head_query = build_head_query(&d)?;
-        let heads = host::execute_query(&head_query, &[], None)?;
-
-        // Prepare the chain-walk step so we amortise SPARQL parse over
-        // every N-element chain we traverse.
-        let step_prepared = host::prepare_query(
-            "SELECT ?value ?rest WHERE { \
-             ?head <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ?value ; \
-                   <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>  ?rest }",
-        )?;
-
-        let insert = format!(
-            "INSERT OR IGNORE INTO {table} (subject, idx, value) VALUES (?, ?, ?)"
-        );
-
-        let mut row_count = 0u64;
-        for row in &heads.rows {
-            let subject = match binding_iri(row, "subject") {
-                Some(s) => s,
-                None => continue,
-            };
-            let head = match binding_iri(row, "head") {
-                Some(h) => h,
-                None => continue,
-            };
-
-            let mut cur = head;
-            let mut idx: i64 = 0;
-            // Cap the chain walk defensively — a malformed cycle shouldn't
-            // hang the materializer. 100k is well above any realistic list.
-            const MAX_CHAIN_STEPS: i64 = 100_000;
-            while cur != RDF_NIL && idx < MAX_CHAIN_STEPS {
-                let step_result = host::run_prepared(
-                    step_prepared,
-                    &[bnode_binding("head", &cur)],
-                    Some(1),
-                )?;
-                let step_row = match step_result.rows.first() {
-                    Some(r) => r,
-                    None => break, // dangling chain — end here
-                };
-                let value = match binding_value(step_row, "value") {
-                    Some(v) => v,
-                    None => break,
-                };
-                host::sink_execute(
-                    handle,
-                    &insert,
-                    &[
-                        string_lit(&subject),
-                        int_lit(idx),
-                        value,
-                    ],
-                )
-                .map_err(|e| {
-                    format!(
-                        "wf_materialize_list: insert row (subject={subject}, idx={idx}): {e}"
-                    )
-                })?;
-                row_count += 1;
-                idx += 1;
-                cur = match binding_iri_or_nil(step_row, "rest") {
-                    Some(n) => n,
-                    None => break,
-                };
-            }
-        }
-
-        host::sink_close(handle).ok();
-
-        Ok(BindingSets {
-            vars: vec!["rows".into()],
-            rows: vec![vec![Binding {
-                name: "rows".into(),
-                value: int_literal(row_count as i64),
-            }]],
-        })
-    }
-
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_materialize_list: aggregate not applicable".into())
-    }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_materialize_list: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label:
-                        "wf_materialize_list(\"<descriptor-json>\") — walks \
-                         rdf:first/rdf:rest chains starting from each anchor \
-                         subject's list head, emits ordered (subject, idx, \
-                         value) rows to the sink. Returns row count."
-                            .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
-        }
+fn xsd_datatype_for(t: &str) -> Option<&'static str> {
+    match t {
+        "integer" => Some("http://www.w3.org/2001/XMLSchema#integer"),
+        "decimal" => Some("http://www.w3.org/2001/XMLSchema#decimal"),
+        "boolean" => Some("http://www.w3.org/2001/XMLSchema#boolean"),
+        "date" => Some("http://www.w3.org/2001/XMLSchema#date"),
+        "datetime" => Some("http://www.w3.org/2001/XMLSchema#dateTime"),
+        _ => None,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Query construction + helpers
-// ---------------------------------------------------------------------------
+fn coerce_to_value_type(v: &WitTerm, target: &str) -> WitTerm {
+    match v {
+        WitTerm::Literal(l) => WitTerm::Literal(WitLiteral {
+            value: l.value.clone(),
+            datatype: xsd_datatype_for(target).map(|s| s.to_string()),
+            language: None,
+        }),
+        other => other.clone(),
+    }
+}
+
+fn map_graph_err(e: gc::GraphCallError) -> String {
+    match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    }
+}
+
+fn map_prepared_err(e: PreparedError) -> String {
+    match e {
+        PreparedError::SyntaxError(m) => format!("prepared-query syntax-error: {m}"),
+        PreparedError::BackendError(m) => format!("prepared-query backend-error: {m}"),
+        PreparedError::UnknownHandle => "prepared-query unknown-handle".into(),
+    }
+}
+
+fn map_sink_err(e: SinkError) -> String {
+    match e {
+        SinkError::NoSuchSink(m) => format!("sink-callbacks no-such-sink: {m}"),
+        SinkError::SchemaViolation(m) => format!("sink-callbacks schema-violation: {m}"),
+        SinkError::BackendError(m) => format!("sink-callbacks backend-error: {m}"),
+        SinkError::NotPermitted(m) => format!("sink-callbacks not-permitted: {m}"),
+    }
+}
+
+fn validate_sink_present(name: &str) -> Result<(), String> {
+    let sinks = sc::list_sinks();
+    if sinks.iter().any(|s| s.name == name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "wf_materialize_list: sink `{name}` not registered with host \
+             (list-sinks returned {} sinks)",
+            sinks.len()
+        ))
+    }
+}
+
+fn split_rows(flat: Vec<WitBinding>) -> Vec<Vec<WitBinding>> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prev| prev.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
 
 fn build_head_query(d: &Descriptor) -> Result<String, String> {
     let anchor_pattern = if let Some(class) = &d.anchor.class {
@@ -228,95 +190,239 @@ fn build_head_query(d: &Descriptor) -> Result<String, String> {
         s
     } else {
         return Err(
-            "wf_materialize_list: anchor missing both `class` and `predicate_signature`"
-                .into(),
+            "wf_materialize_list: anchor missing both `class` and `predicate_signature`".into(),
         );
     };
     Ok(format!(
-        "SELECT ?subject ?head WHERE {{ {anchor}?subject <{lp}> ?head }}",
-        anchor = anchor_pattern,
-        lp = d.list_predicate,
+        "SELECT ?subject ?head WHERE {{ {}?subject <{}> ?head }}",
+        anchor_pattern, d.list_predicate,
     ))
 }
 
-fn table_name_from(url: &str) -> String {
-    url.rsplit_once('#')
-        .map(|(_, frag)| frag.to_string())
-        .unwrap_or_else(|| "list_t".into())
-}
-
-fn sqlite_type_for(t: &str) -> &'static str {
+fn term_iri(t: &WitTerm) -> Option<String> {
     match t {
-        "integer" => "INTEGER",
-        "decimal" => "REAL",
-        "boolean" => "INTEGER",
-        _ => "TEXT",
+        WitTerm::NamedNode(s) => Some(s.clone()),
+        WitTerm::BlankNode(s) => Some(format!("_:{s}")),
+        _ => None,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Binding accessors
-// ---------------------------------------------------------------------------
-
-fn binding_value(row: &[Binding], name: &str) -> Option<Value> {
-    row.iter().find(|b| b.name == name).map(|b| b.value.clone())
-}
-
-fn binding_iri(row: &[Binding], name: &str) -> Option<String> {
-    row.iter().find(|b| b.name == name).and_then(|b| match &b.value {
-        Value::Iri(s) => Some(s.clone()),
-        Value::Bnode(s) => Some(format!("_:{s}")),
-        _ => None,
-    })
-}
-
-/// Like binding_iri but also accepts an rdf:nil marker so chain
-/// termination is transparent to the caller.
-fn binding_iri_or_nil(row: &[Binding], name: &str) -> Option<String> {
-    row.iter().find(|b| b.name == name).and_then(|b| match &b.value {
-        Value::Iri(s) => Some(s.clone()),
-        Value::Bnode(s) => Some(format!("_:{s}")),
-        _ => None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Value constructors
-// ---------------------------------------------------------------------------
-
-fn bnode_binding(name: &str, iri_or_bnode: &str) -> Binding {
-    // If the value came in as a bnode ("_:x" prefix), re-emit as Bnode;
-    // otherwise treat as IRI. Chain heads are usually bnodes but a lifted
-    // list (interned URIs) is possible.
-    let value = if let Some(rest) = iri_or_bnode.strip_prefix("_:") {
-        Value::Bnode(rest.to_string())
+fn head_binding_for(node_iri: &str) -> WitBinding {
+    let value = if let Some(rest) = node_iri.strip_prefix("_:") {
+        WitTerm::BlankNode(rest.to_string())
     } else {
-        Value::Iri(iri_or_bnode.to_string())
+        WitTerm::NamedNode(node_iri.to_string())
     };
-    Binding {
-        name: name.to_string(),
+    WitBinding {
+        variable: "head".into(),
         value,
     }
 }
 
-fn string_lit(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
+fn integer_literal(n: i64) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: n.to_string(),
+        datatype: Some(XSD_INTEGER.into()),
+        language: None,
     })
 }
 
-fn int_lit(n: i64) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
-    })
+fn subject_term_from_iri(iri: &str) -> WitTerm {
+    if let Some(rest) = iri.strip_prefix("_:") {
+        WitTerm::BlankNode(rest.to_string())
+    } else {
+        WitTerm::NamedNode(iri.to_string())
+    }
 }
 
-fn int_literal(n: i64) -> Value {
-    int_lit(n)
+// ---------------------------------------------------------------------------
+// Guest entrypoint
+// ---------------------------------------------------------------------------
+
+fn materialize_list_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    let descriptor_json = match args.first() {
+        Some(WitTerm::Literal(l)) => l.value.clone(),
+        _ => {
+            return Err(
+                "wf_materialize_list: first arg must be a descriptor-json string literal"
+                    .into(),
+            );
+        }
+    };
+
+    let d: Descriptor = serde_json::from_str(&descriptor_json)
+        .map_err(|e| format!("wf_materialize_list: descriptor parse: {e}"))?;
+    if d.shape != "list" {
+        return Err(format!(
+            "wf_materialize_list: descriptor shape must be `list`, got `{}`",
+            d.shape
+        ));
+    }
+    let sink_name = d
+        .sink
+        .as_deref()
+        .ok_or_else(|| "wf_materialize_list: descriptor has no `sink`".to_string())?;
+    validate_sink_present(sink_name)?;
+
+    let element_predicate = d
+        .list_element_predicate
+        .clone()
+        .unwrap_or_else(|| d.list_predicate.clone());
+
+    let head_query = build_head_query(&d)?;
+    let head_result = gc::execute_query(&head_query).map_err(map_graph_err)?;
+    let flat = match head_result {
+        CallbackQueryResult::Bindings(bs) => bs,
+        _ => {
+            return Err(
+                "wf_materialize_list: head query must yield bindings, not CONSTRUCT/ASK".into(),
+            );
+        }
+    };
+    let head_rows = split_rows(flat);
+
+    let step_handle = pq::prepare_query(
+        "SELECT ?value ?rest WHERE { \
+         ?head <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ?value ; \
+               <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>  ?rest }",
+    )
+    .map_err(map_prepared_err)?;
+
+    let mut all_quads: Vec<WitQuad> = Vec::new();
+    let mut source_row_count: u64 = 0;
+    const MAX_CHAIN_STEPS: i64 = 100_000;
+
+    for row in &head_rows {
+        let subject_iri = match row
+            .iter()
+            .find(|b| b.variable == "subject")
+            .and_then(|b| term_iri(&b.value))
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        let head_iri = match row
+            .iter()
+            .find(|b| b.variable == "head")
+            .and_then(|b| term_iri(&b.value))
+        {
+            Some(h) => h,
+            None => continue,
+        };
+
+        let subject_term = subject_term_from_iri(&subject_iri);
+        let mut cur = head_iri;
+        let mut idx: i64 = 0;
+        while cur != RDF_NIL && idx < MAX_CHAIN_STEPS {
+            let inputs = vec![head_binding_for(&cur)];
+            let step_flat = pq::run_prepared(step_handle, &inputs).map_err(map_prepared_err)?;
+            let step_rows = split_rows(step_flat);
+            let step_row = match step_rows.first() {
+                Some(r) => r,
+                None => break,
+            };
+            let value = match step_row.iter().find(|b| b.variable == "value") {
+                Some(b) => coerce_to_value_type(&b.value, &d.value_type),
+                None => break,
+            };
+            all_quads.push(WitQuad {
+                subject: subject_term.clone(),
+                predicate: WitTerm::NamedNode(element_predicate.clone()),
+                object: value,
+                graph: None,
+            });
+            all_quads.push(WitQuad {
+                subject: subject_term.clone(),
+                predicate: WitTerm::NamedNode(TEGMENTUM_LIST_POSITION.into()),
+                object: integer_literal(idx),
+                graph: None,
+            });
+            source_row_count += 1;
+            idx += 1;
+            cur = match step_row
+                .iter()
+                .find(|b| b.variable == "rest")
+                .and_then(|b| term_iri(&b.value))
+            {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    pq::free_prepared(step_handle);
+
+    if all_quads.is_empty() {
+        let out = json!({ "source_rows": source_row_count, "quads_accepted": 0 });
+        return Ok(json_literal(&out.to_string()));
+    }
+
+    let accepted = sc::emit_quads(sink_name, &all_quads).map_err(map_sink_err)?;
+
+    let out = json!({
+        "source_rows": source_row_count,
+        "quads_accepted": accepted,
+    });
+    Ok(json_literal(&out.to_string()))
 }
 
-export!(Component);
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_materialize_list".into(),
+            min_arity: 1,
+            max_arity: Some(1),
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_materialize_list" => materialize_list_impl(&args),
+            other => Err(format!("wf_materialize_list: unknown function '{other}'")),
+        }
+    }
+}
+
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_materialize_list: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_materialize_list: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_materialize_list: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_materialize_list: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
