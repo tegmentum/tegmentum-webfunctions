@@ -2,12 +2,51 @@
 //!
 //! Delegates to Language::all_with_cyrillic_script() and emits one ISO 639-1 code per row.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+/// Legacy names kept as aliases so the ported property-function body
+/// reads with minimum diff against the flat-world original.
+type Value = WitTerm;
+type Literal = WitLiteral;
+
+/// Local shim mirroring the old `Binding` shape (`name`, `value`) so the
+/// port keeps the original construction sites unchanged. Column names
+/// are dropped when converting to the base world's `BindingRow`, which
+/// carries only positional values.
+struct Binding {
+    #[allow(dead_code)]
+    name: String,
+    value: WitTerm,
+}
+
+/// Local shim mirroring the old `BindingSets` shape (`vars`, `rows`).
+struct BindingSets {
+    #[allow(dead_code)]
+    vars: Vec<String>,
+    rows: Vec<Vec<Binding>>,
+}
+
+fn to_binding_rows(bs: BindingSets) -> Vec<BindingRow> {
+    bs.rows
+        .into_iter()
+        .map(|row| BindingRow {
+            values: row.into_iter().map(|b| b.value).collect(),
+        })
+        .collect()
+}
+
 use lingua::Language;
 
 struct Component;
@@ -15,11 +54,10 @@ struct Component;
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+    WitTerm::Literal(WitLiteral { value: s.into(), datatype: Some(XSD_STRING.into()), language: None })
 }
 
-impl Guest for Component {
-    fn evaluate(_args: Vec<Value>) -> Result<BindingSets, String> {
+fn evaluate_impl(_args: Vec<Value>) -> Result<BindingSets, String> {
         let mut langs: Vec<Language> = Language::all_with_cyrillic_script().into_iter().collect();
         langs.sort_by_key(|l| l.iso_code_639_1() as u32);
         let rows = langs.into_iter().map(|l| vec![Binding {
@@ -29,17 +67,71 @@ impl Guest for Component {
         Ok(BindingSets { vars: vec!["lang".into()], rows })
     }
 
-    fn aggregate_step(_a: Vec<Value>, _m: u64) -> Result<(), String> { Err("aggregate not applicable".into()) }
-    fn aggregate_finish() -> Result<BindingSets, String> { Err("aggregate not applicable".into()) }
-    fn cardinality_estimate(_i: Cardinality, _a: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
+/// Filter interface stub — property-function-shaped component.
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        Vec::new()
     }
 
-    fn doc() -> BindingSets {
-        BindingSets { vars: vec!["doc".into()], rows: vec![vec![Binding {
-            name: "doc".into(),
-            value: string_literal("string_lang_lingua_all_languages_with_cyrillic_script() -> ISO 639-1 codes of the compiled-in Cyrillic-script languages.")
-        }]] }
+    fn call(name: String, _args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        Err(format!(
+            "string_lang_lingua_all_languages_with_cyrillic_script: unknown filter function '{name}' (use as a property function)"
+        ))
     }
 }
-export!(Component);
+
+/// Aggregate interface stub.
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "string_lang_lingua_all_languages_with_cyrillic_script: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("string_lang_lingua_all_languages_with_cyrillic_script: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("string_lang_lingua_all_languages_with_cyrillic_script: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        vec![PropertyDescriptor {
+            name: "string_lang_lingua_all_languages_with_cyrillic_script".to_string(),
+            subject_arity: 0,
+            object_arity: 0,
+        }]
+    }
+
+    fn evaluate(
+        name: String,
+        subjects: Vec<WitTerm>,
+        objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        match name.as_str() {
+            "string_lang_lingua_all_languages_with_cyrillic_script" => {
+                let mut args = subjects;
+                args.extend(objects);
+                let bs = evaluate_impl(args)?;
+                Ok(to_binding_rows(bs))
+            }
+            other => Err(format!("string_lang_lingua_all_languages_with_cyrillic_script: unknown property function '{other}'")),
+        }
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+
