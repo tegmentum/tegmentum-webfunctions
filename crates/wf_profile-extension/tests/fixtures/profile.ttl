@@ -1,0 +1,23 @@
+@prefix : <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Fixture for wf_profile-extension smoke tests.
+#
+# Two predicates with distinct triple counts and shapes:
+#
+#   * :name — 3 triples, all literal, functional (each subject has at
+#     most one), 0..1 cardinality. wf_profile classification target:
+#     `attribute` / `string`.
+#   * :knows — 4 triples, all IRI objects, non-functional (:alice has
+#     three knows). wf_profile classification target: `graph` (v1
+#     doesn't check tree invariants, so multi-object IRI predicates
+#     land in the fallback `graph` bucket).
+
+:alice :name "Alice" .
+:bob   :name "Bob" .
+:carol :name "Carol" .
+
+:alice :knows :bob .
+:alice :knows :carol .
+:alice :knows :dave .
+:bob   :knows :carol .
