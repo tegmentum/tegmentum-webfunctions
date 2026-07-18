@@ -1,118 +1,78 @@
 //! wf_pipeline — declarative composition of substrate steps.
 //!
-//! Signature: `wf:call(<wf_pipeline.wasm>, "<plan-json>")`
-//!    → binding-set { step, kind, name, ok, detail }
+//! Signature: `wf:pipeline("<plan-json>")` returns an rdf:JSON
+//! literal shaped as
+//!   `{"vars":["step","kind","name","ok","detail"],"rows":[...]}`
+//! (mirror of the batch1 / batch2 single-term collapse). Each row is a
+//! JSON object with the columns above; one row per executed step.
 //!
-//! Reads a JSON plan with an ordered list of steps and runs each one
-//! against the substrate's host imports. Returns one row per step so
-//! the caller can see exactly what happened and where anything failed.
+//! Migration (Follow-up F): moved off the Stardog overlay onto the
+//! substrate `tegmentum:webfunction/extension-with-all-host-callbacks
+//! @0.1.0` world.
 //!
-//! Plan shape:
+//!   * `sparql_query` / `sparql_update` — `graph-callbacks::
+//!     execute-query` / `execute-update`.
+//!   * `wasm` step — `wasm-callbacks::invoke-wasm-service` (the R1
+//!     property-function-shape sub-invocation, `(url, list<term>) ->
+//!     list<binding>`).
+//!   * `condition` step — an ASK evaluated by `execute-query`; the
+//!     new `graph-callbacks::query-result::boolean` arm exposes the
+//!     verdict directly.
+//!
+//! Migration deviation: the Stardog-era
+//! `stardog:webfunction@0.6.0/host::execute-query-with-bindings`
+//! primitive (dead-code stub in the pre-migration crate) is not
+//! present on the R1 substrate. The v3 `bind_full: true` +
+//! `${var}` -> VALUES-clause interpolation path continues to work —
+//! it never depended on the substrate primitive, only on textual
+//! interpolation into the outgoing SPARQL.
+//!
+//! Plan shape (unchanged from pre-migration):
 //!
 //! ```json
 //! {
 //!   "name": "canonicalize_then_materialize",
 //!   "steps": [
-//!     { "kind": "sparql_update",
-//!       "name": "clear_derived",
-//!       "update":  "CLEAR SILENT GRAPH <urn:derived:person>" },
-//!     { "kind": "sparql_query",
-//!       "name":  "sanity_count",
-//!       "query": "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
-//!       "bind":  { "count": "?n" } },
-//!     { "kind": "condition",
-//!       "name":  "has_person",
-//!       "ask":   "ASK { ?s a <urn:Person> }",
-//!       "then_steps": [
-//!         { "kind": "wasm",
-//!           "name": "materialize_person",
-//!           "url":  "file:///.../wf_materialize.wasm",
-//!           "arg":  "{\"name\": \"person\", \"limit\": ${count}}",
-//!           "on_error": { "retry": 2, "delay_ms": 100,
-//!                          "fallback_steps": [
-//!                            { "kind": "sparql_update",
-//!                              "update": "INSERT DATA { <urn:log> <urn:msg> \"skipped\" }" }
-//!                          ] } }
-//!       ],
-//!       "else_steps": [] }
+//!     { "kind": "sparql_update", "update":  "..." },
+//!     { "kind": "sparql_query",  "query":   "...", "bind": { "count": "?n" } },
+//!     { "kind": "condition",     "ask":     "...",
+//!       "then_steps": [ ... ], "else_steps": [ ... ] },
+//!     { "kind": "wasm",          "url":     "...", "arg": "..." }
 //!   ]
 //! }
 //! ```
-//!
-//! Step kinds:
-//!
-//! * `sparql_query`    — execute-query; detail = row count. `bind` may
-//!                        extract cells from the first row into the
-//!                        step context.
-//! * `sparql_update`   — execute-update; detail = "ok".
-//! * `wasm`            — invoke-wasm with a single-string arg (typically
-//!                        a descriptor JSON); detail = the guest's first
-//!                        row's first cell. `bind` may extract cells too.
-//! * `condition`       — evaluate a SPARQL ASK query, then run either
-//!                        `then_steps` or `else_steps`. detail is "true"
-//!                        or "false"; the boolean itself can be bound via
-//!                        `bind: { "myvar": "_ask" }`.
-//!
-//! v2 scope (this crate):
-//!
-//! * Sequential execution with structured branching (`condition`).
-//! * Inter-step string variables via `bind:` + `${var}` interpolation.
-//!   Substitution happens at pre-dispatch time; the guest still sees a
-//!   fully-formed SPARQL / arg string. Only scalar strings flow — no
-//!   typed binding sets between steps.
-//! * Optional `on_error: { retry, delay_ms, fallback_steps }` per step.
-//!   Fixed-count retry with linear backoff, then fallback substeps.
-//!
-//! v3 scope (this crate, additive over v2):
-//!
-//! * Typed binding-set propagation between steps. A `sparql_query` /
-//!   `wasm` step with `bind_full: true` captures its full binding-set
-//!   (vars + rows, typed) into the pipeline context under its step name.
-//!   Subsequent `${var}` interpolation notices the referenced var is a
-//!   full binding-set (not a scalar string) and expands it as a SPARQL
-//!   VALUES clause:
-//!
-//!   ```sparql
-//!   VALUES (?a ?b) { ("x" "y") (<urn:iri> "z") }
-//!   ```
-//!
-//!   IRIs render as `<...>`, literals with their datatype/lang tags
-//!   preserved.
-//!
-//! * The `execute-query-with-bindings` host import (added in
-//!   `stardog:webfunction@0.6.0`) is available for guests that want to
-//!   feed a captured binding-set as pre-seed bindings on the substrate
-//!   side rather than through VALUES text interpolation. wf_pipeline's
-//!   own `sparql_query` step keeps to string interpolation for
-//!   simplicity — the user-visible knob is `${var}` regardless of shape
-//!   — but the host surface is there for other guests.
-//!
-//! * Backwards compat: `bind_full: false` (default) preserves v2 scalar
-//!   semantics exactly. Using a full-bind var where a scalar is
-//!   expected (e.g. inside a `wasm` step's arg-JSON) fails the step
-//!   with a clear error, so mixed use never silently corrupts a query.
-//!
-//! On step failure (after retries + fallback exhausted): emit an error
-//! row and STOP; later steps don't run. Conditional branches inherit
-//! the same stop-on-failure semantic scoped to the outer pipeline.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::{Value as JsonValue, json};
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::types::{
+    Binding as WitBinding, Literal as WitLiteral, Term as WitTerm,
+};
+use bindings::tegmentum::webfunction::wasm_callbacks::{
+    self as wc, WasmCallError,
+};
 
 struct Component;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 
 // ---------------------------------------------------------------------------
 // Plan JSON shape
@@ -148,34 +108,24 @@ struct Step {
     then_steps: Vec<Step>,
     #[serde(default)]
     else_steps: Vec<Step>,
-    // v2: inter-step variables
+    // inter-step variables
     #[serde(default)]
     bind: BTreeMap<String, String>,
-    /// v3: when true, the step's full binding-set (vars + rows, typed)
-    /// is captured into the pipeline context under the step's `name`.
-    /// Each key in `bind` continues to work as a scalar bind against
-    /// the first row, so a step may capture both a scalar (e.g. row
-    /// count) and its full grid in one shot. Requires `name` to be set.
+    /// When true, the step's full binding-set is captured under the
+    /// step's `name` (requires `name` to be set).
     #[serde(default)]
     bind_full: bool,
-    // v2: error recovery
+    // error recovery
     #[serde(default)]
     on_error: Option<OnError>,
 }
 
 #[derive(Deserialize, Clone, Default)]
 struct OnError {
-    /// Number of retries *after* the first attempt. `retry: 2` means up
-    /// to 3 total attempts.
     #[serde(default)]
     retry: u32,
-    /// Linear backoff base in milliseconds. Attempt N (1-indexed after
-    /// the first) sleeps `delay_ms * N` before firing.
     #[serde(default)]
     delay_ms: u64,
-    /// Steps to run if all retries fail. If the fallback substeps all
-    /// succeed the pipeline continues; if any fallback substep fails
-    /// the pipeline halts as usual.
     #[serde(default)]
     fallback_steps: Vec<Step>,
 }
@@ -185,10 +135,6 @@ struct OnError {
 // the WIT host imports.
 // ---------------------------------------------------------------------------
 
-/// A typed cell in a query outcome. Preserves SPARQL term shape so v3's
-/// VALUES-clause expansion can render IRIs as `<...>` and literals with
-/// datatype/lang decoration. `as_str` yields the raw lexical form for
-/// v2's scalar bind path so old behaviour is preserved.
 #[derive(Clone, Debug)]
 enum Cell {
     Iri(String),
@@ -209,9 +155,6 @@ impl Cell {
         }
     }
 
-    /// SPARQL term form as it appears inside a VALUES clause. Blank
-    /// nodes aren't valid in VALUES; we emit UNDEF (per SPARQL 1.1) so
-    /// downstream queries at least parse.
     fn as_sparql(&self) -> String {
         match self {
             Cell::Iri(s) => format!("<{s}>"),
@@ -254,7 +197,6 @@ fn escape_sparql_string(s: &str) -> String {
 #[derive(Clone, Debug, Default)]
 struct QueryOutcome {
     vars: Vec<String>,
-    /// One row per result; each cell is (var-name, typed-value).
     rows: Vec<Vec<(String, Cell)>>,
 }
 
@@ -263,7 +205,6 @@ trait Substrate {
     fn execute_update(&self, update: &str) -> Result<(), String>;
     fn invoke_wasm(&self, url: &str, arg: Option<&str>) -> Result<QueryOutcome, String>;
     fn execute_ask(&self, sparql: &str) -> Result<bool, String>;
-    /// Backoff hook. Real Guest sleeps via std; the mock counts calls.
     fn sleep_ms(&self, _ms: u64) {}
 }
 
@@ -271,10 +212,6 @@ trait Substrate {
 // Interpolation
 // ---------------------------------------------------------------------------
 
-/// A pipeline-context value. Scalars are v2's shape — a single string
-/// substituted into `${var}` at pre-dispatch time. Full binding-sets
-/// are v3 — captured via `bind_full: true`, expanded as a SPARQL
-/// `VALUES` clause when interpolated.
 #[derive(Clone, Debug)]
 enum CtxValue {
     Scalar(String),
@@ -286,10 +223,6 @@ struct Context {
     vars: BTreeMap<String, CtxValue>,
 }
 
-/// Render a binding-set as a SPARQL `VALUES (?a ?b) { ("x" "y") ... }`
-/// clause. An empty rows list produces `VALUES (?a ?b) { }` — a valid
-/// SPARQL construct that constrains to no rows, which stops downstream
-/// queries from returning anything, but at least parses.
 fn render_values_clause(oc: &QueryOutcome) -> String {
     let mut out = String::from("VALUES (");
     for (i, v) in oc.vars.iter().enumerate() {
@@ -313,35 +246,17 @@ fn render_values_clause(oc: &QueryOutcome) -> String {
         }
         out.push(')');
     }
-    if !oc.rows.is_empty() {
-        out.push(' ');
-    } else {
-        out.push(' ');
-    }
+    out.push(' ');
     out.push('}');
     out
 }
 
-/// Where the interpolated string is going. SPARQL-mode expansion allows
-/// full binding-sets to become VALUES clauses; scalar-mode (used by the
-/// `wasm` step's `arg` JSON blob and by `condition`'s ASK query when
-/// splicing outside a SPARQL grammar position) rejects them with a
-/// clear error — mixed use never silently corrupts downstream input.
 #[derive(Copy, Clone, Debug)]
 enum InterpMode {
     Sparql,
     Scalar,
 }
 
-/// Replace `${var}` occurrences with values from `ctx`. Returns an error
-/// on an unbound variable or an unterminated `${...}`. Escaping is not
-/// supported in v2 — if you need a literal `${...}` in a query, bind a
-/// var whose value is that literal.
-///
-/// v3: full binding-set vars expand as a SPARQL `VALUES (...) { ... }`
-/// clause when interpolated in Sparql mode. Using a full-bind var in
-/// Scalar mode (e.g. inside a `wasm` step's arg-JSON) fails the step
-/// with a clear "mixed use" error.
 fn interpolate(s: &str, ctx: &Context) -> Result<String, String> {
     interpolate_mode(s, ctx, InterpMode::Sparql)
 }
@@ -389,7 +304,7 @@ fn interpolate_mode(s: &str, ctx: &Context, mode: InterpMode) -> Result<String, 
 
 struct Runner<'s, S: Substrate> {
     substrate: &'s S,
-    rows: Vec<Vec<Binding>>,
+    rows: Vec<Vec<(String, JsonValue)>>,
     ctx: Context,
     counter: usize,
 }
@@ -404,7 +319,6 @@ impl<'s, S: Substrate> Runner<'s, S> {
         }
     }
 
-    /// Returns true if the pipeline should continue past `steps`.
     fn run_steps(&mut self, steps: &[Step]) -> bool {
         for step in steps {
             if !self.run_step(step) {
@@ -449,11 +363,9 @@ impl<'s, S: Substrate> Runner<'s, S> {
             }
         }
 
-        // Retries exhausted. Emit the failure row.
         self.rows
             .push(build_row(idx, &step.kind, &step_name, false, &last_err));
 
-        // Fallback?
         if let Some(oe) = step.on_error.as_ref() {
             if !oe.fallback_steps.is_empty() {
                 let fb = oe.fallback_steps.clone();
@@ -502,7 +414,6 @@ impl<'s, S: Substrate> Runner<'s, S> {
         self.rows
             .push(build_row(idx, "condition", step_name, true, detail));
 
-        // Only `_ask` is meaningful for condition binds.
         for (name, source) in &step.bind {
             if source == "_ask" || source == "?_ask" {
                 self.ctx
@@ -515,9 +426,6 @@ impl<'s, S: Substrate> Runner<'s, S> {
         self.run_steps(branch)
     }
 
-    /// One attempt at a non-condition step. Returns (detail, binds).
-    /// v3: when `step.bind_full` is set, the full binding-set is also
-    /// captured, keyed by the step's name.
     fn dispatch(&self, step: &Step) -> Result<(String, Vec<(String, CtxValue)>), String> {
         match step.kind.as_str() {
             "sparql_query" => {
@@ -551,12 +459,8 @@ impl<'s, S: Substrate> Runner<'s, S> {
                     .url
                     .as_deref()
                     .ok_or_else(|| "wasm: missing `url`".to_string())?;
-                // URL is scalar text, not a SPARQL grammar position.
                 let url = interpolate_mode(url, &self.ctx, InterpMode::Scalar)?;
                 let arg_string = match step.arg.as_deref() {
-                    // The wasm arg is an opaque scalar payload (usually
-                    // a JSON blob). Splicing a VALUES clause into it is
-                    // a category error — reject with a clear message.
                     Some(a) => Some(interpolate_mode(a, &self.ctx, InterpMode::Scalar)?),
                     None => None,
                 };
@@ -582,9 +486,6 @@ impl<'s, S: Substrate> Runner<'s, S> {
     }
 }
 
-/// v3 helper: if `bind_full: true`, capture the full binding-set into
-/// context under the step's `name`. Requires `name` to be set — the
-/// binding-set has no other stable handle to key under.
 fn capture_full(
     step: &Step,
     bs: &QueryOutcome,
@@ -604,13 +505,6 @@ fn capture_full(
     Ok(())
 }
 
-/// Given a `bind` map (context-name -> source-var-name) and a query
-/// outcome, produce the (context-name, ctx-value) pairs. Missing source
-/// vars are simply skipped — the pipeline shouldn't fail because a
-/// `SELECT (COUNT(*) AS ?n)` came back with zero rows, but any bind
-/// referencing `?n` in that case just doesn't fire. Always emits
-/// `CtxValue::Scalar` (lexical form) — v3's full-binding-set capture is
-/// separate, driven by `bind_full` on the step.
 fn extract_binds(
     bind_map: &BTreeMap<String, String>,
     bs: &QueryOutcome,
@@ -633,268 +527,246 @@ fn extract_binds(
 }
 
 // ---------------------------------------------------------------------------
+// Row assembly (each row -> BTreeMap<String, JsonValue>)
+// ---------------------------------------------------------------------------
+
+fn build_row(idx: i64, kind: &str, name: &str, ok: bool, detail: &str) -> Vec<(String, JsonValue)> {
+    vec![
+        ("step".to_string(), json!(idx)),
+        ("kind".to_string(), json!(kind)),
+        ("name".to_string(), json!(name)),
+        ("ok".to_string(), json!(ok)),
+        ("detail".to_string(), json!(detail)),
+    ]
+}
+
+fn rows_to_json_literal(rows: Vec<Vec<(String, JsonValue)>>) -> WitTerm {
+    let json_rows: Vec<JsonValue> = rows
+        .into_iter()
+        .map(|r| {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in r {
+                obj.insert(k, v);
+            }
+            JsonValue::Object(obj)
+        })
+        .collect();
+    let out = json!({
+        "vars": ["step", "kind", "name", "ok", "detail"],
+        "rows": json_rows,
+    });
+    WitTerm::Literal(WitLiteral {
+        value: out.to_string(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Guest impl — wires the real WIT host imports into a Substrate.
 // ---------------------------------------------------------------------------
 
 struct HostSubstrate;
 
+fn map_graph_err(e: gc::GraphCallError) -> String {
+    match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    }
+}
+
+fn map_wasm_err(e: WasmCallError) -> String {
+    match e {
+        WasmCallError::NotFound(m) => format!("wasm-callbacks not-found: {m}"),
+        WasmCallError::InvocationError(m) => format!("wasm-callbacks invocation-error: {m}"),
+        WasmCallError::NotPermitted(m) => format!("wasm-callbacks not-permitted: {m}"),
+    }
+}
+
+fn value_to_cell(v: &WitTerm) -> Cell {
+    match v {
+        WitTerm::NamedNode(s) => Cell::Iri(s.clone()),
+        WitTerm::Literal(l) => Cell::Literal {
+            label: l.value.clone(),
+            datatype: l.datatype.clone().unwrap_or_default(),
+            lang: l.language.clone(),
+        },
+        WitTerm::BlankNode(s) => Cell::Bnode(s.clone()),
+        WitTerm::Triple(_) => Cell::Literal {
+            label: "<<quoted-triple>>".into(),
+            datatype: XSD_STRING.into(),
+            lang: None,
+        },
+    }
+}
+
+/// Reconstruct rows from a flat `list<binding>` by splitting on
+/// repeated variable identity (the R1 shape returned by
+/// `graph-callbacks::query-result::bindings` and
+/// `wasm-callbacks::invoke-wasm-service`).
+fn flat_to_outcome(flat: Vec<WitBinding>) -> QueryOutcome {
+    let mut vars: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<(String, Cell)>> = Vec::new();
+    let mut current: Vec<(String, Cell)> = Vec::new();
+    for b in flat {
+        if current.iter().any(|(n, _)| n == &b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        if !vars.contains(&b.variable) {
+            vars.push(b.variable.clone());
+        }
+        current.push((b.variable, value_to_cell(&b.value)));
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    QueryOutcome { vars, rows }
+}
+
 impl Substrate for HostSubstrate {
     fn execute_query(&self, sparql: &str) -> Result<QueryOutcome, String> {
-        let bs = host::execute_query(sparql, &[], None).map_err(|e| e.to_string())?;
-        Ok(bs_to_outcome(bs))
+        let result = gc::execute_query(sparql).map_err(map_graph_err)?;
+        match result {
+            CallbackQueryResult::Bindings(bs) => Ok(flat_to_outcome(bs)),
+            CallbackQueryResult::Quads(qs) => {
+                // Project CONSTRUCT / DESCRIBE results into (?s ?p ?o)
+                // rows so downstream bind/interpolate paths behave.
+                let vars = vec!["s".into(), "p".into(), "o".into()];
+                let rows: Vec<Vec<(String, Cell)>> = qs
+                    .into_iter()
+                    .map(|q| {
+                        vec![
+                            ("s".to_string(), value_to_cell(&q.subject)),
+                            ("p".to_string(), value_to_cell(&q.predicate)),
+                            ("o".to_string(), value_to_cell(&q.object)),
+                        ]
+                    })
+                    .collect();
+                Ok(QueryOutcome { vars, rows })
+            }
+            CallbackQueryResult::Boolean(_) => Err(
+                "sparql_query: ASK result — use a `condition` step instead".into(),
+            ),
+        }
     }
     fn execute_update(&self, update: &str) -> Result<(), String> {
-        host::execute_update(update).map_err(|e| e.to_string())
+        gc::execute_update(update).map_err(map_graph_err)
     }
     fn invoke_wasm(&self, url: &str, arg: Option<&str>) -> Result<QueryOutcome, String> {
-        let arg_val = arg.map(|s| {
-            Value::Literal(Literal {
-                label: s.to_string(),
-                datatype: XSD_STRING.into(),
-                lang: None,
+        let args: Vec<WitTerm> = arg
+            .into_iter()
+            .map(|s| {
+                WitTerm::Literal(WitLiteral {
+                    value: s.to_string(),
+                    datatype: Some(XSD_STRING.into()),
+                    language: None,
+                })
             })
-        });
-        let args: Vec<Value> = arg_val.into_iter().collect();
-        let bs = host::invoke_wasm(url, &args).map_err(|e| e.to_string())?;
-        Ok(bs_to_outcome(bs))
+            .collect();
+        let bs = wc::invoke_wasm_service(url, &args).map_err(map_wasm_err)?;
+        Ok(flat_to_outcome(bs))
     }
     fn execute_ask(&self, sparql: &str) -> Result<bool, String> {
-        let bs = host::execute_query(sparql, &[], None).map_err(|e| e.to_string())?;
-        // ASK results come back as vars=["_ask"] with one row whose sole
-        // binding is a boolean literal labeled "true" or "false".
-        let cell = bs
-            .rows
-            .first()
-            .and_then(|r| r.first())
-            .ok_or_else(|| "ASK returned no rows".to_string())?;
-        match &cell.value {
-            Value::Literal(l) => match l.label.as_str() {
-                "true" => Ok(true),
-                "false" => Ok(false),
-                other => Err(format!("ASK returned non-boolean literal `{other}`")),
-            },
-            _ => Err("ASK returned non-literal".into()),
+        let result = gc::execute_query(sparql).map_err(map_graph_err)?;
+        match result {
+            CallbackQueryResult::Boolean(b) => Ok(b),
+            CallbackQueryResult::Bindings(bs) => {
+                // Fallback: an ASK routed through the bindings arm would
+                // land here. Treat any bound row as `true`, no rows as
+                // `false` — matches the pre-migration mock semantics.
+                Ok(!bs.is_empty())
+            }
+            CallbackQueryResult::Quads(qs) => Ok(!qs.is_empty()),
         }
     }
     fn sleep_ms(&self, ms: u64) {
-        // Best-effort backoff. In a wasi-p2 component this maps to the
-        // clocks import; if the host doesn't provide it, sleep is a
-        // no-op and the retry fires immediately.
         if ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
     }
 }
 
-fn bs_to_outcome(bs: BindingSets) -> QueryOutcome {
-    let vars = bs.vars.clone();
-    let rows = bs
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|b| (b.name.clone(), value_to_cell(&b.value)))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    QueryOutcome { vars, rows }
-}
-
-/// WIT `value` variant → the typed `Cell` used inside a QueryOutcome.
-/// Preserves the SPARQL term shape so v3's VALUES-clause rendering can
-/// emit IRIs as `<...>` and literals with the right decoration.
-fn value_to_cell(v: &Value) -> Cell {
-    match v {
-        Value::Iri(s) => Cell::Iri(s.clone()),
-        Value::Literal(l) => Cell::Literal {
-            label: l.label.clone(),
-            datatype: l.datatype.clone(),
-            lang: l.lang.clone(),
-        },
-        Value::Bnode(s) => Cell::Bnode(s.clone()),
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_pipeline".into(),
+            min_arity: 1,
+            max_arity: Some(1),
+        }]
     }
-}
 
-/// The v3 host import: execute a SPARQL query with a full pre-seed
-/// binding-sets matrix. Currently unused by wf_pipeline itself (the
-/// `sparql_query` step interpolates VALUES via string substitution for
-/// simplicity), but exposed so other guests in the workspace can call
-/// through wf_pipeline's WIT world without re-declaring imports.
-#[allow(dead_code)]
-fn execute_query_with_bindings(
-    sparql: &str,
-    seed: &QueryOutcome,
-    max_rows: Option<u32>,
-) -> Result<QueryOutcome, String> {
-    let seed_wit = outcome_to_wit_binding_sets(seed);
-    let bs = host::execute_query_with_bindings(sparql, &seed_wit, max_rows)
-        .map_err(|e| e.to_string())?;
-    Ok(bs_to_outcome(bs))
-}
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_pipeline" => {
+                let plan_json = match args.first() {
+                    Some(WitTerm::Literal(l)) => l.value.clone(),
+                    _ => {
+                        return Err(
+                            "wf_pipeline: first arg must be a plan-json string literal".into(),
+                        );
+                    }
+                };
+                let plan: Plan = serde_json::from_str(&plan_json)
+                    .map_err(|e| format!("wf_pipeline: plan parse: {e}"))?;
 
-#[allow(dead_code)]
-fn outcome_to_wit_binding_sets(oc: &QueryOutcome) -> BindingSets {
-    let rows = oc
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|(name, cell)| Binding {
-                    name: name.clone(),
-                    value: cell_to_wit_value(cell),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    BindingSets {
-        vars: oc.vars.clone(),
-        rows,
-    }
-}
-
-#[allow(dead_code)]
-fn cell_to_wit_value(cell: &Cell) -> Value {
-    match cell {
-        Cell::Iri(s) => Value::Iri(s.clone()),
-        Cell::Literal {
-            label,
-            datatype,
-            lang,
-        } => Value::Literal(Literal {
-            label: label.clone(),
-            datatype: datatype.clone(),
-            lang: lang.clone(),
-        }),
-        Cell::Bnode(s) => Value::Bnode(s.clone()),
-    }
-}
-
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        let plan_json = match args.first() {
-            Some(Value::Literal(l)) => l.label.clone(),
-            _ => {
-                return Err(
-                    "wf_pipeline: first arg must be a plan-json string literal".into(),
-                );
+                let substrate = HostSubstrate;
+                let mut runner = Runner::new(&substrate);
+                runner.run_steps(&plan.steps);
+                Ok(rows_to_json_literal(runner.rows))
             }
-        };
-        let plan: Plan = serde_json::from_str(&plan_json)
-            .map_err(|e| format!("wf_pipeline: plan parse: {e}"))?;
-
-        let substrate = HostSubstrate;
-        let mut runner = Runner::new(&substrate);
-        runner.run_steps(&plan.steps);
-
-        Ok(BindingSets {
-            vars: vec![
-                "step".into(),
-                "kind".into(),
-                "name".into(),
-                "ok".into(),
-                "detail".into(),
-            ],
-            rows: runner.rows,
-        })
-    }
-
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_pipeline: aggregate not applicable".into())
-    }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_pipeline: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label: "wf_pipeline(\"<plan-json>\") — composition of \
-                            substrate steps (sparql_query, sparql_update, \
-                            wasm, condition). v2 adds condition branches, \
-                            ${var} interpolation via `bind`, and \
-                            on_error retry/fallback. v3 adds typed \
-                            binding-set propagation via `bind_full`: a \
-                            step's full row grid captured under its name, \
-                            expanded as a SPARQL VALUES clause when \
-                            interpolated downstream. One row per step. \
-                            Stops on first unrecovered failure."
-                        .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
+            other => Err(format!("wf_pipeline: unknown function '{other}'")),
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Row assembly
-// ---------------------------------------------------------------------------
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
 
-fn build_row(idx: i64, kind: &str, name: &str, ok: bool, detail: &str) -> Vec<Binding> {
-    vec![
-        Binding {
-            name: "step".into(),
-            value: int_lit(idx),
-        },
-        Binding {
-            name: "kind".into(),
-            value: string_lit(kind),
-        },
-        Binding {
-            name: "name".into(),
-            value: string_lit(name),
-        },
-        Binding {
-            name: "ok".into(),
-            value: bool_lit(ok),
-        },
-        Binding {
-            name: "detail".into(),
-            value: string_lit(detail),
-        },
-    ]
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_pipeline: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
 }
 
-fn string_lit(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
-    })
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_pipeline: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_pipeline: aggregate state was never constructed".into())
+    }
 }
 
-fn int_lit(n: i64) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
-    })
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_pipeline: unknown property function '{name}' (this component provides none)"
+        ))
+    }
 }
 
-fn bool_lit(b: bool) -> Value {
-    Value::Literal(Literal {
-        label: if b { "true".into() } else { "false".into() },
-        datatype: XSD_BOOLEAN.into(),
-        lang: None,
-    })
-}
-
-export!(Component);
+bindings::export!(Component with_types_in bindings);
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — kept intact via the Substrate trait, decoupled from the WIT
+// host imports.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -902,8 +774,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Mock substrate. Each call kind pops from a scripted queue so tests
-    /// can precisely stage per-attempt outcomes (needed for retry tests).
     #[derive(Default)]
     struct MockSubstrate {
         query_results: RefCell<Vec<Result<QueryOutcome, String>>>,
@@ -935,42 +805,35 @@ mod tests {
     impl Substrate for MockSubstrate {
         fn execute_query(&self, sparql: &str) -> Result<QueryOutcome, String> {
             self.queries_seen.borrow_mut().push(sparql.to_string());
-            self.query_results
-                .borrow_mut()
-                .remove(0)
+            self.query_results.borrow_mut().remove(0)
         }
         fn execute_update(&self, update: &str) -> Result<(), String> {
             self.updates_seen.borrow_mut().push(update.to_string());
-            self.update_results
-                .borrow_mut()
-                .remove(0)
+            self.update_results.borrow_mut().remove(0)
         }
         fn invoke_wasm(&self, url: &str, arg: Option<&str>) -> Result<QueryOutcome, String> {
             self.wasm_calls_seen
                 .borrow_mut()
                 .push((url.to_string(), arg.map(|s| s.to_string())));
-            self.wasm_results
-                .borrow_mut()
-                .remove(0)
+            self.wasm_results.borrow_mut().remove(0)
         }
         fn execute_ask(&self, sparql: &str) -> Result<bool, String> {
             self.asks_seen.borrow_mut().push(sparql.to_string());
-            self.ask_results
-                .borrow_mut()
-                .remove(0)
+            self.ask_results.borrow_mut().remove(0)
         }
         fn sleep_ms(&self, ms: u64) {
             self.sleeps.borrow_mut().push(ms);
         }
     }
 
-    fn row_get(row: &[Binding], name: &str) -> String {
+    fn row_get(row: &[(String, JsonValue)], name: &str) -> String {
         row.iter()
-            .find(|b| b.name == name)
-            .map(|b| match &b.value {
-                Value::Literal(l) => l.label.clone(),
-                Value::Iri(s) => s.clone(),
-                Value::Bnode(s) => format!("_:{s}"),
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| match v {
+                JsonValue::String(s) => s.clone(),
+                JsonValue::Bool(b) => b.to_string(),
+                JsonValue::Number(n) => n.to_string(),
+                other => other.to_string(),
             })
             .unwrap_or_default()
     }
@@ -982,20 +845,22 @@ mod tests {
                 .into_iter()
                 .map(|r| {
                     r.into_iter()
-                        .map(|(n, v)| (n.to_string(), Cell::Literal {
-                            label: v.to_string(),
-                            datatype: XSD_STRING.into(),
-                            lang: None,
-                        }))
+                        .map(|(n, v)| {
+                            (
+                                n.to_string(),
+                                Cell::Literal {
+                                    label: v.to_string(),
+                                    datatype: XSD_STRING.into(),
+                                    lang: None,
+                                },
+                            )
+                        })
                         .collect()
                 })
                 .collect(),
         }
     }
 
-    /// Test-only helper: build a QueryOutcome whose cells are typed IRIs.
-    /// Useful for the v3 VALUES-expansion tests, which need `<...>` in
-    /// the rendered clause.
     fn outcome_iri(vars: &[&str], rows: Vec<Vec<(&str, &str)>>) -> QueryOutcome {
         QueryOutcome {
             vars: vars.iter().map(|s| s.to_string()).collect(),
@@ -1009,8 +874,6 @@ mod tests {
                 .collect(),
         }
     }
-
-    // ----- interpolation -----
 
     #[test]
     fn interpolate_basic() {
@@ -1039,8 +902,6 @@ mod tests {
         assert!(err.contains("unterminated"), "err was: {err}");
     }
 
-    // ----- condition -----
-
     #[test]
     fn condition_true_runs_then_branch() {
         let plan_json = r#"{
@@ -1068,7 +929,6 @@ mod tests {
         let mut r = Runner::new(&sub);
         r.run_steps(&plan.steps);
 
-        // condition row + then-branch update row
         assert_eq!(r.rows.len(), 2);
         assert_eq!(row_get(&r.rows[0], "kind"), "condition");
         assert_eq!(row_get(&r.rows[0], "detail"), "true");
@@ -1107,8 +967,6 @@ mod tests {
         assert!(sub.updates_seen.borrow()[0].contains("else"));
     }
 
-    // ----- inter-step bind -----
-
     #[test]
     fn bind_from_step_a_interpolates_into_step_b() {
         let plan_json = r#"{
@@ -1142,7 +1000,6 @@ mod tests {
         assert_eq!(row_get(&r.rows[0], "ok"), "true");
         assert_eq!(row_get(&r.rows[1], "ok"), "true");
         assert_eq!(row_get(&r.rows[1], "detail"), "3 rows");
-        // The second query must have been interpolated with count=3.
         assert!(
             sub.queries_seen.borrow()[1].ends_with("LIMIT 3"),
             "second query was: {}",
@@ -1173,11 +1030,8 @@ mod tests {
         assert!(row_get(&r.rows[0], "detail").contains("unbound"));
     }
 
-    // ----- on_error retry -----
-
     #[test]
     fn on_error_retry_succeeds_on_last_attempt() {
-        // retry: 2 → up to 3 total attempts. Fail twice then succeed.
         let plan_json = r#"{
             "name": "r",
             "steps": [
@@ -1200,7 +1054,6 @@ mod tests {
         assert_eq!(row_get(&r.rows[0], "ok"), "true");
         assert_eq!(row_get(&r.rows[0], "detail"), "ok");
         assert_eq!(sub.updates_seen.borrow().len(), 3);
-        // Linear backoff: sleeps before attempts 1 and 2 → 10, 20.
         assert_eq!(sub.sleeps.borrow().as_slice(), &[10u64, 20u64]);
     }
 
@@ -1231,15 +1084,12 @@ mod tests {
         let sub = MockSubstrate::default();
         sub.stage_update(Err("perm".into()));
         sub.stage_update(Err("perm".into()));
-        // fallback update:
         sub.stage_update(Ok(()));
-        // "after" step:
         sub.stage_update(Ok(()));
 
         let mut r = Runner::new(&sub);
         r.run_steps(&plan.steps);
 
-        // Rows: failure row, fallback row, after row.
         assert_eq!(r.rows.len(), 3, "rows: {:#?}", r.rows);
         assert_eq!(row_get(&r.rows[0], "name"), "will_fail");
         assert_eq!(row_get(&r.rows[0], "ok"), "false");
@@ -1247,7 +1097,6 @@ mod tests {
         assert_eq!(row_get(&r.rows[1], "ok"), "true");
         assert_eq!(row_get(&r.rows[2], "name"), "after");
         assert_eq!(row_get(&r.rows[2], "ok"), "true");
-        // Attempted 2 times (retry=1 → 2 total) + 1 fallback + 1 after = 4.
         assert_eq!(sub.updates_seen.borrow().len(), 4);
     }
 
@@ -1282,12 +1131,8 @@ mod tests {
         assert_eq!(seen[1].1.as_deref(), Some("{\"prev\": \"42\"}"));
     }
 
-    // ----- v3: bind_full / VALUES expansion / mixed use -----
-
     #[test]
     fn bind_full_captures_binding_set() {
-        // A sparql_query step with bind_full: true captures the entire
-        // binding-set (vars + rows) under its name, not just a scalar.
         let plan_json = r#"{
             "name": "cap",
             "steps": [
@@ -1312,7 +1157,6 @@ mod tests {
 
         assert_eq!(r.rows.len(), 1);
         assert_eq!(row_get(&r.rows[0], "ok"), "true");
-        // The ctx should now hold a Full binding-set under "people".
         match r.ctx.vars.get("people") {
             Some(CtxValue::Full(oc)) => {
                 assert_eq!(oc.vars, vec!["p".to_string(), "age".to_string()]);
@@ -1324,8 +1168,6 @@ mod tests {
 
     #[test]
     fn interpolation_expands_binding_set_as_values() {
-        // A captured binding-set interpolated into a downstream SPARQL
-        // query expands as `VALUES (?p ?age) { ("alice" "30") ... }`.
         let plan_json = r#"{
             "name": "expand",
             "steps": [
@@ -1374,9 +1216,6 @@ mod tests {
 
     #[test]
     fn bind_full_iri_expansion_uses_angle_brackets() {
-        // IRIs in a captured binding-set render as `<...>` in the VALUES
-        // clause, not as string literals — otherwise downstream joins
-        // against IRI predicates would silently miss.
         let plan_json = r#"{
             "name": "iri",
             "steps": [
@@ -1417,9 +1256,6 @@ mod tests {
 
     #[test]
     fn scalar_bind_still_works() {
-        // Explicit backwards-compat check: with bind_full: false (the
-        // default) a scalar bind from v2 flows unchanged as a plain
-        // string substitution.
         let plan_json = r#"{
             "name": "compat",
             "steps": [
@@ -1439,12 +1275,10 @@ mod tests {
         let mut r = Runner::new(&sub);
         r.run_steps(&plan.steps);
 
-        // Ctx var is a Scalar, not a Full.
         match r.ctx.vars.get("count") {
             Some(CtxValue::Scalar(s)) => assert_eq!(s, "7"),
             other => panic!("expected Scalar count, got {other:?}"),
         }
-        // Second query has plain "LIMIT 7", no VALUES injection.
         let seen = sub.queries_seen.borrow();
         assert!(seen[1].ends_with("LIMIT 7"), "got: {}", seen[1]);
         assert!(!seen[1].contains("VALUES"), "got: {}", seen[1]);
@@ -1452,10 +1286,6 @@ mod tests {
 
     #[test]
     fn mixed_use_errors_clearly() {
-        // Using a full-bind var inside a `wasm` step's arg-JSON is a
-        // category error — the arg is opaque scalar text, not a SPARQL
-        // position. Fail the step with a message that names the
-        // variable and points at the mistake.
         let plan_json = r#"{
             "name": "mix",
             "steps": [
@@ -1475,8 +1305,6 @@ mod tests {
         let mut r = Runner::new(&sub);
         r.run_steps(&plan.steps);
 
-        // First step succeeds; the wasm step fails cleanly on the
-        // interpolation of `${grid}` into a scalar context.
         assert_eq!(r.rows.len(), 2);
         assert_eq!(row_get(&r.rows[0], "ok"), "true");
         assert_eq!(row_get(&r.rows[1], "ok"), "false");
@@ -1486,8 +1314,6 @@ mod tests {
             detail.contains("bind_full") || detail.contains("full binding-set"),
             "detail was: {detail}"
         );
-        // The wasm was never actually invoked — the failure happened
-        // during pre-dispatch interpolation.
         assert!(sub.wasm_calls_seen.borrow().is_empty());
     }
 }

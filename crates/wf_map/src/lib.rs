@@ -1,168 +1,244 @@
 //! wf_map — map-over-rows higher-order combinator.
 //!
-//! Signature: `wf:call(<wf_map.wasm>, <wasm-url>, "SELECT ?x WHERE {...}")`.
+//! Signature: `wf:map(<wasm-url>, "SELECT ?x WHERE {...}")`.
 //!
-//! Runs the second-argument SELECT against the local store via the
-//! `execute-query` host callback, invokes the first-argument wasm on
-//! each row's first cell via `invoke-wasm`, and packs the resulting
-//! values into an rdf:JSON array — one output element per input row,
-//! in the query's solution order. Semantics match Rust's
-//! `Iterator::map`. The rdf:JSON datatype flags the return as
-//! structured content so downstream consumers can dispatch on datatype
-//! instead of guessing at an untyped string.
+//! Runs the second-argument SELECT against the local store via
+//! `graph-callbacks::execute-query`, invokes the first-argument wasm
+//! on each row's first cell via `wasm-callbacks::invoke-wasm-service`,
+//! and packs the resulting scalar values into an rdf:JSON array —
+//! one output element per input row, in the query's solution order.
+//! Semantics match Rust's `Iterator::map`.
 //!
-//! Targets WIT world v0.4.0 for the `invoke-wasm` host import.
+//! Migration (Follow-up F): moved off the Stardog overlay onto the
+//! substrate `tegmentum:webfunction/extension-with-all-host-callbacks
+//! @0.1.0` world. `execute-query` is on `graph-callbacks`;
+//! `invoke-wasm-service` is on `wasm-callbacks` and returns a flat
+//! `list<binding>`. This crate takes the first row's first binding as
+//! the mapper's output for a given input row.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 use serde_json::{Value as JsonValue, json};
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::types::{
+    Binding as WitBinding, Literal as WitLiteral, Term as WitTerm,
+};
+use bindings::tegmentum::webfunction::wasm_callbacks::{
+    self as wc, WasmCallError,
+};
 
 struct Component;
 
 const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
-fn xsd_string_literal(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
+fn json_literal(s: &str) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: s.into(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
     })
 }
 
-fn json_literal(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: RDF_JSON.into(),
-        lang: None,
-    })
+fn map_graph_err(e: gc::GraphCallError) -> String {
+    match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    }
 }
 
-fn value_to_json_scalar(v: &Value) -> JsonValue {
+fn map_wasm_err(e: WasmCallError) -> String {
+    match e {
+        WasmCallError::NotFound(m) => format!("wasm-callbacks not-found: {m}"),
+        WasmCallError::InvocationError(m) => format!("wasm-callbacks invocation-error: {m}"),
+        WasmCallError::NotPermitted(m) => format!("wasm-callbacks not-permitted: {m}"),
+    }
+}
+
+fn term_to_json_scalar(v: &WitTerm) -> JsonValue {
     match v {
-        Value::Iri(uri) => json!(uri),
-        Value::Bnode(id) => json!(format!("_:{id}")),
-        Value::Literal(l) => {
-            // Best-effort typed-numeric promotion — matches what the
-            // host-native wf:map did before the port, so downstream
-            // consumers see the same shape.
-            let dt = l.datatype.as_str();
+        WitTerm::NamedNode(uri) => json!(uri),
+        WitTerm::BlankNode(id) => json!(format!("_:{id}")),
+        WitTerm::Literal(l) => {
+            let dt = l.datatype.as_deref().unwrap_or("");
             if dt.ends_with("integer") || dt.ends_with("long") || dt.ends_with("int") {
-                if let Ok(n) = l.label.parse::<i64>() {
+                if let Ok(n) = l.value.parse::<i64>() {
                     return json!(n);
                 }
             }
             if dt.ends_with("decimal") || dt.ends_with("double") || dt.ends_with("float") {
-                if let Ok(n) = l.label.parse::<f64>() {
+                if let Ok(n) = l.value.parse::<f64>() {
                     if n.is_finite() {
                         return json!(n);
                     }
                 }
             }
             if dt.ends_with("boolean") {
-                match l.label.as_str() {
+                match l.value.as_str() {
                     "true" | "1" => return json!(true),
                     "false" | "0" => return json!(false),
                     _ => {}
                 }
             }
-            json!(l.label)
+            json!(l.value)
         }
+        WitTerm::Triple(_) => json!("<<quoted-triple>>"),
     }
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        if args.len() != 2 {
+/// Split a flat binding list on repeated variable identity and return
+/// the first (row_0, binding_0.value). Returns Null when the sub-wasm
+/// produced no output — a valid stand-in for a missing SPARQL binding.
+fn first_scalar_of(flat: Vec<WitBinding>) -> JsonValue {
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prev| prev.variable == b.variable) {
+            break;
+        }
+        current.push(b);
+    }
+    current
+        .first()
+        .map(|b| term_to_json_scalar(&b.value))
+        .unwrap_or(JsonValue::Null)
+}
+
+fn map_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "wf_map: expected 2 args (wasm URL, inner SPARQL), got {}",
+            args.len()
+        ));
+    }
+    let url = match &args[0] {
+        WitTerm::NamedNode(s) => s.clone(),
+        WitTerm::Literal(l) => l.value.clone(),
+        other => {
             return Err(format!(
-                "wf_map: expected 2 args (wasm URL, inner SPARQL), got {}",
-                args.len()
+                "wf_map: first arg must be an IRI or string, got {other:?}"
             ));
         }
-        let url = match &args[0] {
-            Value::Iri(s) => s.clone(),
-            Value::Literal(l) => l.label.clone(),
-            other => {
-                return Err(format!(
-                    "wf_map: first arg must be an IRI or string, got {other:?}"
-                ));
-            }
-        };
-        let inner_sparql = match &args[1] {
-            Value::Literal(l) => l.label.clone(),
-            Value::Iri(s) => s.clone(),
-            other => {
-                return Err(format!(
-                    "wf_map: second arg must be a SPARQL string, got {other:?}"
-                ));
-            }
-        };
-
-        // Fetch the rows we're going to map over. `execute-query` is the
-        // v0.3.x import; still present and unchanged in v0.4.
-        let bs = host::execute_query(&inner_sparql, &[], None)?;
-
-        let mut mapped: Vec<JsonValue> = Vec::with_capacity(bs.rows.len());
-        for row in &bs.rows {
-            // First column of the row is the input to the mapper. Rows
-            // that project no bound values become nulls in the output
-            // — a valid stand-in for a missing SPARQL binding.
-            let Some(first) = row.first() else {
-                mapped.push(JsonValue::Null);
-                continue;
-            };
-            let inner_args = vec![first.value.clone()];
-            let inner_bs = host::invoke_wasm(&url, &inner_args)?;
-            let output_value = inner_bs
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .map(|b| value_to_json_scalar(&b.value))
-                .unwrap_or(JsonValue::Null);
-            mapped.push(output_value);
+    };
+    let inner_sparql = match &args[1] {
+        WitTerm::Literal(l) => l.value.clone(),
+        WitTerm::NamedNode(s) => s.clone(),
+        other => {
+            return Err(format!(
+                "wf_map: second arg must be a SPARQL string, got {other:?}"
+            ));
         }
+    };
 
-        let payload = serde_json::to_string(&JsonValue::Array(mapped))
-            .map_err(|e| format!("wf_map: serializing output: {e}"))?;
+    let result = gc::execute_query(&inner_sparql).map_err(map_graph_err)?;
+    let flat_bindings = match result {
+        CallbackQueryResult::Bindings(bs) => bs,
+        CallbackQueryResult::Quads(_) => {
+            return Err("wf_map: inner query returned CONSTRUCT-shape result".into());
+        }
+        CallbackQueryResult::Boolean(_) => {
+            return Err("wf_map: inner query returned ASK-shape result".into());
+        }
+    };
 
-        Ok(BindingSets {
-            vars: vec!["mapped".into()],
-            rows: vec![vec![Binding {
-                name: "mapped".into(),
-                value: json_literal(&payload),
-            }]],
-        })
+    // Reconstruct rows by splitting on repeated variable identity.
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat_bindings {
+        if current.iter().any(|prev| prev.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_map: aggregate not applicable".into())
+    let mut mapped: Vec<JsonValue> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(first) = row.into_iter().next() else {
+            mapped.push(JsonValue::Null);
+            continue;
+        };
+        let sub_args = vec![first.value];
+        let sub = wc::invoke_wasm_service(&url, &sub_args).map_err(map_wasm_err)?;
+        mapped.push(first_scalar_of(sub));
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_map: aggregate not applicable".into())
+
+    let payload = serde_json::to_string(&JsonValue::Array(mapped))
+        .map_err(|e| format!("wf_map: serializing output: {e}"))?;
+    Ok(json_literal(&payload))
+}
+
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "wf_map".into(),
+            min_arity: 2,
+            max_arity: Some(2),
+        }]
     }
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: xsd_string_literal(
-                    "wf_map(<wasm-url>, \"SELECT ...\") -> rdf:JSON array of the wasm's \
-                     output on each row's first cell, in the query's solution order.",
-                ),
-            }]],
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "wf_map" => map_impl(&args),
+            other => Err(format!("wf_map: unknown function '{other}'")),
         }
     }
 }
 
-export!(Component);
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_map: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_map: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_map: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_map: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
