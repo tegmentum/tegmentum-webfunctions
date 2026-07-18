@@ -8,12 +8,11 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen.workspace = true
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 [package.metadata.component]
-package = "tegmentum:base64-decode"
-
+package = "tegmentum:webfunction"
 [package.metadata.component.target]
-path = "wit"
-world = "webfunction"
+path = "../../wit"
+world = "sparql-extension"

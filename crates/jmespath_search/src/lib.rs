@@ -6,30 +6,60 @@
 //! xsd:string literal (matching the source crate's shape); callers can
 //! then pipe through `parse_json` if they want to unfold rows.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+/// Legacy names — kept as type aliases so the ported business logic
+/// below reads with minimum diff against the flat-world original. The
+/// `Term::Triple` arm added by the R2 types consolidation is handled
+/// in each `match` inside this file.
+type Value = WitTerm;
+type Literal = WitLiteral;
 
 struct Component;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 fn string_literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+    WitTerm::Literal(WitLiteral { value: s.into(), datatype: Some(XSD_STRING.into()), language: None })
 }
 
 fn string_of(arg: &Value, which: &str) -> Result<String, String> {
     match arg {
-        Value::Literal(l) => Ok(l.label.clone()),
+        WitTerm::Literal(l) => Ok(l.value.clone()),
         _ => Err(format!("jmespath_search: {} must be a string literal", which)),
     }
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "jmespath_search".to_string(),
+            min_arity: 0,
+            max_arity: None,
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "jmespath_search" => evaluate_impl(args),
+            other => Err(format!("jmespath_search: unknown function '{other}'")),
+        }
+    }
+}
+
+fn evaluate_impl(args: Vec<Value>) -> Result<Value, String> {
         if args.len() != 2 {
             return Err(format!("jmespath_search: expected 2 args, got {}", args.len()));
         }
@@ -48,36 +78,52 @@ impl Guest for Component {
         // `result.to_string()` behaviour.
         let output = result.to_string();
 
-        Ok(BindingSets {
-            vars: vec!["result".into()],
-            rows: vec![vec![Binding {
-                name: "result".into(),
-                value: string_literal(&output),
-            }]],
-        })
+        Ok(string_literal(&output))
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("jmespath_search: aggregate not applicable".into())
+/// Aggregate interface stub — this component provides none.
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("jmespath_search: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: string_literal(
-                    "jmespath_search(expression, json_document) -> JSON-encoded \
-                     result of applying the JMESPath expression to the document. \
-                     Pipe through parse_json to unfold structured results into rows."),
-            }]],
-        }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "jmespath_search: unknown aggregate '{name}' (this component provides none)"
+        ))
     }
 }
 
-export!(Component);
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("jmespath_search: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("jmespath_search: aggregate state was never constructed".into())
+    }
+}
+
+/// Property-function interface stub — this component provides none.
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "jmespath_search: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+

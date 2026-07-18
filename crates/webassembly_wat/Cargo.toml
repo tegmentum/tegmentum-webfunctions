@@ -8,13 +8,12 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen.workspace = true
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
 wasmprinter = "0.220"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 [package.metadata.component]
-package = "tegmentum:webassembly-wat"
-
+package = "tegmentum:webfunction"
 [package.metadata.component.target]
-path = "wit"
-world = "webfunction"
+path = "../../wit"
+world = "sparql-extension"
