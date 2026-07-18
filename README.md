@@ -190,6 +190,38 @@ for c in crates/*; do (cd "$c" && cargo component build --release); done
 
 Wasm outputs land in `target/wasm32-wasip1/release/<name>.wasm`.
 
+## Migrated components (`*-extension` crates)
+
+Sibling crates that re-expose primitives from the Stardog-era `wf_*`
+family on the standardized `tegmentum:webfunction@0.1.0` package
+declared in `~/git/oxigraph-extension/wit/`. Each sibling is a
+`cdylib` targeting `wasm32-wasip2`, loads under any host implementing
+the standardized extension world, and does not modify the original
+`wf_*` crate. See `~/git/wf-conformance/docs/design/wf-host-callbacks.md`
+§7 for the migration path.
+
+| Sibling | Upstream contract | Imported callbacks | Original crate |
+|---|---|---|---|
+| `wf_skolemize-extension` | `tegmentum:webfunction/extension@0.1.0` | (none — pure filter) | `wf_skolemize` |
+| `wf_profile-extension` | `tegmentum:webfunction/extension-with-host-callbacks@0.1.0` | `tegmentum:webfunction/graph-callbacks@0.1.0` | `wf_profile` |
+
+The `-extension` siblings target the shared world under
+`tegmentum:webfunction@0.1.0`; the originals keep their per-crate
+`stardog:webfunction@0.5.0` (or peer) worlds intact for existing
+Stardog-plugin consumers.
+
+Build one sibling and run its round-trip:
+```bash
+cargo component build --release -p wf_profile-extension --target wasm32-wasip2
+cargo test -p wf_profile-extension --test smoke
+```
+
+The smoke test uses the reference `host-callbacks-impl` from
+`~/git/oxigraph-extension/crates/host-callbacks-impl/` (path
+dev-dep) to prove the migrated component loads against the shared
+world's host side. Downstream hosts implementing the same three
+`Host` traits load the migrated component with no adapter layer.
+
 ## Publishing as a wasm-in-database bundle
 
 The long game (see the tegmentum roadmap): publish the whole suite as a
