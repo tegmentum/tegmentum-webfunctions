@@ -1,0 +1,22 @@
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix :     <http://example.org/> .
+
+# Fixture for wf_infer-extension smoke tests.
+#
+# Class hierarchy: Animal < Mammal < Cat / Dog. rdfs:subClassOf is
+# transitive under the CONSTRUCT rule the smoke test runs.
+:Cat    rdfs:subClassOf :Mammal .
+:Dog    rdfs:subClassOf :Mammal .
+:Mammal rdfs:subClassOf :Animal .
+
+# Three direct type assertions. After the (transitive-closure)
+# subclass rule fires, each of these subjects should also carry the
+# supertype:
+#
+#   :whiskers a :Cat    →  :whiskers a :Mammal, :Animal
+#   :rex      a :Dog    →  :rex      a :Mammal, :Animal
+#   :dumbo    a :Mammal →  :dumbo    a :Animal
+:whiskers a :Cat .
+:rex      a :Dog .
+:dumbo    a :Mammal .
