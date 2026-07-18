@@ -8,14 +8,13 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen.workspace = true
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
 whirlpool = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 digest = { version = "0.10", default-features = false }
 
 [package.metadata.component]
-package = "tegmentum:hash-whirlpool"
-
+package = "tegmentum:webfunction"
 [package.metadata.component.target]
-path = "wit"
-world = "webfunction"
+path = "../../wit"
+world = "sparql-extension"

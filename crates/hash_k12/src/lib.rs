@@ -1,33 +1,63 @@
 //! hash_k12 — hex-encoded KangarooTwelve XOF output (32 bytes) of a UTF-8 string literal.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
+
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
+
+/// Legacy names — kept as type aliases so the ported business logic
+/// below reads with minimum diff against the flat-world original. The
+/// `Term::Triple` arm added by the R2 types consolidation is handled
+/// in each `match` inside this file.
+type Value = WitTerm;
+type Literal = WitLiteral;
 
 use k12::{
     digest::{ExtendableOutput, Update, XofReader},
     KangarooTwelve,
 };
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
-
 struct Component;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 fn literal(s: &str) -> Value {
-    Value::Literal(Literal { label: s.into(), datatype: XSD_STRING.into(), lang: None })
+    WitTerm::Literal(WitLiteral { value: s.into(), datatype: Some(XSD_STRING.into()), language: None })
 }
 
 fn string_of(arg: &Value) -> Result<&str, String> {
     match arg {
-        Value::Literal(l) => Ok(l.label.as_str()),
+        WitTerm::Literal(l) => Ok(l.value.as_str()),
         _ => Err("hash_k12: argument must be a string literal".into()),
     }
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "hash_k12".to_string(),
+            min_arity: 0,
+            max_arity: None,
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "hash_k12" => evaluate_impl(args),
+            other => Err(format!("hash_k12: unknown function '{other}'")),
+        }
+    }
+}
+
+fn evaluate_impl(args: Vec<Value>) -> Result<Value, String> {
         if args.len() != 1 {
             return Err(format!("hash_k12: expected 1 arg, got {}", args.len()));
         }
@@ -35,33 +65,52 @@ impl Guest for Component {
         hasher.update(string_of(&args[0])?.as_bytes());
         let mut output = [0u8; 32];
         hasher.finalize_xof().read(&mut output);
-        Ok(BindingSets {
-            vars: vec!["result".into()],
-            rows: vec![vec![Binding {
-                name: "result".into(),
-                value: literal(&hex::encode(output)),
-            }]],
-        })
+        Ok(literal(&hex::encode(output)))
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("hash_k12: aggregate not applicable".into())
+/// Aggregate interface stub — this component provides none.
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("hash_k12: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(_input: Cardinality, _args: Vec<Value>) -> Result<Cardinality, String> {
-        Ok(Cardinality { value: 1.0, accuracy: Accuracy::Accurate })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: literal("hash_k12(s) -> lowercase hex-encoded KangarooTwelve (32-byte XOF) of s."),
-            }]],
-        }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "hash_k12: unknown aggregate '{name}' (this component provides none)"
+        ))
     }
 }
 
-export!(Component);
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("hash_k12: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("hash_k12: aggregate state was never constructed".into())
+    }
+}
+
+/// Property-function interface stub — this component provides none.
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "hash_k12: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+
