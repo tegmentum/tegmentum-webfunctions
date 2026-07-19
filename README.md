@@ -249,12 +249,11 @@ world's host side. Downstream hosts implementing the same three
 
 ## Overlay-crate migration status
 
-The 21-crate overlay wave (Follow-up E + F + M1) moves each Stardog-era
+The 22-crate overlay wave (Follow-up E + F + M1) moves each Stardog-era
 `stardog:webfunction@0.3.x`–`0.6.x` crate onto the substrate
 contract at `tegmentum:webfunction@0.1.0` (submodule `wit/`).
 
-Progress: 21 / 21 attempted, 20 / 21 successfully migrated, 1
-deferred (wf_canonicalize — pending tracker-sink integration).
+Progress: 22 / 22 overlay crates migrated, 1 retired (`wf_sql`).
 `wf_sql` is retired as of Follow-up F — the R2
 `sink-query-callbacks::execute-sink-select` surface subsumes its
 "arbitrary SQL against a sink" role, so shipping a wf_sql analogue
@@ -274,15 +273,7 @@ contract, not on the crate itself).
 | Follow-up F batch6 (`3beeb6a`) | `wf_materialize`, `wf_materialize_list` | `extension-with-all-host-callbacks` | `sink-callbacks` (write-only) + `graph-callbacks` (+ `prepared-query-callbacks` for the list variant) |
 | M1 Q3 batch7 | `wf_demote`, `wf_demote_tree`, `wf_materialize_tree` | `extension-with-all-host-callbacks` | `sink-query-callbacks::scan-sink-quads` (demote) + `document-sink-callbacks::put-document` (demote_tree, materialize_tree) + `graph-callbacks` |
 | M1 Q2 wf_fetch | `wf_fetch` | `extension-with-all-host-callbacks` | `http-callbacks::http-get` + `sink-callbacks::emit-quads` — HTTP GET + Turtle/N-Triples/N-Quads parse + batched emit (see `feat(wf_fetch)` commit) |
-
-### Deferred (1 crate)
-
-Deferred pending a substrate-side callback surface that has not yet
-landed:
-
-| Crate | Reason deferred |
-|---|---|
-| `wf_canonicalize` | Extensive `sink-execute(SELECT ...)` over its canonical-mapping table plus custom fulltext bridge — awaits tracker-sink integration (M1 X4). |
+| M1 X4 wf_canonicalize | `wf_canonicalize` | `extension-with-all-host-callbacks` | `tracker-sink-callbacks` (alias-map + fulltext-sweep + document-sweep scratch tables) + `graph-callbacks` + `http-callbacks::http-post-json` (Manticore admin + Sirix SQL) |
 
 ### Retired
 
