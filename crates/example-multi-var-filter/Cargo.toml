@@ -1,0 +1,31 @@
+# Reference SPARQL extension that exercises the multi-argument
+# filter call path. Exports one function, `describe`, that takes
+# two string-literal arguments and concatenates them with `=`.
+# Its purpose is to prove that the dispatch surface honestly
+# handles `args.len() == 2` end-to-end; the semantics themselves
+# are deliberately trivial.
+#
+# Migrated from stardog-webfunction-plugin/src/test/rust/function/
+# multi_var_component as part of the cross-plugin test-fixture
+# consolidation. Semantics preserved: single-literal return.
+[package]
+name = "example-multi-var-filter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference SPARQL extension: two-arg `describe` filter function."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Matches the
+# version the other example crates pin.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "sparql-extension"

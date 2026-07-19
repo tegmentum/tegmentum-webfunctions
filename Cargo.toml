@@ -191,6 +191,12 @@ members = [
     "crates/example-count-aggregate",
     "crates/example-power-set-property",
     "crates/example-graph-callback-extension",
+    # Migrated from stardog-webfunction-plugin/src/test/rust as part
+    # of the cross-plugin test-fixture consolidation — same crates,
+    # single source of truth so all four engine bindings (stardog,
+    # jena, rdf4j, oxigraph) load one shared wasm.
+    "crates/example-sum-aggregate",
+    "crates/example-multi-var-filter",
 ]
 resolver = "2"
 

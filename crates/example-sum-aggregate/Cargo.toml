@@ -1,0 +1,33 @@
+# Reference SPARQL aggregate extension. Exports one aggregate,
+# `sum`, that accumulates i64 literals over a SPARQL group and
+# returns the total as xsd:integer. Its purpose is to prove the
+# aggregate lifecycle end-to-end — `register-aggregates` at load,
+# `new-aggregate` per SPARQL group, `step` per row, `finish` per
+# group — with numeric-reduction semantics that count-distinct
+# does not exercise.
+#
+# Migrated from stardog-webfunction-plugin/src/test/rust/aggregate/
+# sum_component as part of the cross-plugin test-fixture
+# consolidation. Semantics preserved bit-for-bit: 1-arg per step,
+# i64 accumulator via `RefCell`, xsd:integer return.
+[package]
+name = "example-sum-aggregate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference SPARQL aggregate: i64 sum."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime for cargo-component's generated bindings. Matches the
+# version the other example crates pin.
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "tegmentum:webfunction"
+
+[package.metadata.component.target]
+path = "../../wit"
+world = "sparql-extension"
