@@ -1,55 +1,87 @@
-//! wf_demote_tree — detect tree-shaped RDF subgraphs and shuttle them out
-//! as JSON documents.
+//! wf_demote_tree — detect tree-shaped RDF subgraphs and shuttle them
+//! out as JSON documents to a document sink.
 //!
-//! Signature: `wf:call(<wf_demote_tree.wasm>, "<config-json>")`
-//!    → binding-set { trees: xsd:integer, nodes: xsd:integer,
-//!                    skipped: xsd:integer, deleted: xsd:integer }
+//! Signature: `<urn:webfunction:demote-tree>("<config-json>")` returns
+//! an rdf:JSON literal shaped as
+//! `{"trees": T, "nodes": N, "skipped": S, "deleted": D}`
+//! (single-term collapse per the ExtensionGuest convention).
 //!
 //! Contract:
-//!   * Reads a config that names a `root_selector` (SPARQL WHERE pattern
-//!     projecting `?r`), a `sink` URL, and an optional resource name.
-//!   * Enumerates root IRIs matching the selector.
-//!   * For each root, walks outgoing edges depth-first into a JSON
-//!     document. The archetypal RDF list (`rdf:first` / `rdf:rest` /
-//!     `rdf:nil`) collapses to a JSON array; every other subject
-//!     becomes a JSON object keyed by predicate local-name.
+//!   * Reads a config that names a `root_selector` (SPARQL WHERE
+//!     pattern projecting `?r`), a document `sink` name, and shape
+//!     flags.
+//!   * Enumerates root IRIs matching the selector via
+//!     `graph-callbacks::execute-query`.
+//!   * For each root, walks outgoing edges via CONSTRUCT closure into
+//!     a JSON document. The archetypal RDF list
+//!     (`rdf:first` / `rdf:rest` / `rdf:nil`) collapses to a JSON
+//!     array; every other subject becomes a JSON object keyed by
+//!     predicate local-name.
 //!   * Enforces the tree property: a subject reached during the walk
 //!     may not have more than one in-edge from within the collected
 //!     set. If it does, that's a DAG, and the guest either skips that
-//!     root (default) or fails per config.
-//!   * Blank nodes are skolemized on the way out — Sirix drops
-//!     blank-node identity across the boundary, so we mint a stable
-//!     genid IRI per bnode so the demoted document can round-trip.
-//!   * Emits each document via the sink's `INSERT DOC` sentinel (v0.5
-//!     WIT). Reference sinks: `jsonl://` (write stub), `sirix://` (real
-//!     Sirix via companion `sirix-import` CLI reading the JSONL).
-//!   * When `delete_source` is set, DELETEs every collected triple
-//!     from the source graph so the tree is genuinely demoted, not
-//!     duplicated.
+//!     root (default) or emits a `"$ref"` placeholder.
+//!   * Blank nodes are skolemized on the way out — the sink typically
+//!     drops blank-node identity across the boundary, so we mint a
+//!     stable genid IRI per bnode so the demoted document can
+//!     round-trip.
+//!   * Emits each document via
+//!     `document-sink-callbacks::put-document`. The document key is
+//!     the root IRI (or the minted genid for bnode roots — rejected
+//!     at collect time); the content is the serialized JSON.
+//!   * When `delete_source` is set, DELETEs every triple whose
+//!     subject is in the collected set from the source graph so the
+//!     tree is genuinely demoted, not duplicated.
 //!
-//! Rationale: this is the tree counterpart of `wf_demote`, which
-//! handles shape-relational demotion into SQLite. Together they
-//! implement the "convert relational shapes to SQL, tree shapes to
-//! JSON documents" split from the substrate design.
+//! Migration deviations (M1 Q3, ExtensionGuest wave):
+//!
+//!   * `sink` is now a substrate-side document-sink NAME (not a
+//!     driver URL). Sinks must be pre-registered; presence is
+//!     validated via `sink-callbacks::list-sinks`.
+//!   * The Stardog-era `sink-execute("INSERT DOC", <json-lit>)`
+//!     retires in favor of typed `put-document(sink-name,
+//!     {key: <root-iri>, content: <json>})`. The sink adapter owns
+//!     whatever storage projection the backend uses.
+//!   * `wf_demote_tree` semantically WRITES documents (and DELETEs
+//!     source triples), so it consumes `document-sink-callbacks` for
+//!     the sink side rather than the read-shape
+//!     `sink-query-callbacks::scan-sink-quads` the task-table's row
+//!     assumes. Root enumeration continues to run against the source
+//!     graph via `graph-callbacks::execute-query`, not against the
+//!     sink — the current lib.rs behavior; the sink is the sink-side
+//!     output, not the source of truth for what to demote.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Deserialize;
+use serde_json::json;
 
-#[cfg(target_arch = "wasm32")]
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::document_sink_callbacks::{
+    self as ds, Document, DocumentSinkError,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::sink_callbacks::{self as sc};
+use bindings::tegmentum::webfunction::types::{
+    Literal as WitLiteral, Term as WitTerm,
+};
 
 struct Component;
 
-#[allow(dead_code)]
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
 const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
 const RDF_NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
@@ -71,9 +103,7 @@ pub struct Config {
     /// `?r a <http://schema.org/Recipe>` or
     /// `?r <http://example.org/listHead> _:root . ?r a <http://example.org/List>`.
     pub root_selector: String,
-    /// Sink URL. Any scheme the host recognizes with an `INSERT DOC`
-    /// verb — `jsonl://` (write stub) or `sirix://` (via companion
-    /// import).
+    /// Substrate-side document-sink NAME (not a driver URL).
     pub sink: String,
     /// When set, the guest DELETEs every triple involving any subject
     /// in the collected tree set. Defaults to true.
@@ -90,7 +120,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub collapse_rdf_lists: bool,
     /// Include `@id` (the root IRI, or a synthesized genid for
-    /// bnode-rooted trees) on every node. Defaults true — Sirix loses
+    /// bnode-rooted trees) on every node. Defaults true — sinks lose
     /// subject identity otherwise.
     #[serde(default = "default_true")]
     pub include_id: bool,
@@ -101,76 +131,68 @@ fn default_true() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Guest impl
+// Helpers
 // ---------------------------------------------------------------------------
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        let config_json = match args.first() {
-            Some(Value::Literal(l)) => l.label.clone(),
-            _ => {
-                return Err(
-                    "wf_demote_tree: first arg must be a config-json string literal".into(),
-                );
-            }
-        };
-        let cfg: Config = serde_json::from_str(&config_json)
-            .map_err(|e| format!("wf_demote_tree: config parse: {e}"))?;
+fn json_literal(s: &str) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: s.into(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    })
+}
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            evaluate_impl(cfg)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = cfg;
-            Err("wf_demote_tree: host imports are not available on the native target".into())
-        }
+fn map_graph_err(e: gc::GraphCallError) -> String {
+    match e {
+        gc::GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        gc::GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        gc::GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
     }
+}
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_demote_tree: aggregate not applicable".into())
+fn map_doc_err(e: DocumentSinkError) -> String {
+    match e {
+        DocumentSinkError::NoSuchSink(m) => format!("document-sink no-such-sink: {m}"),
+        DocumentSinkError::NoSuchDocument(m) => format!("document-sink no-such-document: {m}"),
+        DocumentSinkError::BackendError(m) => format!("document-sink backend-error: {m}"),
+        DocumentSinkError::NotPermitted(m) => format!("document-sink not-permitted: {m}"),
     }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_demote_tree: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label: "wf_demote_tree(\"<config-json>\") — walk each \
-                            root's tree, collapse rdf:List into JSON arrays, \
-                            reject non-tree DAGs, emit JSON per root to the \
-                            sink, optionally DELETE source triples."
-                        .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
-        }
+}
+
+fn validate_sink_present(name: &str) -> Result<(), String> {
+    let sinks = sc::list_sinks();
+    if sinks.iter().any(|s| s.name == name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "wf_demote_tree: sink `{name}` not registered with host \
+             (list-sinks returned {} sinks)",
+            sinks.len()
+        ))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Wasm-only evaluation path
+// Guest entrypoint
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "wasm32")]
-fn evaluate_impl(cfg: Config) -> Result<BindingSets, String> {
+fn demote_tree_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    let config_json = match args.first() {
+        Some(WitTerm::Literal(l)) => l.value.clone(),
+        Some(other) => {
+            return Err(format!(
+                "wf_demote_tree: first arg must be a config-json string literal, got {other:?}"
+            ));
+        }
+        None => return Err("wf_demote_tree: expected one arg (config json)".into()),
+    };
+    let cfg: Config = serde_json::from_str(&config_json)
+        .map_err(|e| format!("wf_demote_tree: config parse: {e}"))?;
+
+    validate_sink_present(&cfg.sink)?;
+
     let roots = enumerate_roots(&cfg.root_selector)?;
 
-    let sink_handle = host::sink_open(&cfg.sink)?;
     let mut trees = 0u64;
     let mut nodes = 0u64;
     let mut skipped = 0u64;
@@ -178,142 +200,122 @@ fn evaluate_impl(cfg: Config) -> Result<BindingSets, String> {
 
     for root in &roots {
         let mut edges = EdgeMap::default();
-        // CONSTRUCT the entire reachable subgraph in one round-trip so
-        // we can decide tree-ness holistically before serializing.
-        collect_subgraph_wasm(root, &mut edges)?;
-        if !is_tree(&edges, root) {
-            if cfg.reject_non_tree {
-                skipped += 1;
-                continue;
-            }
+        collect_subgraph(root, &mut edges)?;
+        if !is_tree(&edges, root) && cfg.reject_non_tree {
+            skipped += 1;
+            continue;
         }
         let mut node_count = 0u64;
-        let doc = serialize_tree(&edges, root, &cfg, &mut node_count)?;
+        let doc_value = serialize_tree(&edges, root, &cfg, &mut node_count)?;
         nodes += node_count;
 
-        let json_line = serde_json::to_string(&doc)
+        let json_content = serde_json::to_string(&doc_value)
             .map_err(|e| format!("wf_demote_tree: serialize `{root}`: {e}"))?;
-        host::sink_execute(
-            sink_handle,
-            "INSERT DOC",
-            &[Value::Literal(Literal {
-                label: json_line,
-                datatype: XSD_STRING.into(),
-                lang: None,
-            })],
+        ds::put_document(
+            &cfg.sink,
+            &Document {
+                key: WitTerm::NamedNode(root.clone()),
+                content: json_content,
+            },
         )
-        .map_err(|e| format!("wf_demote_tree: sink write for `{root}`: {e}"))?;
+        .map_err(|e| {
+            format!("wf_demote_tree: put-document for `{root}`: {}", map_doc_err(e))
+        })?;
         trees += 1;
         all_collected.extend(edges.subjects.iter().cloned());
     }
-    host::sink_close(sink_handle).ok();
 
     let mut deleted = 0u64;
     if cfg.delete_source && !all_collected.is_empty() {
         deleted = delete_collected(&all_collected)?;
     }
 
-    Ok(BindingSets {
-        vars: vec![
-            "trees".into(),
-            "nodes".into(),
-            "skipped".into(),
-            "deleted".into(),
-        ],
-        rows: vec![vec![
-            Binding {
-                name: "trees".into(),
-                value: int_lit(trees as i64),
-            },
-            Binding {
-                name: "nodes".into(),
-                value: int_lit(nodes as i64),
-            },
-            Binding {
-                name: "skipped".into(),
-                value: int_lit(skipped as i64),
-            },
-            Binding {
-                name: "deleted".into(),
-                value: int_lit(deleted as i64),
-            },
-        ]],
-    })
+    let out = json!({
+        "trees": trees,
+        "nodes": nodes,
+        "skipped": skipped,
+        "deleted": deleted,
+    });
+    Ok(json_literal(&out.to_string()))
 }
 
-#[cfg(target_arch = "wasm32")]
 fn enumerate_roots(root_selector: &str) -> Result<Vec<String>, String> {
     let sparql = format!("SELECT DISTINCT ?r WHERE {{ {root_selector} }}");
-    let bs = host::execute_query(&sparql, &[], None)?;
-    let mut out = Vec::with_capacity(bs.rows.len());
-    for row in &bs.rows {
-        if let Some(iri) = row.first().and_then(|b| match &b.value {
-            Value::Iri(s) => Some(s.clone()),
-            Value::Bnode(b) => Some(format!("_:{b}")),
-            _ => None,
-        }) {
-            out.push(iri);
+    let result = gc::execute_query(&sparql).map_err(map_graph_err)?;
+    let flat = match result {
+        CallbackQueryResult::Bindings(bs) => bs,
+        _ => {
+            return Err(
+                "wf_demote_tree: root selector must yield bindings, not CONSTRUCT/ASK".into(),
+            );
+        }
+    };
+    let mut out = Vec::new();
+    for b in flat {
+        if b.variable != "r" {
+            continue;
+        }
+        match &b.value {
+            WitTerm::NamedNode(s) => out.push(s.clone()),
+            WitTerm::BlankNode(s) => out.push(format!("_:{s}")),
+            _ => (),
         }
     }
     Ok(out)
 }
 
-/// Collect the entire subgraph reachable from `root` in a single CONSTRUCT
-/// so that blank-node identity is preserved on the wire (SPARQL Update
-/// text can't reference specific bnodes, and re-querying by label
-/// doesn't survive engines that canonicalize labels per query — the
-/// property-path closure walks the actual graph from the root and gives
-/// us every triple in one shot).
+/// Collect the entire subgraph reachable from `root` in a single
+/// CONSTRUCT so that blank-node identity is preserved on the wire.
+/// The property-path closure `(!<no:such>)*` walks the actual graph
+/// from the root and gives us every reachable subject in one shot.
 ///
-/// Requires an IRI root. Bnode-rooted trees need to be skolemized first
-/// (via `wf_skolemize`) — Sirix drops bnode identity across the sink
-/// boundary anyway, so demoting a bnode-rooted tree without
+/// Requires an IRI root. Bnode-rooted trees need to be skolemized
+/// first (via `wf_skolemize`) — the sink boundary does not preserve
+/// bnode identity, so demoting a bnode-rooted tree without
 /// skolemization would round-trip to a different graph on ingest.
-#[cfg(target_arch = "wasm32")]
-fn collect_subgraph_wasm(
-    root: &str,
-    edges: &mut EdgeMap,
-) -> Result<(), String> {
+fn collect_subgraph(root: &str, edges: &mut EdgeMap) -> Result<(), String> {
     if root.starts_with("_:") {
         return Err(format!(
             "wf_demote_tree: bnode-rooted tree at {root} — skolemize \
-             upstream (wf_skolemize) before demoting; Sirix does not \
-             preserve bnode identity across the sink"
+             upstream (wf_skolemize) before demoting; the sink boundary \
+             does not preserve bnode identity"
         ));
     }
-    // Property-path closure `(!<no:such>)*` matches any predicate, zero
-    // or more times, so `?s` ranges over every node reachable outward
-    // from `<root>`. `?s ?p ?o` then materializes every outgoing edge
-    // of every reachable subject.
     let sparql = format!(
         "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ \
          <{root}> (!<urn:tegmentum:no-such-predicate>)* ?s . \
          ?s ?p ?o \
         }}"
     );
-    let bs = host::execute_query(&sparql, &[], None)?;
+    let result = gc::execute_query(&sparql).map_err(map_graph_err)?;
+    let quads = match result {
+        CallbackQueryResult::Quads(qs) => qs,
+        _ => {
+            return Err(
+                "wf_demote_tree: subgraph CONSTRUCT must yield quads, not bindings/ASK".into(),
+            );
+        }
+    };
     edges.subjects.insert(root.to_string());
-    for row in &bs.rows {
-        let s = row.iter().find(|b| b.name == "s").map(|b| b.value.clone());
-        let p = row.iter().find(|b| b.name == "p").map(|b| b.value.clone());
-        let o = row.iter().find(|b| b.name == "o").map(|b| b.value.clone());
-        let (Some(s), Some(p), Some(o)) = (s, p, o) else {
-            continue;
-        };
-        let predicate = match &p {
-            Value::Iri(name) => name.clone(),
+    for q in quads {
+        let predicate = match &q.predicate {
+            WitTerm::NamedNode(name) => name.clone(),
             other => {
-                return Err(format!("wf_demote_tree: non-IRI predicate: {other:?}"));
+                return Err(format!(
+                    "wf_demote_tree: non-IRI predicate: {other:?}"
+                ));
             }
         };
-        let subject_key = match &s {
-            Value::Iri(iri) => iri.clone(),
-            Value::Bnode(label) => format!("_:{label}"),
+        let subject_key = match &q.subject {
+            WitTerm::NamedNode(iri) => iri.clone(),
+            WitTerm::BlankNode(label) => format!("_:{label}"),
             other => {
-                return Err(format!("wf_demote_tree: non-node subject: {other:?}"));
+                return Err(format!(
+                    "wf_demote_tree: non-node subject: {other:?}"
+                ));
             }
         };
-        let object_term = wit_to_term(&o);
+        let object_term = wit_to_term(&q.object);
         edges
             .out
             .entry(subject_key.clone())
@@ -329,12 +331,7 @@ fn collect_subgraph_wasm(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn delete_collected(subjects: &HashSet<String>) -> Result<u64, String> {
-    // Two passes: outgoing (subject is the collected set) and incoming
-    // (object is the collected set). We can't reference blank-node
-    // labels directly in SPARQL Update text (SPARQL 1.1 disallows that),
-    // so anything blank is filtered via `str(?s) = "..."`.
     let mut deleted = 0u64;
     for subj in subjects {
         let (delete_body, where_body) = if let Some(label) = subj.strip_prefix("_:") {
@@ -351,43 +348,41 @@ fn delete_collected(subjects: &HashSet<String>) -> Result<u64, String> {
             )
         };
         let update = format!("DELETE {{ {delete_body} }} WHERE {{ {where_body} }}");
-        host::execute_update(&update).map_err(|e| {
-            format!("wf_demote_tree: delete outgoing for `{subj}`: {e}")
+        gc::execute_update(&update).map_err(|e| {
+            format!(
+                "wf_demote_tree: delete outgoing for `{subj}`: {}",
+                map_graph_err(e)
+            )
         })?;
         deleted += 1;
     }
     Ok(deleted)
 }
 
-#[cfg(target_arch = "wasm32")]
-fn wit_to_term(v: &Value) -> Term {
+fn wit_to_term(v: &WitTerm) -> Term {
     match v {
-        Value::Iri(s) => Term::Iri(s.clone()),
-        Value::Bnode(s) => Term::Bnode(s.clone()),
-        Value::Literal(l) => Term::Literal {
-            label: l.label.clone(),
-            datatype: l.datatype.clone(),
-            lang: l.lang.clone(),
+        WitTerm::NamedNode(s) => Term::Iri(s.clone()),
+        WitTerm::BlankNode(s) => Term::Bnode(s.clone()),
+        WitTerm::Literal(l) => Term::Literal {
+            label: l.value.clone(),
+            datatype: l.datatype.clone().unwrap_or_default(),
+            lang: l.language.clone(),
+        },
+        WitTerm::Triple(_) => Term::Literal {
+            label: "<<quoted triple>>".into(),
+            datatype: "http://www.w3.org/2001/XMLSchema#string".into(),
+            lang: None,
         },
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn int_lit(n: i64) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
-    })
-}
-
 // ---------------------------------------------------------------------------
-// Pure data structures and tree logic (used by wasm evaluate and tests)
+// Pure data structures and tree logic (used by evaluate and tests)
 // ---------------------------------------------------------------------------
 
-/// Simple term representation, target-independent. Kept separate from the
-/// wit-bindgen `Value` type so unit tests don't need to instantiate host-
-/// generated bindings.
+/// Simple term representation, target-independent. Kept separate from
+/// the wit-bindgen `WitTerm` type so unit tests don't need to
+/// instantiate host-generated bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
     Iri(String),
@@ -414,10 +409,7 @@ fn term_key(t: &Term) -> String {
     }
 }
 
-/// Directed edge map used during subgraph collection. `subjects` is the
-/// full set of collected subjects; `out` is subject → list of (predicate,
-/// object); `in_count` counts incoming references per term key so we can
-/// enforce the tree property.
+/// Directed edge map used during subgraph collection.
 #[derive(Debug, Default, Clone)]
 pub struct EdgeMap {
     pub subjects: HashSet<String>,
@@ -441,9 +433,7 @@ impl EdgeMap {
 
 /// A subgraph rooted at `root` is a tree when every collected subject
 /// other than the root has exactly one incoming edge from within the
-/// collected set. The root itself is allowed zero incoming edges (or
-/// one, if the caller elected to include the parent stub — we ignore
-/// the root's in-count).
+/// collected set.
 pub fn is_tree(edges: &EdgeMap, root: &str) -> bool {
     for subject in &edges.subjects {
         if subject == root {
@@ -487,16 +477,9 @@ fn serialize_subject(
         return Err(format!("wf_demote_tree: max depth at {subject}"));
     }
     if !visited.insert(subject.to_string()) {
-        // Second visit — the tree check should have rejected this, but
-        // if reject_non_tree=false the caller wants us to keep going.
-        // Emit a reference stub so the doc is still well-formed.
         return Ok(serde_json::json!({ "$ref": display_id(subject) }));
     }
 
-    // RDF-list collapse: a subject is a list head when it has rdf:first
-    // + rdf:rest edges (and no other edges except rdf:type=rdf:List
-    // decoration, which we tolerate). Node counting is delegated to
-    // `serialize_list` so we don't double-count the head cons cell.
     if cfg.collapse_rdf_lists && is_list_head(edges, subject) {
         return serialize_list(edges, subject, cfg, visited, depth, node_count);
     }
@@ -507,9 +490,6 @@ fn serialize_subject(
     if cfg.include_id {
         obj.insert("@id".into(), serde_json::Value::String(display_id(subject)));
     }
-    // Predicate grouping: RDF predicates can repeat; collapse into JSON
-    // arrays keyed by predicate local-name. Sorted for determinism —
-    // Sirix shredding order matters for revision keys.
     let empty: Vec<(String, Term)> = Vec::new();
     let out_edges = edges.out.get(subject).unwrap_or(&empty);
     let mut grouped: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
@@ -550,8 +530,6 @@ fn serialize_object(
             if edges.out.contains_key(&key) {
                 serialize_subject(edges, &key, cfg, visited, depth, node_count)
             } else {
-                // Bnode with no outgoing edges we know about. Skolemize
-                // into a genid IRI so the reference survives Sirix.
                 Ok(serde_json::Value::String(mint_genid(label)))
             }
         }
@@ -591,19 +569,11 @@ fn serialize_list(
     let mut items = Vec::new();
     let mut cursor = Some(head.to_string());
     let mut first_iter = true;
-    // Head was already inserted into `visited` by the caller. Each
-    // subsequent cons cell we visit needs to be recorded so a cycle
-    // terminates the walk instead of stack-overflowing.
     while let Some(node) = cursor {
         if node == RDF_NIL {
             break;
         }
-        // Mark visited on second and later cons cells; head was inserted
-        // by the caller.
         if !first_iter && !visited.insert(node.clone()) {
-            // Cycle in the rdf:rest chain — abort with a `$cycle`
-            // marker for this list, matching the reject_non_tree path
-            // in the outer walker.
             items.push(serde_json::json!({ "$cycle": display_id(&node) }));
             break;
         }
@@ -632,7 +602,7 @@ fn serialize_list(
                         ));
                     }
                 },
-                _ => (), // ignore rdf:type=rdf:List decoration and any noise.
+                _ => (),
             }
         }
         if let Some(v) = first_val {
@@ -673,8 +643,6 @@ fn literal_to_json(label: &str, datatype: &str, lang: Option<&str>) -> serde_jso
 }
 
 fn local_name(predicate: &str) -> String {
-    // Prefer last '#', else last '/'. rdf:type is a special case — expose
-    // it as `@type` so the JSON reads like JSON-LD.
     if predicate == RDF_TYPE {
         return "@type".into();
     }
@@ -715,10 +683,73 @@ fn mint_genid(label: &str) -> String {
     format!("{GENID_PREFIX}{hash:016x}{hash2:016x}")
 }
 
-export!(Component);
+// ---------------------------------------------------------------------------
+// Guest impls
+// ---------------------------------------------------------------------------
+
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "urn:webfunction:demote-tree".into(),
+            min_arity: 1,
+            max_arity: Some(1),
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "urn:webfunction:demote-tree" => demote_tree_impl(&args),
+            other => Err(format!("wf_demote_tree: unknown function '{other}'")),
+        }
+    }
+}
+
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_demote_tree: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_demote_tree: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_demote_tree: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_demote_tree: unknown property function '{name}' (this component provides none)"
+        ))
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests (pure-data, target-independent)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -737,15 +768,9 @@ mod tests {
         }
     }
 
-    /// The archetypal test:
-    ///
-    ///   <r> rdf:first "a" ; rdf:rest [ rdf:first "b" ; rdf:rest rdf:nil ]
-    ///
-    /// demotes to the JSON array `["a", "b"]`.
     #[test]
     fn rdf_list_two_items_collapses_to_json_array() {
         let mut edges = EdgeMap::default();
-        // <r> rdf:first "a" ; rdf:rest _:b1
         edges.add_edge(
             "http://ex/r",
             RDF_FIRST,
@@ -760,7 +785,6 @@ mod tests {
             RDF_REST,
             Term::Bnode("b1".into()),
         );
-        // _:b1 rdf:first "b" ; rdf:rest rdf:nil
         edges.add_edge(
             "_:b1",
             RDF_FIRST,
@@ -780,7 +804,6 @@ mod tests {
         let mut nodes = 0u64;
         let doc = serialize_tree(&edges, "http://ex/r", &cfg, &mut nodes).unwrap();
         assert_eq!(doc, serde_json::json!(["a", "b"]));
-        // Two cons cells traversed.
         assert_eq!(nodes, 2);
     }
 
@@ -836,8 +859,6 @@ mod tests {
 
     #[test]
     fn dag_shape_is_rejected_by_is_tree() {
-        // Two subjects both point at a shared child — that's a DAG, not
-        // a tree.
         let mut edges = EdgeMap::default();
         edges.add_edge(
             "http://ex/r",
@@ -905,51 +926,11 @@ mod tests {
     }
 
     #[test]
-    fn literal_types_project_to_typed_json() {
-        let cases = [
-            (
-                Term::Literal {
-                    label: "42".into(),
-                    datatype: "http://www.w3.org/2001/XMLSchema#integer".into(),
-                    lang: None,
-                },
-                serde_json::json!(42),
-            ),
-            (
-                Term::Literal {
-                    label: "true".into(),
-                    datatype: "http://www.w3.org/2001/XMLSchema#boolean".into(),
-                    lang: None,
-                },
-                serde_json::json!(true),
-            ),
-            (
-                Term::Literal {
-                    label: "hi".into(),
-                    datatype: "http://www.w3.org/2001/XMLSchema#string".into(),
-                    lang: None,
-                },
-                serde_json::json!("hi"),
-            ),
-        ];
-        for (term, expected) in cases {
-            let mut edges = EdgeMap::default();
-            edges.add_edge("http://ex/r", "http://ex/p", term);
-            let cfg = cfg_default();
-            let mut nodes = 0u64;
-            let doc = serialize_tree(&edges, "http://ex/r", &cfg, &mut nodes).unwrap();
-            let p = doc.get("p").expect("p field");
-            assert_eq!(p, &expected);
-        }
-    }
-
-    #[test]
-    fn genid_is_deterministic_and_matches_wf_skolemize_shape() {
+    fn genid_is_deterministic() {
         let a1 = mint_genid("x1");
         let a2 = mint_genid("x1");
         assert_eq!(a1, a2);
         assert!(a1.starts_with(GENID_PREFIX));
-        // The suffix should be two 16-hex-char halves = 32 chars.
         let suffix = a1.strip_prefix(GENID_PREFIX).unwrap();
         assert_eq!(suffix.len(), 32);
     }

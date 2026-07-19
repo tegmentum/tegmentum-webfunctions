@@ -249,16 +249,20 @@ world's host side. Downstream hosts implementing the same three
 
 ## Overlay-crate migration status
 
-The 21-crate overlay wave (Follow-up E + F) moves each Stardog-era
+The 21-crate overlay wave (Follow-up E + F + M1) moves each Stardog-era
 `stardog:webfunction@0.3.x`–`0.6.x` crate onto the substrate
 contract at `tegmentum:webfunction@0.1.0` (submodule `wit/`).
 
-Progress: 20 / 21 attempted, 16 / 21 successfully migrated, 5
-deferred pending sink-callbacks read-side landing. `wf_sql` is
-retired as of this wave — the R2 `sink-query-callbacks::execute-sink-select`
-surface subsumes its "arbitrary SQL against a sink" role, so shipping
-a wf_sql analogue on the substrate would be dead weight. See
-`docs/wf_sql-retirement.md`.
+Progress: 21 / 21 attempted, 20 / 21 successfully migrated, 1
+deferred (wf_canonicalize — pending tracker-sink integration).
+`wf_sql` is retired as of Follow-up F — the R2
+`sink-query-callbacks::execute-sink-select` surface subsumes its
+"arbitrary SQL against a sink" role, so shipping a wf_sql analogue
+on the substrate would be dead weight. See
+`docs/wf_sql-retirement.md`. `wf_fetch` is redesigned in the same
+wave as an HTTP-fetch + `emit-quads` guest (still a substrate
+crate — the "retired" label is on its old descriptor / sql-tail
+contract, not on the crate itself).
 
 | Wave / batch | Crates | World | Callbacks used |
 |---|---|---|---|
@@ -268,23 +272,16 @@ a wf_sql analogue on the substrate would be dead weight. See
 | Follow-up F batch4 (`69584ce`) | `adjacency_tree`, `wf_tree`, `wf_tree_rows` | `extension-with-all-host-callbacks` | `prepared-query-callbacks` + `observability-callbacks` |
 | Follow-up F batch5 (`f04fd51`) | `wf_apply`, `wf_map`, `wf_pipeline` | `extension-with-all-host-callbacks` | `wasm-callbacks` + `graph-callbacks` |
 | Follow-up F batch6 (`3beeb6a`) | `wf_materialize`, `wf_materialize_list` | `extension-with-all-host-callbacks` | `sink-callbacks` (write-only) + `graph-callbacks` (+ `prepared-query-callbacks` for the list variant) |
+| M1 Q3 batch7 | `wf_demote`, `wf_demote_tree`, `wf_materialize_tree` | `extension-with-all-host-callbacks` | `sink-query-callbacks::scan-sink-quads` (demote) + `document-sink-callbacks::put-document` (demote_tree, materialize_tree) + `graph-callbacks` |
 
-### Deferred (4 crates)
+### Deferred (1 crate)
 
-Each of these consumes the Stardog-era sink-* triple
-(`sink-open` / `sink-execute` / `sink-close`) for READ-side operations
-that the R1 `sink-callbacks` interface does not surface — its two
-functions (`emit-quad`, `emit-quads`) are strictly write-only per
-`~/git/webfunction-wit/docs/design/sink-callbacks.md` §7. A
-substrate-neutral sink-read primitive is out of scope for R1 and
-awaits a follow-on design memo.
+Deferred pending a substrate-side callback surface that has not yet
+landed:
 
 | Crate | Reason deferred |
 |---|---|
-| `wf_demote` | Reads sink's `subject_iri` column via `sink-execute(SELECT ...)` to know what to delete |
-| `wf_demote_tree` | Same read pattern as `wf_demote`, scoped to the tree-shaped materialisation |
-| `wf_canonicalize` | Extensive `sink-execute(SELECT ...)` over its canonical-mapping table plus custom fulltext bridge |
-| `wf_materialize_tree` | Writes opaque JSON documents via `sink-execute("INSERT DOC", <json-lit>)`; the document-store shape does not decompose into typed quads without a substrate-side document sink descriptor |
+| `wf_canonicalize` | Extensive `sink-execute(SELECT ...)` over its canonical-mapping table plus custom fulltext bridge — awaits tracker-sink integration (M1 X4). |
 
 ### Retired
 
