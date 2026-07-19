@@ -1,20 +1,20 @@
-//! wf_canonicalize — resolve owl:sameAs at ingest, plus keep the fulltext
-//! literal-index in sync with the graph.
+//! wf_canonicalize — resolve owl:sameAs at ingest, plus keep the
+//! fulltext literal-index and document-mirror indexes in sync with
+//! the graph.
 //!
-//! Signature: `wf:call(<wf_canonicalize.wasm>, "<config-json>")`
-//!    → binding-set { classes: xsd:integer, aliased: xsd:integer,
-//!                     rewritten: xsd:integer, seeded: xsd:integer,
-//!                     ft_inserted: xsd:integer, ft_deleted: xsd:integer,
-//!                     ft_errors: xsd:integer,
-//!                     doc_inserted: xsd:integer, doc_deleted: xsd:integer,
-//!                     doc_unchanged: xsd:integer, doc_errors: xsd:integer }
+//! Signature (M1 X4 ExtensionGuest shape):
+//!     `<urn:webfunction:canonicalize>("<config-json>")`
+//!         → rdf:JSON literal `{"classes": N, "aliased": N,
+//!            "rewritten": N, "seeded": N, "ft_inserted": N,
+//!            "ft_deleted": N, "ft_errors": N, "doc_inserted": N,
+//!            "doc_deleted": N, "doc_unchanged": N, "doc_errors": N}`.
 //!
 //! Config JSON shape (only `sink` is required; `rule` defaults to
 //! `mint_genid`; `fulltext_indexes` and `document_indexes` default to
 //! empty and skip their respective reconcile phases entirely):
 //!
 //! ```json
-//! { "sink": "sqlite:///data/mv.db#aliases",
+//! { "sink": "canonicalize",
 //!   "rule": "mint_genid",
 //!   "fulltext_indexes": [
 //!     { "name": "products",
@@ -35,485 +35,595 @@
 //!   ] }
 //! ```
 //!
-//! The fulltext-reconcile phase (§07 of the wf-fulltext design memo) runs
-//! after alias-reconcile and before the sameAs delete. For each entry it
-//! CONSTRUCTs the current subject→(field, literal-lex) mapping for the
-//! registered predicates, diffs it against a per-index "known keys"
-//! tracker persisted in the same sink SQLite, and emits inserts/deletes
-//! to Manticore's `/bulk` endpoint. Errors on the fulltext side are
-//! logged and never crash the sweep — the alias-reconcile outputs stay
-//! usable even when the fulltext backend is down.
+//! Migration deviations (M1 X4, ExtensionGuest + tracker-sink wave):
 //!
-//! Pipeline (five phases):
+//!   * The `sink` field is now a substrate-side sink NAME (not a
+//!     driver URL). The host owns the underlying SQLite/DuckDB/…
+//!     backend; tracker tables are materialized by the host at
+//!     `register-tracker-tables` time. The pre-migration form
+//!     `sqlite:///data/mv.db#aliases` is dropped; the new form is a
+//!     bare identifier the host recognises.
+//!   * The alias-map table is fixed at the name `aliases`. Under the
+//!     old shape the caller could pick a name via the URL fragment;
+//!     the tracker-sink surface does not model per-invocation table
+//!     names, so callers who need to segregate alias maps grant
+//!     distinct sink names instead.
+//!   * `execute_query` / `execute_update` now route through
+//!     `graph-callbacks`. The return shape of SELECT (flat
+//!     `list<binding>` rather than the old `binding_sets` with a
+//!     per-row grouping) is split back into rows via a
+//!     variable-repeat heuristic (see `group_bindings_into_rows`),
+//!     matching wf_profile's approach.
+//!   * Manticore admin HTTP + Sirix SQL HTTP routes through
+//!     `http-callbacks::http-post-json` rather than the retired
+//!     `wf:fulltext/host@0.1.0` import. Content-Type stays
+//!     `application/json` for wire compatibility with the previous
+//!     sweep behavior; a future revision can typed-migrate the
+//!     Manticore bulk write to `fulltext-callbacks::insert-documents`
+//!     but the current Manticore schema (retention `_valid_from` /
+//!     `_valid_to` columns + custom `content_type`+`subject` slots)
+//!     doesn't fit the typed `fulltext-document { id, fields, lang }`
+//!     shape — flagged as a fulltext-callbacks WIT gap in the
+//!     migration report.
 //!
-//! 0. Load any existing alias map from the sink. Seed the union-find
-//!    with the (alias → canonical) pairs so previously-assigned
-//!    canonicals stay sticky across ingest batches. First run finds no
-//!    table and skips seeding; subsequent runs pick up the accumulated
-//!    identity decisions and never remint a canonical for a class that
-//!    already has one.
-//!
-//! 1. Enumerate every `?a owl:sameAs ?b` triple in the store, union
-//!    them into the DSU. sameAs is transitive per OWL, so A↔B, B↔C
-//!    forms one class {A, B, C}. Combined with the seed pairs from
-//!    phase 0, this produces the current post-batch equivalence
-//!    classes.
-//!
-//! 2. For each class, pick a canonical. If the class already contains
-//!    a canonical from phase 0's seed (sticky path), reuse it — no
-//!    remint even if the class grew. Otherwise apply the configured
-//!    rule. v1 rules:
-//!    * `mint_genid` (default) — mint a deterministic well-known-genid
-//!      IRI derived from the sorted class membership. Every source URI
-//!      is treated equally as an alias; no arbitrary preference. Matches
-//!      wf_skolemize's identity resolution.
-//!    * `shortest_uri` — promote the shortest source URI (lex-first
-//!      tiebreak). Retained for callers who want to keep a source URI
-//!      as canonical (e.g. when one identifier scheme is authoritative).
-//!
-//! 3. Rewrite the store: for every triple involving any alias (non-
-//!    canonical member) in subject or object position, INSERT the
-//!    canonicalized version and DELETE the original. Batched as one
-//!    INSERT DATA + one filtered DELETE to minimize round trips.
-//!
-//! 4. Write the (alias → canonical) map into the sink so external
-//!    consumers who reach for a non-canonical IRI can be redirected.
-//!    Schema: (alias TEXT PRIMARY KEY, canonical TEXT NOT NULL).
-//!
-//! 5. Delete the owl:sameAs triples themselves — they've served their
-//!    purpose and the substrate now maintains the equivalences via
-//!    canonical identity + alias map.
+//! Pipeline (five phases): unchanged in shape; the guest performs
+//! phase-0 alias-map load, phase-1 sameAs union-find, phase-2
+//! canonical selection, phase-3 graph rewrite, phase-4 alias
+//! persistence + fulltext / document sweeps, phase-5 sameAs delete.
 
-wit_bindgen::generate!({
-    world: "webfunction",
-    path: "wit",
-    generate_all,
-});
+#[allow(warnings)]
+mod bindings;
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_json::json;
 
 pub mod document_sweep;
 pub mod fulltext_sweep;
 
-use stardog::webfunction::host;
-use stardog::webfunction::types::{Accuracy, Binding, Literal};
-use wf::fulltext::host as fulltext_host;
+use bindings::exports::tegmentum::webfunction::aggregate::{
+    AggregateDescriptor, AggregateState, Guest as AggregateGuest, GuestAggregateState,
+};
+use bindings::exports::tegmentum::webfunction::extension::{
+    FunctionDescriptor, Guest as ExtensionGuest,
+};
+use bindings::exports::tegmentum::webfunction::property_function::{
+    BindingRow, Guest as PropertyFunctionGuest, PropertyDescriptor,
+};
+use bindings::tegmentum::webfunction::graph_callbacks::{
+    self as gc, Binding as WitBinding, GraphCallError, QueryResult as CallbackQueryResult,
+};
+use bindings::tegmentum::webfunction::http_callbacks::{
+    self as hc, HttpError, HttpHeader,
+};
+use bindings::tegmentum::webfunction::tracker_sink_callbacks::{
+    self as ts, ColumnType, TrackerColumn, TrackerError, TrackerRow, TrackerTableSchema,
+    TrackerValue, TrackerWhere,
+};
+use bindings::tegmentum::webfunction::types::{Literal as WitLiteral, Term as WitTerm};
 
 use document_sweep::{DocumentIndexConfig, SweepResult as DocSweepResult};
 use fulltext_sweep::{FulltextIndexConfig, SweepCounts};
 
 struct Component;
 
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+const ALIAS_TABLE: &str = "aliases";
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct Config {
+    /// Substrate-side sink NAME (post-migration). Must resolve in
+    /// the host's tracker-sink allowlist; the host owns the backend
+    /// path + connection string, not the guest.
     sink: String,
     #[serde(default = "default_rule")]
     rule: String,
-    /// Zero or more literal-index registry entries to reconcile against
-    /// the graph on this sweep. Empty (or absent) skips the entire
-    /// fulltext-reconcile phase — first-boot before any index is
-    /// registered is a valid state.
     #[serde(default)]
     fulltext_indexes: Vec<FulltextIndexConfig>,
-    /// Zero or more Managed-mode document-index registry entries to
-    /// reconcile against Sirix on this sweep. Empty (or absent) skips
-    /// the entire document-reconcile phase — Federated-mode entries
-    /// are filtered out by the outer oxigraph-wf handler before the
-    /// config is serialized, so anything that reaches this field is
-    /// Managed by construction.
     #[serde(default)]
     document_indexes: Vec<DocumentIndexConfig>,
-    /// v1.0 backfill flag on the document sweep. When `true`, the
-    /// retention=all branch ignores the known-keys tracker's
-    /// `last_seen_rev` history and re-mirrors every revision it can
-    /// see from Sirix — used at initial `retention: "all"` enablement
-    /// to pull the full history. Defaults to `false` so scheduled
-    /// invocations stay incremental. Latest-mode branches also honor
-    /// the flag (skip the FNV unchanged-check) so an operator can
-    /// force-refresh a stale mirror.
     #[serde(default)]
     full_scan: bool,
 }
 
 fn default_rule() -> String {
-    // Mint a well-known-genid IRI per equivalence class rather than
-    // promoting one of the sources — treats every input identifier the
-    // same instead of arbitrarily preferring one. Matches wf_skolemize's
-    // treatment of blank nodes: identity ambiguity always resolves to a
-    // minted IRI + alias map.
     "mint_genid".into()
 }
 
-impl Guest for Component {
-    fn evaluate(args: Vec<Value>) -> Result<BindingSets, String> {
-        let config_json = match args.first() {
-            Some(Value::Literal(l)) => l.label.clone(),
-            _ => {
-                return Err(
-                    "wf_canonicalize: first arg must be a config-json string literal"
-                        .into(),
-                );
+// ---------------------------------------------------------------------------
+// Error mapping
+// ---------------------------------------------------------------------------
+
+fn fmt_graph_err(e: GraphCallError) -> String {
+    match e {
+        GraphCallError::SyntaxError(m) => format!("graph-callbacks syntax-error: {m}"),
+        GraphCallError::BackendError(m) => format!("graph-callbacks backend-error: {m}"),
+        GraphCallError::NotPermitted(m) => format!("graph-callbacks not-permitted: {m}"),
+    }
+}
+
+fn fmt_http_err(e: HttpError) -> String {
+    match e {
+        HttpError::Network(m) => format!("http-callbacks network: {m}"),
+        HttpError::Status(c) => format!("http-callbacks non-2xx: {c}"),
+        HttpError::InvalidRequest(m) => format!("http-callbacks invalid-request: {m}"),
+        HttpError::NotPermitted(m) => format!("http-callbacks not-permitted: {m}"),
+    }
+}
+
+fn fmt_tracker_err(e: TrackerError) -> String {
+    match e {
+        TrackerError::NoSuchSink(m) => format!("tracker-sink no-such-sink: {m}"),
+        TrackerError::NoSuchTable(m) => format!("tracker-sink no-such-table: {m}"),
+        TrackerError::NoSuchRow(m) => format!("tracker-sink no-such-row: {m}"),
+        TrackerError::SchemaViolation(m) => format!("tracker-sink schema-violation: {m}"),
+        TrackerError::BackendError(m) => format!("tracker-sink backend-error: {m}"),
+        TrackerError::NotPermitted(m) => format!("tracker-sink not-permitted: {m}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binding helpers
+// ---------------------------------------------------------------------------
+
+/// Split the flat `list<binding>` graph-callbacks returns into row
+/// groups. Same heuristic wf_profile uses: a repeat of a previously-
+/// seen variable name in the current row signals the start of a new
+/// row.
+fn group_bindings_into_rows(flat: Vec<WitBinding>) -> Vec<Vec<WitBinding>> {
+    let mut rows: Vec<Vec<WitBinding>> = Vec::new();
+    let mut current: Vec<WitBinding> = Vec::new();
+    for b in flat {
+        if current.iter().any(|prior| prior.variable == b.variable) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(b);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+fn select_rows(sparql: &str) -> Result<Vec<Vec<WitBinding>>, String> {
+    let result = gc::execute_query(sparql).map_err(fmt_graph_err)?;
+    match result {
+        CallbackQueryResult::Bindings(bs) => Ok(group_bindings_into_rows(bs)),
+        CallbackQueryResult::Quads(_) => {
+            Err("wf_canonicalize: SELECT expected but graph-callbacks returned quads".into())
+        }
+        CallbackQueryResult::Boolean(_) => {
+            Err("wf_canonicalize: SELECT expected but graph-callbacks returned boolean".into())
+        }
+    }
+}
+
+fn binding_iri(row: &[WitBinding], name: &str) -> Option<String> {
+    row.iter().find(|b| b.variable == name).and_then(|b| match &b.value {
+        WitTerm::NamedNode(s) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+fn binding_term(row: &[WitBinding], name: &str) -> Option<WitTerm> {
+    row.iter().find(|b| b.variable == name).map(|b| b.value.clone())
+}
+
+// ---------------------------------------------------------------------------
+// SPARQL value rendering — WitTerm → SPARQL text with alias rewrite
+// ---------------------------------------------------------------------------
+
+fn value_to_sparql(v: &WitTerm, alias_to_canonical: &HashMap<String, String>) -> String {
+    match v {
+        WitTerm::NamedNode(s) => {
+            let target = alias_to_canonical.get(s).unwrap_or(s);
+            format!("<{target}>")
+        }
+        WitTerm::BlankNode(label) => format!("_:{label}"),
+        WitTerm::Literal(l) => {
+            let escaped = l
+                .value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            if let Some(lang) = &l.language {
+                format!("\"{escaped}\"@{lang}")
+            } else if let Some(dt) = &l.datatype {
+                format!("\"{escaped}\"^^<{dt}>")
+            } else {
+                // xsd:string default per RDF 1.1.
+                format!("\"{escaped}\"")
             }
+        }
+        WitTerm::Triple(_) => {
+            // RDF-star quoted triples don't appear in the sameAs
+            // canonicalization pipeline. Emit a placeholder rather
+            // than panic; log at build-diff time if it surfaces.
+            "<urn:webfunction:canonicalize:unsupported-triple>".into()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Literal constructors (for tracker-sink round-trips + SPARQL emits)
+// ---------------------------------------------------------------------------
+
+fn json_literal(s: &str) -> WitTerm {
+    WitTerm::Literal(WitLiteral {
+        value: s.into(),
+        datatype: Some(RDF_JSON.into()),
+        language: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tracker-sink helpers
+// ---------------------------------------------------------------------------
+
+fn tracker_text(values: &[TrackerValue], idx: usize) -> Result<String, String> {
+    match values.get(idx) {
+        Some(TrackerValue::TextValue(s)) => Ok(s.clone()),
+        Some(other) => Err(format!("tracker-select: expected text at column {idx}, got {other:?}")),
+        None => Err(format!("tracker-select: missing column {idx}")),
+    }
+}
+
+fn tracker_int(values: &[TrackerValue], idx: usize) -> Result<i64, String> {
+    match values.get(idx) {
+        Some(TrackerValue::IntegerValue(i)) => Ok(*i),
+        Some(other) => Err(format!("tracker-select: expected integer at column {idx}, got {other:?}")),
+        None => Err(format!("tracker-select: missing column {idx}")),
+    }
+}
+
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Materialize the alias-map table on the named sink. Idempotent; the
+/// host `register-tracker-tables` call is safe to repeat with the
+/// same schema (memo §5).
+fn register_alias_table(sink_name: &str) -> Result<(), String> {
+    let schema = TrackerTableSchema {
+        name: ALIAS_TABLE.into(),
+        columns: vec![
+            TrackerColumn {
+                name: "alias".into(),
+                column_type: ColumnType::Text,
+                primary_key: true,
+                nullable: false,
+            },
+            TrackerColumn {
+                name: "canonical".into(),
+                column_type: ColumnType::Text,
+                primary_key: false,
+                nullable: false,
+            },
+        ],
+        indexes: vec![],
+    };
+    ts::register_tracker_tables(sink_name, &[schema]).map_err(fmt_tracker_err)
+}
+
+// ---------------------------------------------------------------------------
+// Guest entry
+// ---------------------------------------------------------------------------
+
+fn canonicalize_impl(args: &[WitTerm]) -> Result<WitTerm, String> {
+    let config_json = match args.first() {
+        Some(WitTerm::Literal(l)) => l.value.clone(),
+        _ => {
+            return Err(
+                "wf_canonicalize: first arg must be a config-json string literal".into(),
+            );
+        }
+    };
+    let cfg: Config = serde_json::from_str(&config_json)
+        .map_err(|e| format!("wf_canonicalize: config parse: {e}"))?;
+
+    let sink_name = cfg.sink.clone();
+
+    // Phase 0a: materialize the alias-map table + seed the DSU from
+    // any pre-existing (alias → canonical) rows.
+    register_alias_table(&sink_name)?;
+
+    let mut dsu = DisjointSetUnion::new();
+    let mut existing_canonicals: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    let existing_rows = ts::tracker_select(
+        &sink_name,
+        ALIAS_TABLE,
+        &[],
+        &["alias".to_string(), "canonical".to_string()],
+    )
+    .map_err(fmt_tracker_err)?;
+    for row in &existing_rows {
+        let alias = tracker_text(&row.values, 0)?;
+        let canonical = tracker_text(&row.values, 1)?;
+        dsu.union(&alias, &canonical);
+        existing_canonicals.insert(canonical);
+    }
+    let seed_size = existing_canonicals.len();
+
+    // Phase 1: union-find over sameAs in the store on top of the seed.
+    let pairs_sparql = format!(
+        "SELECT ?a ?b WHERE {{ ?a <{OWL_SAME_AS}> ?b }}"
+    );
+    let pairs = select_rows(&pairs_sparql)?;
+
+    for row in &pairs {
+        let a = match binding_iri(row, "a") {
+            Some(v) => v,
+            None => continue,
         };
-        let cfg: Config = serde_json::from_str(&config_json)
-            .map_err(|e| format!("wf_canonicalize: config parse: {e}"))?;
+        let b = match binding_iri(row, "b") {
+            Some(v) => v,
+            None => continue,
+        };
+        dsu.union(&a, &b);
+    }
+    let classes = dsu.classes();
 
-        // Phase 0: prepare the sink and seed the DSU from any existing
-        // (alias → canonical) map. Table is created idempotently so a
-        // first run finds it empty and the seed loop is a no-op.
-        let sink_handle = host::sink_open(&cfg.sink)?;
-        let table = table_name_from(&cfg.sink);
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (\
-             alias TEXT PRIMARY KEY, \
-             canonical TEXT NOT NULL)"
+    // Phase 2: pick canonicals. Sticky rule — if the class contains a
+    // pre-existing canonical, reuse it verbatim; else apply the
+    // configured rule.
+    let mut alias_to_canonical: HashMap<String, String> = HashMap::new();
+    for class in &classes {
+        let mut existing_in_class: Vec<&String> = class
+            .iter()
+            .filter(|m| existing_canonicals.contains(*m))
+            .collect();
+        existing_in_class.sort();
+        let canonical = match existing_in_class.first() {
+            Some(sticky) => (*sticky).clone(),
+            None => pick_canonical(class, &cfg.rule)?,
+        };
+        for member in class {
+            if member != &canonical {
+                alias_to_canonical.insert(member.clone(), canonical.clone());
+            }
+        }
+    }
+
+    // Phase 3: rewrite the graph.
+    let aliases_len = alias_to_canonical.len();
+    let mut rewritten = 0u64;
+
+    if !alias_to_canonical.is_empty() {
+        let alias_iris: Vec<&String> = alias_to_canonical.keys().collect();
+
+        let values_clause = alias_iris
+            .iter()
+            .map(|iri| format!("<{iri}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fetch = format!(
+            "SELECT ?s ?p ?o WHERE {{ \
+             {{ VALUES ?target {{ {vals} }} ?target ?p ?o . BIND(?target AS ?s) }} \
+             UNION \
+             {{ VALUES ?target {{ {vals} }} ?s ?p ?target . BIND(?target AS ?o) }} \
+             FILTER(?p != <{OWL_SAME_AS}>) \
+             }}",
+            vals = values_clause,
         );
-        host::sink_execute(sink_handle, &ddl, &[])
-            .map_err(|e| format!("wf_canonicalize: create alias table: {e}"))?;
+        let touched = select_rows(&fetch)?;
 
-        let mut dsu = DisjointSetUnion::new();
-        let mut existing_canonicals: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        let existing = host::sink_execute(
-            sink_handle,
-            &format!("SELECT alias, canonical FROM {table}"),
-            &[],
-        )
-        .map_err(|e| format!("wf_canonicalize: load existing alias map: {e}"))?;
-        for row in &existing.rows {
-            let alias = binding_literal_str(row, "alias");
-            let canonical = binding_literal_str(row, "canonical");
-            if let (Some(a), Some(c)) = (alias, canonical) {
-                dsu.union(&a, &c);
-                existing_canonicals.insert(c);
-            }
-        }
-        let seed_size = existing_canonicals.len();
-
-        // Phase 1: union-find over sameAs in the store on top of the seed.
-        let pairs = host::execute_query(
-            &format!(
-                "SELECT ?a ?b WHERE {{ ?a <{OWL_SAME_AS}> ?b }}"
-            ),
-            &[],
-            None,
-        )?;
-
-        for row in &pairs.rows {
-            let a = match binding_iri(row, "a") {
+        let mut insert_body = String::new();
+        for row in &touched {
+            let s = match binding_term(row, "s") {
                 Some(v) => v,
                 None => continue,
             };
-            let b = match binding_iri(row, "b") {
+            let p = match binding_term(row, "p") {
                 Some(v) => v,
                 None => continue,
             };
-            dsu.union(&a, &b);
-        }
-        let classes = dsu.classes();
-
-        // Phase 2: pick canonicals. Sticky rule — if the class already
-        // contains a previously-assigned canonical (from the phase-0
-        // seed), reuse it verbatim. This makes re-runs safe: canonicals
-        // never change once assigned, so triples that reference them
-        // don't need to be rewritten again. Only newly-added members
-        // become fresh aliases in the map.
-        //
-        // If multiple existing canonicals ended up in the same class
-        // (two previously-separate classes merged via a newly-observed
-        // sameAs bridge), pick the lex-smallest to keep the choice
-        // deterministic; the other becomes an alias, and any triples
-        // referencing it get rewritten in phase 3.
-        let mut alias_to_canonical: HashMap<String, String> = HashMap::new();
-        for class in &classes {
-            let mut existing_in_class: Vec<&String> = class
-                .iter()
-                .filter(|m| existing_canonicals.contains(*m))
-                .collect();
-            existing_in_class.sort();
-            let canonical = match existing_in_class.first() {
-                Some(sticky) => (*sticky).clone(),
-                None => pick_canonical(class, &cfg.rule)?,
+            let o = match binding_term(row, "o") {
+                Some(v) => v,
+                None => continue,
             };
-            for member in class {
-                if member != &canonical {
-                    alias_to_canonical.insert(member.clone(), canonical.clone());
-                }
-            }
+            let s_txt = value_to_sparql(&s, &alias_to_canonical);
+            let p_txt = value_to_sparql(&p, &alias_to_canonical);
+            let o_txt = value_to_sparql(&o, &alias_to_canonical);
+            insert_body.push_str(&s_txt);
+            insert_body.push(' ');
+            insert_body.push_str(&p_txt);
+            insert_body.push(' ');
+            insert_body.push_str(&o_txt);
+            insert_body.push_str(" .\n");
+            rewritten += 1;
         }
 
-        // Phase 3: rewrite the graph. Fetch every triple that touches an
-        // alias, INSERT the canonicalized form, then filter-delete the
-        // originals. Deleting last so the fetched originals stay valid
-        // through the guest's iteration.
-        //
-        // For scale we chunk aliases into batches: SPARQL VALUES lists
-        // stay under a few thousand IRIs comfortably. v1 dataset sizes
-        // (thousands of aliases) fit in one batch — chunk only when we
-        // grow past ~5000 aliases.
-        let aliases_len = alias_to_canonical.len();
-        let mut rewritten = 0u64;
-
-        if !alias_to_canonical.is_empty() {
-            let alias_iris: Vec<&String> = alias_to_canonical.keys().collect();
-
-            // Fetch triples where subject or object is any alias.
-            let values_clause = alias_iris
-                .iter()
-                .map(|iri| format!("<{iri}>"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let fetch = format!(
-                "SELECT ?s ?p ?o WHERE {{ \
-                 {{ VALUES ?target {{ {vals} }} ?target ?p ?o . BIND(?target AS ?s) }} \
-                 UNION \
-                 {{ VALUES ?target {{ {vals} }} ?s ?p ?target . BIND(?target AS ?o) }} \
-                 FILTER(?p != <{OWL_SAME_AS}>) \
-                 }}",
-                vals = values_clause,
-            );
-            let touched = host::execute_query(&fetch, &[], None)?;
-
-            // Build INSERT DATA batch of canonicalized triples.
-            let mut insert_body = String::new();
-            for row in &touched.rows {
-                let s = match binding_value(row, "s") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let p = match binding_value(row, "p") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let o = match binding_value(row, "o") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let s_txt = value_to_sparql(&s, &alias_to_canonical);
-                let p_txt = value_to_sparql(&p, &alias_to_canonical);
-                let o_txt = value_to_sparql(&o, &alias_to_canonical);
-                insert_body.push_str(&s_txt);
-                insert_body.push(' ');
-                insert_body.push_str(&p_txt);
-                insert_body.push(' ');
-                insert_body.push_str(&o_txt);
-                insert_body.push_str(" .\n");
-                rewritten += 1;
-            }
-
-            if !insert_body.is_empty() {
-                let insert = format!("INSERT DATA {{ {insert_body} }}");
-                host::execute_update(&insert).map_err(|e| {
-                    format!("wf_canonicalize: insert canonicalized batch: {e}")
-                })?;
-            }
-
-            // Filter-delete all triples touching an alias in subject or
-            // object position. Reuses the same VALUES list.
-            let delete = format!(
-                "DELETE {{ ?s ?p ?o }} WHERE {{ \
-                 ?s ?p ?o . \
-                 VALUES ?alias {{ {vals} }} \
-                 FILTER(?s = ?alias || ?o = ?alias) \
-                 }}",
-                vals = values_clause,
-            );
-            host::execute_update(&delete).map_err(|e| {
-                format!("wf_canonicalize: delete alias-bearing triples: {e}")
+        if !insert_body.is_empty() {
+            let insert = format!("INSERT DATA {{ {insert_body} }}");
+            gc::execute_update(&insert).map_err(|e| {
+                format!(
+                    "wf_canonicalize: insert canonicalized batch: {}",
+                    fmt_graph_err(e)
+                )
             })?;
         }
 
-        // Phase 4: append the alias map. INSERT OR REPLACE so re-runs
-        // that redirect a previously-seen alias to a merged class's
-        // canonical overwrite the old row instead of erroring on the
-        // primary key.
-        if !alias_to_canonical.is_empty() {
-            let insert = format!(
-                "INSERT OR REPLACE INTO {table} (alias, canonical) VALUES (?, ?)"
-            );
-            for (alias, canonical) in &alias_to_canonical {
-                host::sink_execute(
-                    sink_handle,
-                    &insert,
-                    &[string_lit(alias), string_lit(canonical)],
-                )
-                .map_err(|e| {
-                    format!("wf_canonicalize: alias table insert `{alias}`: {e}")
-                })?;
-            }
-        }
-        // Phase 4b: fulltext-reconcile. Runs after alias-reconcile so
-        // any subjects that got rewritten to their canonicals are
-        // reflected in the fulltext index too. Skipped entirely when
-        // no fulltext_indexes are configured — first-boot / no-index
-        // deployments pay zero cost.
-        //
-        // The sweep reuses the same sink handle for its per-index
-        // "known keys" trackers, so a single SQLite file carries both
-        // the alias table and the fulltext state. `run` never bubbles
-        // errors up — it accumulates a per-entry error count into
-        // `SweepCounts` and logs to stderr, which the outer wf:call
-        // frame surfaces to the operator. That keeps the sweep robust
-        // when the fulltext backend is briefly unreachable.
-        let sweep_counts = if cfg.fulltext_indexes.is_empty() {
-            SweepCounts::default()
-        } else {
-            eprintln!(
-                "fulltext sweep: {} literal-index entries, last commit rev={}",
-                cfg.fulltext_indexes.len(),
-                store_rev()
-            );
-            fulltext_sweep::run(
-                &cfg.fulltext_indexes,
-                &FulltextHostBridge,
-                &GraphBridge,
-                &SinkBridgeImpl { handle: sink_handle },
-            )
-        };
-
-        // Phase 4c: document-mirror sweep. Runs after fulltext_sweep
-        // because both mirror to the same Manticore (different indexes
-        // per registry entry) — running document last means an
-        // operator watching sweep logs sees the two phases in a
-        // consistent order regardless of registry composition. Skipped
-        // entirely when no document_indexes are configured, so
-        // fulltext-only deployments pay zero cost.
-        //
-        // Same fail-soft posture as fulltext_sweep: any per-entry
-        // Sirix/Manticore error logs to stderr and bumps `errors`; the
-        // alias-reconcile outputs stay usable even when the document
-        // backends are down.
-        let doc_sweep = if cfg.document_indexes.is_empty() {
-            DocSweepResult::default()
-        } else {
-            eprintln!(
-                "document sweep: {} managed entries, last commit rev={}, full_scan={}",
-                cfg.document_indexes.len(),
-                store_rev(),
-                cfg.full_scan,
-            );
-            document_sweep::run_with_options(
-                &cfg.document_indexes,
-                &FulltextHostBridge,
-                &SirixHostBridge,
-                &DocSinkBridgeImpl { handle: sink_handle },
-                document_sweep::SweepOptions {
-                    full_scan: cfg.full_scan,
-                    now_millis: None,
-                },
-            )
-        };
-
-        host::sink_close(sink_handle).ok();
-
-        // Phase 5: delete the sameAs assertions.
-        let delete_sameas = format!(
-            "DELETE {{ ?a <{OWL_SAME_AS}> ?b }} WHERE {{ ?a <{OWL_SAME_AS}> ?b }}"
+        let delete = format!(
+            "DELETE {{ ?s ?p ?o }} WHERE {{ \
+             ?s ?p ?o . \
+             VALUES ?alias {{ {vals} }} \
+             FILTER(?s = ?alias || ?o = ?alias) \
+             }}",
+            vals = values_clause,
         );
-        host::execute_update(&delete_sameas)
-            .map_err(|e| format!("wf_canonicalize: delete sameAs assertions: {e}"))?;
-
-        Ok(BindingSets {
-            vars: vec![
-                "classes".into(),
-                "aliased".into(),
-                "rewritten".into(),
-                "seeded".into(),
-                "ft_inserted".into(),
-                "ft_deleted".into(),
-                "ft_errors".into(),
-                "doc_inserted".into(),
-                "doc_deleted".into(),
-                "doc_unchanged".into(),
-                "doc_errors".into(),
-            ],
-            rows: vec![vec![
-                Binding {
-                    name: "classes".into(),
-                    value: int_literal(classes.len() as i64),
-                },
-                Binding {
-                    name: "aliased".into(),
-                    value: int_literal(aliases_len as i64),
-                },
-                Binding {
-                    name: "rewritten".into(),
-                    value: int_literal(rewritten as i64),
-                },
-                Binding {
-                    name: "seeded".into(),
-                    value: int_literal(seed_size as i64),
-                },
-                Binding {
-                    name: "ft_inserted".into(),
-                    value: int_literal(sweep_counts.inserted as i64),
-                },
-                Binding {
-                    name: "ft_deleted".into(),
-                    value: int_literal(sweep_counts.deleted as i64),
-                },
-                Binding {
-                    name: "ft_errors".into(),
-                    value: int_literal(sweep_counts.errors as i64),
-                },
-                Binding {
-                    name: "doc_inserted".into(),
-                    value: int_literal(doc_sweep.inserted as i64),
-                },
-                Binding {
-                    name: "doc_deleted".into(),
-                    value: int_literal(doc_sweep.deleted as i64),
-                },
-                Binding {
-                    name: "doc_unchanged".into(),
-                    value: int_literal(doc_sweep.unchanged as i64),
-                },
-                Binding {
-                    name: "doc_errors".into(),
-                    value: int_literal(doc_sweep.errors as i64),
-                },
-            ]],
-        })
+        gc::execute_update(&delete).map_err(|e| {
+            format!(
+                "wf_canonicalize: delete alias-bearing triples: {}",
+                fmt_graph_err(e)
+            )
+        })?;
     }
 
-    fn aggregate_step(_args: Vec<Value>, _mult: u64) -> Result<(), String> {
-        Err("wf_canonicalize: aggregate not applicable".into())
-    }
-    fn aggregate_finish() -> Result<BindingSets, String> {
-        Err("wf_canonicalize: aggregate not applicable".into())
-    }
-    fn cardinality_estimate(
-        _input: Cardinality,
-        _args: Vec<Value>,
-    ) -> Result<Cardinality, String> {
-        Ok(Cardinality {
-            value: 1.0,
-            accuracy: Accuracy::Injected,
-        })
-    }
-    fn doc() -> BindingSets {
-        BindingSets {
-            vars: vec!["doc".into()],
-            rows: vec![vec![Binding {
-                name: "doc".into(),
-                value: Value::Literal(Literal {
-                    label: "wf_canonicalize(\"{ sink, rule }\") — union-find \
-                            over owl:sameAs, pick canonical per equivalence \
-                            class, rewrite the store, table the alias→canonical \
-                            map into the sink, delete sameAs assertions."
-                        .into(),
-                    datatype: XSD_STRING.into(),
-                    lang: None,
-                }),
-            }]],
+    // Phase 4: persist the alias map (INSERT OR REPLACE semantics).
+    if !alias_to_canonical.is_empty() {
+        for (alias, canonical) in &alias_to_canonical {
+            let row = TrackerRow {
+                values: vec![
+                    TrackerValue::TextValue(alias.clone()),
+                    TrackerValue::TextValue(canonical.clone()),
+                ],
+            };
+            ts::tracker_upsert(&sink_name, ALIAS_TABLE, &row).map_err(|e| {
+                format!(
+                    "wf_canonicalize: alias table upsert `{alias}`: {}",
+                    fmt_tracker_err(e)
+                )
+            })?;
         }
+    }
+
+    // Phase 4b: fulltext-reconcile. Same fail-soft posture as the
+    // pre-migration crate — errors are accumulated per-entry, never
+    // propagated up.
+    let sweep_counts = if cfg.fulltext_indexes.is_empty() {
+        SweepCounts::default()
+    } else {
+        eprintln!(
+            "fulltext sweep: {} literal-index entries, last commit rev={}",
+            cfg.fulltext_indexes.len(),
+            store_rev()
+        );
+        fulltext_sweep::run(
+            &cfg.fulltext_indexes,
+            &FulltextHostBridge,
+            &GraphBridge,
+            &SinkBridgeImpl {
+                sink_name: sink_name.clone(),
+            },
+        )
+    };
+
+    // Phase 4c: document-mirror sweep.
+    let doc_sweep = if cfg.document_indexes.is_empty() {
+        DocSweepResult::default()
+    } else {
+        eprintln!(
+            "document sweep: {} managed entries, last commit rev={}, full_scan={}",
+            cfg.document_indexes.len(),
+            store_rev(),
+            cfg.full_scan,
+        );
+        document_sweep::run_with_options(
+            &cfg.document_indexes,
+            &FulltextHostBridge,
+            &SirixHostBridge,
+            &DocSinkBridgeImpl {
+                sink_name: sink_name.clone(),
+            },
+            document_sweep::SweepOptions {
+                full_scan: cfg.full_scan,
+                now_millis: None,
+            },
+        )
+    };
+
+    // Phase 5: delete the sameAs assertions.
+    let delete_sameas = format!(
+        "DELETE {{ ?a <{OWL_SAME_AS}> ?b }} WHERE {{ ?a <{OWL_SAME_AS}> ?b }}"
+    );
+    gc::execute_update(&delete_sameas).map_err(|e| {
+        format!(
+            "wf_canonicalize: delete sameAs assertions: {}",
+            fmt_graph_err(e)
+        )
+    })?;
+
+    let summary = json!({
+        "classes": classes.len(),
+        "aliased": aliases_len,
+        "rewritten": rewritten,
+        "seeded": seed_size,
+        "ft_inserted": sweep_counts.inserted,
+        "ft_deleted": sweep_counts.deleted,
+        "ft_errors": sweep_counts.errors,
+        "doc_inserted": doc_sweep.inserted,
+        "doc_deleted": doc_sweep.deleted,
+        "doc_unchanged": doc_sweep.unchanged,
+        "doc_errors": doc_sweep.errors,
+    });
+    Ok(json_literal(&summary.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// ExtensionGuest / AggregateGuest / PropertyFunctionGuest surfaces
+// ---------------------------------------------------------------------------
+
+impl ExtensionGuest for Component {
+    fn register() -> Vec<FunctionDescriptor> {
+        vec![FunctionDescriptor {
+            name: "urn:webfunction:canonicalize".into(),
+            min_arity: 1,
+            max_arity: Some(1),
+        }]
+    }
+
+    fn call(name: String, args: Vec<WitTerm>) -> Result<WitTerm, String> {
+        match name.as_str() {
+            "urn:webfunction:canonicalize" => canonicalize_impl(&args),
+            other => Err(format!("wf_canonicalize: unknown function '{other}'")),
+        }
+    }
+}
+
+impl AggregateGuest for Component {
+    type AggregateState = UnreachableState;
+
+    fn register_aggregates() -> Vec<AggregateDescriptor> {
+        Vec::new()
+    }
+
+    fn new_aggregate(name: String) -> Result<AggregateState, String> {
+        Err(format!(
+            "wf_canonicalize: unknown aggregate '{name}' (this component provides none)"
+        ))
+    }
+}
+
+pub struct UnreachableState;
+
+impl GuestAggregateState for UnreachableState {
+    fn step(&self, _args: Vec<WitTerm>) -> Result<(), String> {
+        Err("wf_canonicalize: aggregate state was never constructed".into())
+    }
+
+    fn finish(&self) -> Result<WitTerm, String> {
+        Err("wf_canonicalize: aggregate state was never constructed".into())
+    }
+}
+
+impl PropertyFunctionGuest for Component {
+    fn register_property_functions() -> Vec<PropertyDescriptor> {
+        Vec::new()
+    }
+
+    fn evaluate(
+        name: String,
+        _subjects: Vec<WitTerm>,
+        _objects: Vec<WitTerm>,
+    ) -> Result<Vec<BindingRow>, String> {
+        Err(format!(
+            "wf_canonicalize: unknown property function '{name}' \
+             (this component provides none)"
+        ))
     }
 }
 
@@ -523,10 +633,6 @@ impl Guest for Component {
 
 fn pick_canonical(class: &[String], rule: &str) -> Result<String, String> {
     match rule {
-        // Mint a fresh well-known-genid IRI derived from the equivalence
-        // class's sorted membership. No original identifier is promoted;
-        // every source is treated as an alias. Deterministic — the same
-        // input class always produces the same canonical.
         "mint_genid" => {
             if class.is_empty() {
                 return Err("wf_canonicalize: empty equivalence class".into());
@@ -536,10 +642,6 @@ fn pick_canonical(class: &[String], rule: &str) -> Result<String, String> {
             let joined = sorted.join("\0");
             Ok(mint_genid_iri(&joined))
         }
-        // Shortest URI wins; lex-first tiebreak. Deterministic and rule-
-        // free — no external prefix table to maintain. Retained as an
-        // opt-in for callers who prefer promoting a real source URI
-        // (useful when one identifier scheme is definitively primary).
         "shortest_uri" => class
             .iter()
             .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
@@ -551,10 +653,6 @@ fn pick_canonical(class: &[String], rule: &str) -> Result<String, String> {
     }
 }
 
-/// Mint a deterministic well-known-genid IRI from an input string. Same
-/// 128-bit hash pattern used by wf_skolemize — two 64-bit accumulators
-/// seeded so collisions across skolemize/canonicalize outputs are
-/// astronomically unlikely.
 fn mint_genid_iri(input: &str) -> String {
     const GENID_PREFIX: &str = "https://tegmentum.ai/.well-known/genid/";
     const SALT: u64 = 0x9E3779B97F4A7C15;
@@ -606,7 +704,6 @@ impl DisjointSetUnion {
         }
     }
 
-    /// Emit all equivalence classes as a list of member-lists.
     fn classes(&mut self) -> Vec<Vec<String>> {
         let keys: Vec<String> = self.parent.keys().cloned().collect();
         let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
@@ -619,96 +716,9 @@ impl DisjointSetUnion {
 }
 
 // ---------------------------------------------------------------------------
-// SPARQL value rendering
+// Store-rev marker (opaque monotonic wall-clock stamp for logs)
 // ---------------------------------------------------------------------------
 
-fn value_to_sparql(
-    v: &Value,
-    alias_to_canonical: &HashMap<String, String>,
-) -> String {
-    match v {
-        Value::Iri(s) => {
-            let target = alias_to_canonical.get(s).unwrap_or(s);
-            format!("<{target}>")
-        }
-        Value::Bnode(label) => format!("_:{label}"),
-        Value::Literal(l) => {
-            let escaped = l
-                .label
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            if let Some(lang) = &l.lang {
-                format!("\"{escaped}\"@{lang}")
-            } else {
-                format!("\"{escaped}\"^^<{}>", l.datatype)
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Binding + literal helpers
-// ---------------------------------------------------------------------------
-
-fn binding_iri(row: &[Binding], name: &str) -> Option<String> {
-    row.iter().find(|b| b.name == name).and_then(|b| match &b.value {
-        Value::Iri(s) => Some(s.clone()),
-        _ => None,
-    })
-}
-
-fn binding_value(row: &[Binding], name: &str) -> Option<Value> {
-    row.iter().find(|b| b.name == name).map(|b| b.value.clone())
-}
-
-/// Extract the string form of a binding's value regardless of variant.
-/// Used for the sink's alias table — its columns come back as WIT
-/// literals per the sink-execute contract, and we only need their
-/// lexical form.
-fn binding_literal_str(row: &[Binding], name: &str) -> Option<String> {
-    row.iter().find(|b| b.name == name).and_then(|b| match &b.value {
-        Value::Literal(l) => Some(l.label.clone()),
-        Value::Iri(s) => Some(s.clone()),
-        _ => None,
-    })
-}
-
-fn table_name_from(url: &str) -> String {
-    url.rsplit_once('#')
-        .map(|(_, frag)| frag.to_string())
-        .unwrap_or_else(|| "aliases".into())
-}
-
-fn string_lit(s: &str) -> Value {
-    Value::Literal(Literal {
-        label: s.into(),
-        datatype: XSD_STRING.into(),
-        lang: None,
-    })
-}
-
-fn int_literal(n: i64) -> Value {
-    Value::Literal(Literal {
-        label: n.to_string(),
-        datatype: XSD_INTEGER.into(),
-        lang: None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Fulltext-sweep bridges
-// ---------------------------------------------------------------------------
-
-/// Returns the current "commit rev" the sweep should log alongside its
-/// start message. v0.1: we don't have a per-store transaction counter
-/// exposed through the WIT world, so use the wall-clock time in
-/// milliseconds since epoch — a monotonic-per-run identifier that lets
-/// an operator scan logs and correlate. If we ever get a real store-rev
-/// import (§07 of the design memo mentions this as a v0.2 want), swap
-/// this for the real thing.
 fn store_rev() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -717,21 +727,36 @@ fn store_rev() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-/// Wire the sweep module's `HttpBridge` trait through to the
-/// wit-bindgen-generated fulltext host import. Kept as a zero-sized
-/// newtype so the sweep unit tests can substitute an in-memory mock
-/// without pulling in the wit bindings.
+// ---------------------------------------------------------------------------
+// Fulltext-sweep / document-sweep bridges
+// ---------------------------------------------------------------------------
+
+/// Wire the sweep modules' `HttpBridge` through to
+/// `http-callbacks::http-post-json`. Content-Type stays
+/// `application/json` for wire compatibility with the pre-migration
+/// behavior (which routed through `wf:fulltext/host@0.1.0` that
+/// hardcoded the same value).
 struct FulltextHostBridge;
 
 impl fulltext_sweep::HttpBridge for FulltextHostBridge {
     fn post_json(&self, url: &str, body: &str) -> Result<String, String> {
-        fulltext_host::http_post_json(url, body)
+        let headers = vec![HttpHeader {
+            name: "content-type".into(),
+            value: "application/json".into(),
+        }];
+        let resp = hc::http_post_json(url, body, &headers).map_err(fmt_http_err)?;
+        if !(200..300).contains(&resp.status) {
+            return Err(format!(
+                "http-callbacks: non-2xx status {} from {}",
+                resp.status, url
+            ));
+        }
+        Ok(resp.body)
     }
 }
 
-/// Wire the sweep module's `GraphBridge` trait through to the
-/// wit-bindgen-generated webfunction host import. Same zero-sized shim
-/// pattern as `FulltextHostBridge`.
+/// Wire the fulltext-sweep module's `GraphBridge` through to
+/// `graph-callbacks::execute-query`.
 struct GraphBridge;
 
 impl fulltext_sweep::GraphBridge for GraphBridge {
@@ -747,11 +772,10 @@ impl fulltext_sweep::GraphBridge for GraphBridge {
         let sparql = format!(
             "SELECT ?s ?p ?o WHERE {{ ?s ?p ?o . VALUES ?p {{ {values} }} }}"
         );
-        let bs = host::execute_query(&sparql, &[], None)
-            .map_err(|e| format!("wf_canonicalize.fulltext_sweep: execute_query: {e}"))?;
+        let rows = select_rows(&sparql)?;
         let mut out: Vec<(String, String, fulltext_sweep::LiteralOrIri)> =
-            Vec::with_capacity(bs.rows.len());
-        for row in &bs.rows {
+            Vec::with_capacity(rows.len());
+        for row in &rows {
             let s = match binding_iri(row, "s") {
                 Some(v) => v,
                 None => continue,
@@ -760,15 +784,16 @@ impl fulltext_sweep::GraphBridge for GraphBridge {
                 Some(v) => v,
                 None => continue,
             };
-            let o_binding = row.iter().find(|b| b.name == "o");
+            let o_binding = row.iter().find(|b| b.variable == "o");
             let o = match o_binding {
                 Some(b) => match &b.value {
-                    Value::Literal(l) => fulltext_sweep::LiteralOrIri::Literal {
-                        lex: l.label.clone(),
-                        lang: l.lang.clone(),
+                    WitTerm::Literal(l) => fulltext_sweep::LiteralOrIri::Literal {
+                        lex: l.value.clone(),
+                        lang: l.language.clone(),
                     },
-                    Value::Iri(i) => fulltext_sweep::LiteralOrIri::Iri(i.clone()),
-                    Value::Bnode(_) => continue,
+                    WitTerm::NamedNode(i) => fulltext_sweep::LiteralOrIri::Iri(i.clone()),
+                    // Blank-node and quoted-triple objects are unindexable — skip.
+                    WitTerm::BlankNode(_) | WitTerm::Triple(_) => continue,
                 },
                 None => continue,
             };
@@ -778,82 +803,79 @@ impl fulltext_sweep::GraphBridge for GraphBridge {
     }
 }
 
-/// Wire the sweep module's `SinkBridge` through to the WIT `sink-*`
-/// imports. Carries the open sink handle and provides the four
-/// tracker-table primitives the sweep needs.
+/// Wire the fulltext-sweep module's `SinkBridge` through to the
+/// tracker-sink WIT imports. Carries only the sink NAME — the host
+/// owns the underlying connection.
 struct SinkBridgeImpl {
-    handle: u32,
+    sink_name: String,
 }
 
 impl fulltext_sweep::SinkBridge for SinkBridgeImpl {
     fn ensure_table(&self, table: &str) -> Result<(), String> {
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (\
-             subject_iri TEXT PRIMARY KEY, \
-             doc_hash TEXT NOT NULL, \
-             updated_at INTEGER NOT NULL)"
-        );
-        host::sink_execute(self.handle, &ddl, &[])
-            .map(|_| ())
-            .map_err(|e| format!("ensure_table: {e}"))
+        let schema = TrackerTableSchema {
+            name: table.into(),
+            columns: vec![
+                TrackerColumn {
+                    name: "subject_iri".into(),
+                    column_type: ColumnType::Text,
+                    primary_key: true,
+                    nullable: false,
+                },
+                TrackerColumn {
+                    name: "doc_hash".into(),
+                    column_type: ColumnType::Text,
+                    primary_key: false,
+                    nullable: false,
+                },
+                TrackerColumn {
+                    name: "updated_at".into(),
+                    column_type: ColumnType::Integer,
+                    primary_key: false,
+                    nullable: false,
+                },
+            ],
+            indexes: vec![],
+        };
+        ts::register_tracker_tables(&self.sink_name, &[schema]).map_err(fmt_tracker_err)
     }
 
     fn load_known(&self, table: &str) -> Result<HashMap<String, String>, String> {
-        let sql = format!("SELECT subject_iri, doc_hash FROM {table}");
-        let bs = host::sink_execute(self.handle, &sql, &[])
-            .map_err(|e| format!("load_known: {e}"))?;
-        let mut out = HashMap::with_capacity(bs.rows.len());
-        for row in &bs.rows {
-            let subj = row
-                .iter()
-                .find(|b| b.name == "subject_iri")
-                .and_then(|b| match &b.value {
-                    Value::Literal(l) => Some(l.label.clone()),
-                    Value::Iri(i) => Some(i.clone()),
-                    _ => None,
-                });
-            let hash = row
-                .iter()
-                .find(|b| b.name == "doc_hash")
-                .and_then(|b| match &b.value {
-                    Value::Literal(l) => Some(l.label.clone()),
-                    _ => None,
-                });
-            if let (Some(s), Some(h)) = (subj, hash) {
-                out.insert(s, h);
-            }
+        let rows = ts::tracker_select(
+            &self.sink_name,
+            table,
+            &[],
+            &["subject_iri".to_string(), "doc_hash".to_string()],
+        )
+        .map_err(fmt_tracker_err)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let subj = tracker_text(&r.values, 0)?;
+            let hash = tracker_text(&r.values, 1)?;
+            out.insert(subj, hash);
         }
         Ok(out)
     }
 
     fn upsert(&self, table: &str, subject: &str, hash: &str) -> Result<(), String> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let sql = format!(
-            "INSERT OR REPLACE INTO {table} (subject_iri, doc_hash, updated_at) \
-             VALUES (?, ?, ?)"
-        );
-        host::sink_execute(
-            self.handle,
-            &sql,
-            &[
-                string_lit(subject),
-                string_lit(hash),
-                int_literal(now_secs),
+        let row = TrackerRow {
+            values: vec![
+                TrackerValue::TextValue(subject.into()),
+                TrackerValue::TextValue(hash.into()),
+                TrackerValue::IntegerValue(now_secs()),
             ],
-        )
-        .map(|_| ())
-        .map_err(|e| format!("upsert: {e}"))
+        };
+        ts::tracker_upsert(&self.sink_name, table, &row).map_err(fmt_tracker_err)
     }
 
     fn delete(&self, table: &str, subject: &str) -> Result<(), String> {
-        let sql = format!("DELETE FROM {table} WHERE subject_iri = ?");
-        host::sink_execute(self.handle, &sql, &[string_lit(subject)])
+        let clauses = vec![TrackerWhere {
+            column: "subject_iri".into(),
+            operator: "=".into(),
+            value: Some(TrackerValue::TextValue(subject.into())),
+        }];
+        ts::tracker_delete(&self.sink_name, table, &clauses)
             .map(|_| ())
-            .map_err(|e| format!("delete: {e}"))
+            .map_err(fmt_tracker_err)
     }
 }
 
@@ -861,12 +883,10 @@ impl fulltext_sweep::SinkBridge for SinkBridgeImpl {
 // Document-sweep bridges
 // ---------------------------------------------------------------------------
 
-/// Wire the document-sweep `SirixBridge` through to `http-post-json`.
-/// Sirix-sql-server exposes a single `POST /query` endpoint that takes
-/// `{"sql": "..."}` and returns `{"columns":[...],"rows":[[...],...]}`
-/// — same wire shape wf_document uses. Kept as a zero-sized newtype so
-/// the sweep unit tests can substitute a TcpListener-backed mock
-/// without pulling in the wit bindings.
+/// Wire the document-sweep `SirixBridge` through to
+/// `http-callbacks::http-post-json`. Sirix-sql-server accepts a plain
+/// `POST /query` with `{"sql": "..."}` — same wire shape wf_document
+/// uses.
 struct SirixHostBridge;
 
 impl document_sweep::SirixBridge for SirixHostBridge {
@@ -882,96 +902,99 @@ impl document_sweep::SirixBridge for SirixHostBridge {
             document_sweep::build_scan_sql(database, resource, since_rev, wants_history);
         let body = document_sweep::build_query_body(&sql);
         let url = document_sweep::sirix_query_url(sirix_url);
-        let response = fulltext_host::http_post_json(&url, &body)
-            .map_err(|e| format!("sirix POST /query: {e}"))?;
-        document_sweep::parse_scan_response(&response)
+        let headers = vec![HttpHeader {
+            name: "content-type".into(),
+            value: "application/json".into(),
+        }];
+        let resp = hc::http_post_json(&url, &body, &headers).map_err(fmt_http_err)?;
+        if !(200..300).contains(&resp.status) {
+            return Err(format!(
+                "sirix POST /query: non-2xx status {} from {}",
+                resp.status, url
+            ));
+        }
+        document_sweep::parse_scan_response(&resp.body)
     }
 }
 
-/// Wire the document-sweep `DocSinkBridge` through to the WIT `sink-*`
-/// imports. Separate from `SinkBridgeImpl` because the tracker schema
-/// carries an extra `last_seen_rev` column that the fulltext sweep
-/// doesn't need.
+/// Wire the document-sweep `DocSinkBridge` through to the tracker-sink
+/// WIT imports. Separate from `SinkBridgeImpl` because the doc
+/// tracker schema carries an extra `last_seen_rev` column and its PK
+/// is composite `(doc_uri, rev)`.
 struct DocSinkBridgeImpl {
-    handle: u32,
+    sink_name: String,
 }
 
 impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
     fn ensure_doc_table(&self, table: &str) -> Result<(), String> {
-        // v1.0 schema: composite (doc_uri, rev) primary key. Latest-
-        // mode rows use rev=0 (SQLite DEFAULT 0); retention=all rows
-        // carry the real Sirix revision. `last_seen_rev` stays as a
-        // value column so a hash-diff can still compare "same rev,
-        // same content" for latest-mode. Existing v0.2 databases will
-        // pick up the new schema on the next sweep because CREATE
-        // TABLE IF NOT EXISTS is a no-op for the same name — deployed
-        // clusters that ran v0.2 need a one-shot migration (`ALTER
-        // TABLE ... ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`) if
-        // they want retention=all data alongside their existing
-        // latest-mode rows. Documented behavior at first cutover.
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (\
-             doc_uri TEXT NOT NULL, \
-             rev INTEGER NOT NULL DEFAULT 0, \
-             last_seen_rev INTEGER NOT NULL, \
-             doc_hash TEXT NOT NULL, \
-             updated_at INTEGER NOT NULL, \
-             PRIMARY KEY (doc_uri, rev))"
-        );
-        host::sink_execute(self.handle, &ddl, &[])
-            .map(|_| ())
-            .map_err(|e| format!("ensure_doc_table: {e}"))
+        let schema = TrackerTableSchema {
+            name: table.into(),
+            columns: vec![
+                TrackerColumn {
+                    name: "doc_uri".into(),
+                    column_type: ColumnType::Text,
+                    primary_key: true,
+                    nullable: false,
+                },
+                TrackerColumn {
+                    name: "rev".into(),
+                    column_type: ColumnType::Integer,
+                    primary_key: true,
+                    nullable: false,
+                },
+                TrackerColumn {
+                    name: "last_seen_rev".into(),
+                    column_type: ColumnType::Integer,
+                    primary_key: false,
+                    nullable: false,
+                },
+                TrackerColumn {
+                    name: "doc_hash".into(),
+                    column_type: ColumnType::Text,
+                    primary_key: false,
+                    nullable: false,
+                },
+                TrackerColumn {
+                    name: "updated_at".into(),
+                    column_type: ColumnType::Integer,
+                    primary_key: false,
+                    nullable: false,
+                },
+            ],
+            indexes: vec![],
+        };
+        ts::register_tracker_tables(&self.sink_name, &[schema]).map_err(fmt_tracker_err)
     }
 
     fn load_known_docs(
         &self,
         table: &str,
     ) -> Result<HashMap<(String, u64), document_sweep::KnownDoc>, String> {
-        let sql = format!("SELECT doc_uri, rev, last_seen_rev, doc_hash FROM {table}");
-        let bs = host::sink_execute(self.handle, &sql, &[])
-            .map_err(|e| format!("load_known_docs: {e}"))?;
-        let mut out = HashMap::with_capacity(bs.rows.len());
-        for row in &bs.rows {
-            let uri = row
-                .iter()
-                .find(|b| b.name == "doc_uri")
-                .and_then(|b| match &b.value {
-                    Value::Literal(l) => Some(l.label.clone()),
-                    Value::Iri(i) => Some(i.clone()),
-                    _ => None,
-                });
-            let rev_col = row
-                .iter()
-                .find(|b| b.name == "rev")
-                .and_then(|b| match &b.value {
-                    Value::Literal(l) => l.label.parse::<u64>().ok(),
-                    _ => None,
-                });
-            let last_seen_rev = row
-                .iter()
-                .find(|b| b.name == "last_seen_rev")
-                .and_then(|b| match &b.value {
-                    Value::Literal(l) => l.label.parse::<u64>().ok(),
-                    _ => None,
-                });
-            let hash = row
-                .iter()
-                .find(|b| b.name == "doc_hash")
-                .and_then(|b| match &b.value {
-                    Value::Literal(l) => Some(l.label.clone()),
-                    _ => None,
-                });
-            if let (Some(u), Some(rev_key), Some(r), Some(h)) =
-                (uri, rev_col, last_seen_rev, hash)
-            {
-                out.insert(
-                    (u, rev_key),
-                    document_sweep::KnownDoc {
-                        last_seen_rev: r,
-                        doc_hash: h,
-                    },
-                );
-            }
+        let rows = ts::tracker_select(
+            &self.sink_name,
+            table,
+            &[],
+            &[
+                "doc_uri".to_string(),
+                "rev".to_string(),
+                "last_seen_rev".to_string(),
+                "doc_hash".to_string(),
+            ],
+        )
+        .map_err(fmt_tracker_err)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let uri = tracker_text(&r.values, 0)?;
+            let rev = tracker_int(&r.values, 1)? as u64;
+            let last_seen_rev = tracker_int(&r.values, 2)? as u64;
+            let doc_hash = tracker_text(&r.values, 3)?;
+            out.insert(
+                (uri, rev),
+                document_sweep::KnownDoc {
+                    last_seen_rev,
+                    doc_hash,
+                },
+            );
         }
         Ok(out)
     }
@@ -983,46 +1006,35 @@ impl document_sweep::DocSinkBridge for DocSinkBridgeImpl {
         rev: u64,
         entry: &document_sweep::KnownDoc,
     ) -> Result<(), String> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let sql = format!(
-            "INSERT OR REPLACE INTO {table} \
-             (doc_uri, rev, last_seen_rev, doc_hash, updated_at) \
-             VALUES (?, ?, ?, ?, ?)"
-        );
-        host::sink_execute(
-            self.handle,
-            &sql,
-            &[
-                string_lit(doc_uri),
-                int_literal(rev as i64),
-                int_literal(entry.last_seen_rev as i64),
-                string_lit(&entry.doc_hash),
-                int_literal(now_secs),
+        let row = TrackerRow {
+            values: vec![
+                TrackerValue::TextValue(doc_uri.into()),
+                TrackerValue::IntegerValue(rev as i64),
+                TrackerValue::IntegerValue(entry.last_seen_rev as i64),
+                TrackerValue::TextValue(entry.doc_hash.clone()),
+                TrackerValue::IntegerValue(now_secs()),
             ],
-        )
-        .map(|_| ())
-        .map_err(|e| format!("upsert_doc: {e}"))
+        };
+        ts::tracker_upsert(&self.sink_name, table, &row).map_err(fmt_tracker_err)
     }
 
-    fn delete_doc(
-        &self,
-        table: &str,
-        doc_uri: &str,
-        rev: u64,
-    ) -> Result<(), String> {
-        let sql = format!("DELETE FROM {table} WHERE doc_uri = ? AND rev = ?");
-        host::sink_execute(
-            self.handle,
-            &sql,
-            &[string_lit(doc_uri), int_literal(rev as i64)],
-        )
-        .map(|_| ())
-        .map_err(|e| format!("delete_doc: {e}"))
+    fn delete_doc(&self, table: &str, doc_uri: &str, rev: u64) -> Result<(), String> {
+        let clauses = vec![
+            TrackerWhere {
+                column: "doc_uri".into(),
+                operator: "=".into(),
+                value: Some(TrackerValue::TextValue(doc_uri.into())),
+            },
+            TrackerWhere {
+                column: "rev".into(),
+                operator: "=".into(),
+                value: Some(TrackerValue::IntegerValue(rev as i64)),
+            },
+        ];
+        ts::tracker_delete(&self.sink_name, table, &clauses)
+            .map(|_| ())
+            .map_err(fmt_tracker_err)
     }
 }
 
-export!(Component);
+bindings::export!(Component with_types_in bindings);
