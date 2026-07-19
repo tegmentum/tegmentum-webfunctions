@@ -273,6 +273,7 @@ contract, not on the crate itself).
 | Follow-up F batch5 (`f04fd51`) | `wf_apply`, `wf_map`, `wf_pipeline` | `extension-with-all-host-callbacks` | `wasm-callbacks` + `graph-callbacks` |
 | Follow-up F batch6 (`3beeb6a`) | `wf_materialize`, `wf_materialize_list` | `extension-with-all-host-callbacks` | `sink-callbacks` (write-only) + `graph-callbacks` (+ `prepared-query-callbacks` for the list variant) |
 | M1 Q3 batch7 | `wf_demote`, `wf_demote_tree`, `wf_materialize_tree` | `extension-with-all-host-callbacks` | `sink-query-callbacks::scan-sink-quads` (demote) + `document-sink-callbacks::put-document` (demote_tree, materialize_tree) + `graph-callbacks` |
+| M1 Q2 wf_fetch | `wf_fetch` | `extension-with-all-host-callbacks` | `http-callbacks::http-get` + `sink-callbacks::emit-quads` — HTTP GET + Turtle/N-Triples/N-Quads parse + batched emit (see `feat(wf_fetch)` commit) |
 
 ### Deferred (1 crate)
 
@@ -288,7 +289,6 @@ landed:
 | Crate | Reason retired |
 |---|---|
 | `wf_sql` | Subsumed by `sink-query-callbacks::execute-sink-select` (R2 sink-read landing). The whole point of `wf_sql` was "arbitrary SQL against a sink returned as binding-sets" — the substrate now exposes that shape as a first-class callback, so a guest crate that re-wraps it is dead weight. See `docs/wf_sql-retirement.md`. |
-| `wf_fetch` | Redesigned as HTTP + `emit-quads`, no longer a sink-read consumer. See `feat(wf_fetch)` commit. |
 
 These crates continue to build against their per-crate legacy
 `stardog:webfunction@0.5.0/host` world and are unchanged by the
