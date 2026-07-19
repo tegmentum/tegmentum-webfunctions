@@ -249,12 +249,16 @@ world's host side. Downstream hosts implementing the same three
 
 ## Overlay-crate migration status
 
-The 22-crate overlay wave (Follow-up E + F) moves each Stardog-era
+The 21-crate overlay wave (Follow-up E + F) moves each Stardog-era
 `stardog:webfunction@0.3.x`–`0.6.x` crate onto the substrate
 contract at `tegmentum:webfunction@0.1.0` (submodule `wit/`).
 
-Progress: 21 / 22 attempted, 16 / 22 successfully migrated, 6
-deferred pending sink-callbacks read-side landing.
+Progress: 20 / 21 attempted, 16 / 21 successfully migrated, 5
+deferred pending sink-callbacks read-side landing. `wf_sql` is
+retired as of this wave — the R2 `sink-query-callbacks::execute-sink-select`
+surface subsumes its "arbitrary SQL against a sink" role, so shipping
+a wf_sql analogue on the substrate would be dead weight. See
+`docs/wf_sql-retirement.md`.
 
 | Wave / batch | Crates | World | Callbacks used |
 |---|---|---|---|
@@ -265,7 +269,7 @@ deferred pending sink-callbacks read-side landing.
 | Follow-up F batch5 (`f04fd51`) | `wf_apply`, `wf_map`, `wf_pipeline` | `extension-with-all-host-callbacks` | `wasm-callbacks` + `graph-callbacks` |
 | Follow-up F batch6 (`3beeb6a`) | `wf_materialize`, `wf_materialize_list` | `extension-with-all-host-callbacks` | `sink-callbacks` (write-only) + `graph-callbacks` (+ `prepared-query-callbacks` for the list variant) |
 
-### Deferred (6 crates)
+### Deferred (4 crates)
 
 Each of these consumes the Stardog-era sink-* triple
 (`sink-open` / `sink-execute` / `sink-close`) for READ-side operations
@@ -277,12 +281,17 @@ awaits a follow-on design memo.
 
 | Crate | Reason deferred |
 |---|---|
-| `wf_fetch` | Uses sink-* for both read and write (READ half not landed) |
-| `wf_sql` | Sink-side SQL SELECT is the crate's entire purpose (pure sink-read) |
 | `wf_demote` | Reads sink's `subject_iri` column via `sink-execute(SELECT ...)` to know what to delete |
 | `wf_demote_tree` | Same read pattern as `wf_demote`, scoped to the tree-shaped materialisation |
 | `wf_canonicalize` | Extensive `sink-execute(SELECT ...)` over its canonical-mapping table plus custom fulltext bridge |
 | `wf_materialize_tree` | Writes opaque JSON documents via `sink-execute("INSERT DOC", <json-lit>)`; the document-store shape does not decompose into typed quads without a substrate-side document sink descriptor |
+
+### Retired
+
+| Crate | Reason retired |
+|---|---|
+| `wf_sql` | Subsumed by `sink-query-callbacks::execute-sink-select` (R2 sink-read landing). The whole point of `wf_sql` was "arbitrary SQL against a sink returned as binding-sets" — the substrate now exposes that shape as a first-class callback, so a guest crate that re-wraps it is dead weight. See `docs/wf_sql-retirement.md`. |
+| `wf_fetch` | Redesigned as HTTP + `emit-quads`, no longer a sink-read consumer. See `feat(wf_fetch)` commit. |
 
 These crates continue to build against their per-crate legacy
 `stardog:webfunction@0.5.0/host` world and are unchanged by the
