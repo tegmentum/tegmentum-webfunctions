@@ -8,13 +8,20 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen.workspace = true
-serde = { version = "1", features = ["derive"] }
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
 serde_json = "1"
+# oxttl: pure-Rust Turtle / N-Triples / N-Quads parsers from the
+# oxigraph family. Chosen because (a) already present in the workspace
+# lockfile transitively via oxigraph, (b) compiles cleanly to
+# wasm32-wasip2 (pure Rust, only memchr / oxiri / oxrdf as inner deps),
+# (c) exposes uniform iterator-based APIs for the three RDF syntaxes we
+# support at MVP.
+oxttl = "0.2"
+oxrdf = "0.3"
 
 [package.metadata.component]
-package = "tegmentum:wf-fetch"
+package = "tegmentum:webfunction"
 
 [package.metadata.component.target]
-path = "wit"
-world = "webfunction"
+path = "../../wit"
+world = "extension-with-all-host-callbacks"
